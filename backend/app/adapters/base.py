@@ -28,9 +28,11 @@ class AdapterOrder:
     symbol: str
     side: str
     quantity: float
+    venue_symbol: str | None = None
     price: float | None = None
     order_type: str = "market"
     post_only: bool = False
+    reduce_only: bool = False
     ttl_seconds: int = 0
     paper_latency_ms: int = 0
 

@@ -781,6 +781,9 @@ POST /api/alerts/{id}/ack
 - 权限：单管理员账号，默认用户名密码来自 `.env`，未配置时为 `admin/admin123`。
 - 告警：站内告警和系统日志。
 - 执行：支持 `dry_run`、`paper`、`live` 三种模式；真实下单默认关闭。
+- 执行网关：新增 `ExecutionGateway` 抽象、`AdapterExecutionGateway` 桥接层和 `build_execution_gateway()` 工厂入口，当前下单路径先产生统一 `OrderEvent` / `FillEvent`，再写入订单和成交表；NautilusTrader 已接入 Hyperliquid-only gateway，可通过 `NAUTILUS_HYPERLIQUID_ENABLED=true` 替换 Hyperliquid 单腿执行内核，并在 `NAUTILUS_HYPERLIQUID_SUBMIT_ENABLED=true` 时通过 bridge Strategy 提交 market/limit 单；MT5 腿仍保留现有 adapter。
+- 执行回查：`execution_reconciler` 会周期回查 `opening` / `closing` 对冲组的 pending 订单，确认成交后补写 fill 并推进 hedge group 状态；同时刷新 live positions，对已关闭 live 对冲组做残余仓位告警。单腿成交且另一腿仍 pending 时，系统会尝试撤销未成交腿并进入人工处理；外部订单状态长时间不可重建时也会升级人工处理。
+- 自动平仓：paper 自动平仓默认可用；live 自动平仓需要额外开启 `auto_close_live_enabled` 和系统实盘总开关，随后走同一套反向订单路径。
 - 实盘保护：开启实盘必须在前端输入确认短语 `ENABLE LIVE TRADING`。
 - 行情：新增实时 QuoteCache，扫描和执行只使用时间对齐后的报价对。
 - Hyperliquid：live 行情路径预留 WebSocket `l2Book` 订阅。
@@ -791,4 +794,4 @@ POST /api/alerts/{id}/ack
 - 实时扫描视图：价差扫描页改为每个品种最新快照，候选机会页改为当前候选池；历史 `spread_snapshots` 继续供价差研究统计。
 - MT5 会话保护：新增 MT5 交易时段状态和动作级权限检查。扫描器会区分正常交易、只平仓、仅报价、盘尾禁开、开盘冷却和休市状态；不可开仓时不会生成候选机会。
 
-首版实盘适配器保留了真实交易边界和凭证检查，但 Hyperliquid 与 MT5 的真实 SDK 下单调用仍处于保护状态。接入真实券商和主网前，需要补充具体账户规格、手续费、隔夜费、合约乘数和下单回报处理。
+实盘适配器保留真实交易边界和凭证检查。Hyperliquid 通过 NautilusTrader bridge Strategy 受保护提交单腿订单，MT5 通过 `MT5Adapter` 受保护提交 market 订单；默认均关闭。接入真实券商和主网前，需要继续补充具体账户规格、手续费、隔夜费、合约乘数、撤单、成交回报、启动恢复和异常补偿处理。

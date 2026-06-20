@@ -45,8 +45,12 @@
 - `GET /api/accounts`：同步并返回 Hyperliquid、MT5 两个平台的最新账户状态；Hyperliquid 会分开展示 Perp 权益、Spot USDC、可提取和可用保证金，读取失败时回退 Paper 账户。
 - `GET /api/accounts/snapshots`：账户快照分页。
 - `GET /api/positions`：当前仓位。
-- `GET /api/orders`：订单分页。
+- `POST /api/positions/{id}/adopt`：管理员将已同步的 Hyperliquid/MT5 外部仓位接管为 `live/manual_intervention` 对冲组；用于处理 readiness 发现的孤儿仓位。请求体可传 `reason`，必要时可传内部 `symbol`。
+- `POST /api/execution/reconcile`：管理员手工触发执行状态同步，立即刷新 live positions、回查 pending 订单、检查 closed 残仓和外部孤儿仓位。
+- `GET /api/orders`：订单分页，包含 `post_only`、`reduce_only` 和 `ttl_seconds` 等执行语义字段，便于复核 live 平仓/补偿单是否按 reduce-only 提交。
 - `GET /api/fills`：成交分页。
+
+前端“执行记录”页面会同时展示订单与成交，订单表重点展示 `reduce_only`、`post_only`、外部单号和错误信息，用于排查 NautilusTrader Hyperliquid 与 MT5 live 执行回报。
 
 ## 风控
 
@@ -57,7 +61,7 @@
 
 ## 设置
 
-- `GET/PUT /api/settings/strategy`：策略参数，包含统计入场线、Paper 自动执行和 Paper 自动平仓参数；自动平仓退出线按 `max(低分位价差, 成本保护线 + 每份利润缓冲)` 计算。
+- `GET/PUT /api/settings/strategy`：策略参数，包含统计入场线、Paper 自动执行和自动平仓参数；`auto_close_live_enabled=false` 时自动平仓只处理 paper 对冲组，开启后才允许 live 自动平仓继续进入实盘反向订单路径。自动平仓退出线按 `min(低分位价差, 开仓价差 - 单位成本 - 每份利润缓冲)` 计算，利润保护上限无效时返回 `0`。
 - `GET/PUT /api/settings/risk`：风控参数。
 - `GET/PUT /api/settings/symbol-mappings`：品种映射。
 - `POST /api/settings/symbol-mappings`：新增单条品种映射。
@@ -67,6 +71,7 @@
 - 品种映射包含执行策略字段：`execution_style`、`hl_open_order_type`、`hl_close_order_type`、`hl_post_only`、`hl_maker_offset_bps`、`hl_order_ttl_seconds`、`hl_unfilled_action`、`single_leg_action`。
 - 品种映射包含 MT5 会话保护字段：`mt5_pre_close_no_open_minutes`、`mt5_post_open_cooldown_minutes`、`allow_hold_through_mt5_close`。
 - `GET/PUT /api/settings/live-trading`：实盘开关。
+- `GET /api/settings/live-readiness`：实盘执行就绪检查，返回总状态和 Hyperliquid NautilusTrader、MT5、全局实盘开关、只读账户连通性、品种映射、单腿补偿配置等检查项。
 
 开启实盘时必须传入确认短语 `ENABLE LIVE TRADING`。
 

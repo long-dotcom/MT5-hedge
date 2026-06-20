@@ -18,6 +18,18 @@ export function HedgeGroupsPage() {
     },
     onError: (err: any) => messageApi.error(err.response?.data?.detail || '平仓失败')
   });
+  const reconcile = useMutation({
+    mutationFn: async () => (await api.post('/execution/reconcile')).data,
+    onSuccess: (data) => {
+      messageApi.success(`执行状态已同步，变更 ${data.changed || 0} 项`);
+      queryClient.invalidateQueries({ queryKey: ['hedge-groups'] });
+      queryClient.invalidateQueries({ queryKey: ['alerts'] });
+      queryClient.invalidateQueries({ queryKey: ['positions'] });
+      queryClient.invalidateQueries({ queryKey: ['orders'] });
+      queryClient.invalidateQueries({ queryKey: ['fills'] });
+    },
+    onError: (err: any) => messageApi.error(err.response?.data?.detail || '同步失败')
+  });
   const columns: ColumnsType<any> = [
     { title: 'ID', dataIndex: 'id', width: 70 },
     { title: '品种', dataIndex: 'symbol' },
@@ -38,7 +50,10 @@ export function HedgeGroupsPage() {
   return (
     <Space direction="vertical" size={16} className="full-width">
       {contextHolder}
-      <Typography.Title level={3}>对冲组</Typography.Title>
+      <Space className="full-width" align="center" style={{ justifyContent: 'space-between' }}>
+        <Typography.Title level={3} style={{ margin: 0 }}>对冲组</Typography.Title>
+        <Button loading={reconcile.isPending} onClick={() => reconcile.mutate()}>同步执行状态</Button>
+      </Space>
       <Card>
         <Table rowKey="id" columns={columns} dataSource={query.data?.items || []} loading={query.isLoading} scroll={{ x: 1200 }} pagination={{ current: page, pageSize: 20, total: query.data?.total || 0, onChange: setPage }} />
       </Card>

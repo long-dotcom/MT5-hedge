@@ -9,6 +9,7 @@ import {
   LineChartOutlined,
   NodeIndexOutlined,
   HistoryOutlined,
+  OrderedListOutlined,
   SafetyCertificateOutlined,
   SettingOutlined,
   StockOutlined
@@ -27,6 +28,7 @@ const items = [
   { key: '/lead-lag', icon: <NodeIndexOutlined />, label: '报价领先滞后' },
   { key: '/opportunities', icon: <AlertOutlined />, label: '候选机会' },
   { key: '/hedge-groups', icon: <HistoryOutlined />, label: '对冲组' },
+  { key: '/execution', icon: <OrderedListOutlined />, label: '执行记录' },
   { key: '/accounts', icon: <FundOutlined />, label: '账户' },
   { key: '/positions', icon: <StockOutlined />, label: '仓位' },
   { key: '/risk', icon: <SafetyCertificateOutlined />, label: '风控' },

@@ -55,9 +55,11 @@ def evaluate_entry_signal(
     reachable_entry = max(_percentile(spreads, strategy.reachable_entry_percentile), avg + strategy.reachable_entry_zscore * std)
     cost_guard = _percentile(costs, strategy.cost_guard_percentile)
     strong_entry = max(_percentile(spreads, 0.90), avg + 1.5 * std)
-    exit_target = max(
-        _percentile(spreads, strategy.exit_target_percentile),
-        cost_guard + max(strategy.auto_close_unit_profit_buffer, 0.0),
+    exit_target = _exit_target_with_profit_buffer(
+        percentile_target=_percentile(spreads, strategy.exit_target_percentile),
+        entry_spread=current_spread,
+        unit_cost=cost_guard,
+        unit_profit_buffer=strategy.auto_close_unit_profit_buffer,
     )
     overheat = _percentile(spreads, 0.99)
     unit_edge = current_spread - cost_guard
@@ -87,3 +89,16 @@ def _percentile(values: list[float], percentile: float) -> float:
     upper = min(lower + 1, len(ordered) - 1)
     weight = index - lower
     return ordered[lower] * (1 - weight) + ordered[upper] * weight
+
+
+def _exit_target_with_profit_buffer(
+    *,
+    percentile_target: float,
+    entry_spread: float,
+    unit_cost: float,
+    unit_profit_buffer: float,
+) -> float:
+    profit_safe_target = entry_spread - max(unit_cost, 0.0) - max(unit_profit_buffer, 0.0)
+    if percentile_target <= 0 or profit_safe_target <= 0:
+        return 0.0
+    return min(percentile_target, profit_safe_target)

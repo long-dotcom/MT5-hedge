@@ -54,6 +54,7 @@ def ensure_schema_columns() -> None:
         existing_orders = {column["name"] for column in inspector.get_columns("orders")}
         order_columns = {
             "post_only": "BOOLEAN DEFAULT 0",
+            "reduce_only": "BOOLEAN DEFAULT 0",
             "ttl_seconds": "INTEGER DEFAULT 0",
         }
         with engine.begin() as conn:
@@ -108,6 +109,7 @@ def ensure_schema_columns() -> None:
             "min_unit_edge": "FLOAT DEFAULT 0.0",
             "min_total_profit": "FLOAT DEFAULT 0.5",
             "auto_close_enabled": "BOOLEAN DEFAULT 1",
+            "auto_close_live_enabled": "BOOLEAN DEFAULT 0",
             "exit_target_percentile": "FLOAT DEFAULT 0.25",
             "auto_close_unit_profit_buffer": "FLOAT DEFAULT 20.0",
             "auto_close_min_profit": "FLOAT DEFAULT 0.0",

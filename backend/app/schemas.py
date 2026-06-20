@@ -27,6 +27,7 @@ class StrategySettingsIn(BaseModel):
     min_unit_edge: float = 0.0
     min_total_profit: float = 0.5
     auto_close_enabled: bool = True
+    auto_close_live_enabled: bool = False
     exit_target_percentile: float = 0.25
     auto_close_unit_profit_buffer: float = 20.0
     auto_close_min_profit: float = 0.0
@@ -74,6 +75,11 @@ class RiskModeIn(BaseModel):
 
 class CloseHedgeGroupIn(BaseModel):
     reason: str = "manual"
+
+
+class AdoptPositionIn(BaseModel):
+    reason: str = "adopt external live position"
+    symbol: str = ""
 
 
 class SymbolMappingIn(BaseModel):

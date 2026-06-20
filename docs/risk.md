@@ -69,7 +69,7 @@ Hyperliquid maker 能降低手续费，但会带来成交不确定性：
 - HL maker 未成交时不能先打 MT5，否则会裸露单边风险。
 - HL 部分成交时只能按成交数量去 MT5 对冲。
 - HL 成交后必须重新校验 MT5 最新报价。
-- 任一边失败时默认进入 `manual_intervention`。
+- 任一边失败时默认进入 `manual_intervention`；如果该品种设置 `single_leg_action=auto_close` 或 `reverse_filled_leg`，系统会先尝试反向冲销已成交腿。
 
 ## 实盘保护
 
@@ -80,4 +80,10 @@ Hyperliquid maker 能降低手续费，但会带来成交不确定性：
 3. 在实盘开关页面输入 `ENABLE LIVE TRADING`。
 4. `.env` 中配置 Hyperliquid 和 MT5 凭证。
 
-首版任一边下单失败时，不自动补仓，直接把对冲组标记为 `manual_intervention` 并产生告警。
+任一边下单失败时，默认把对冲组标记为 `manual_intervention` 并产生告警。只有品种映射显式设置 `single_leg_action=auto_close` 或 `reverse_filled_leg` 时，reconciler 才会对已成交腿提交反向市价冲销单；补偿单未确认成交时仍保持人工介入。
+
+live 平仓和单腿补偿都会使用 reduce-only 语义。MT5Adapter 会把 MT5 hedging 持仓 ticket 写入 `order_send.position`；若找不到对应可减仓持仓，则拒绝发单而不是开反向新仓。NautilusTrader Hyperliquid order factory 如果不支持 `reduce_only` 参数，系统会直接把订单标为失败，不会退化成普通反向单。
+
+实盘就绪检查会读取当前已同步的 Hyperliquid/MT5 live 仓位管理状态。外部仓位必须同时匹配 live 对冲组的平台、映射品种、方向和该平台预期数量；同品种但方向或数量不一致也会视为未归属。若发现外部仓位无法匹配任何 live 对冲组，或已关闭 live 对冲组仍有残余仓位，系统会把 readiness 标为 `blocked`，live 开仓和平仓入口不会继续提交真实订单。
+
+外部孤儿仓位需要先人工确认来源。确认要由系统接管时，可从仓位页或 `POST /api/positions/{id}/adopt` 创建 `live/manual_intervention` 对冲组；该操作不下单，只改变本地管理关系。导入的单腿组平仓时只会反向关闭已有平台腿。

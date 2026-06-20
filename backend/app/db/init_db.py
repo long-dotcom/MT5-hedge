@@ -1,0 +1,240 @@
+from sqlalchemy import inspect, text
+from sqlalchemy.orm import Session
+
+from app.auth.security import hash_password
+from app.config.settings import get_settings
+from app.db.models import Base, RiskSetting, StrategySetting, SymbolMapping, SystemSetting, User
+from app.db.session import engine
+from app.accounts.sync import ensure_initial_account_snapshots
+from app.market.symbols import seed_symbol_mappings_from_file
+
+
+def init_db() -> None:
+    Base.metadata.create_all(bind=engine)
+    ensure_schema_columns()
+    with Session(engine) as db:
+        seed_defaults(db)
+
+
+def ensure_schema_columns() -> None:
+    inspector = inspect(engine)
+    if "symbol_mappings" not in inspector.get_table_names():
+        return
+    existing = {column["name"] for column in inspector.get_columns("symbol_mappings")}
+    columns = {
+        "mt5_min_lot": "FLOAT DEFAULT 0.0",
+        "mt5_volume_step": "FLOAT DEFAULT 0.0",
+        "mt5_contract_size": "FLOAT DEFAULT 1.0",
+        "mt5_currency_base": "VARCHAR(16) DEFAULT ''",
+        "mt5_currency_profit": "VARCHAR(16) DEFAULT 'USD'",
+        "mt5_currency_margin": "VARCHAR(16) DEFAULT 'USD'",
+        "mt5_calc_mode": "INTEGER DEFAULT 0",
+        "mt5_min_base_size": "FLOAT DEFAULT 0.0",
+        "hyperliquid_min_base_size": "FLOAT DEFAULT 0.0",
+        "hyperliquid_min_notional": "FLOAT DEFAULT 10.0",
+        "execution_style": "VARCHAR(64) DEFAULT 'taker_taker'",
+        "hl_open_order_type": "VARCHAR(16) DEFAULT 'market'",
+        "hl_close_order_type": "VARCHAR(16) DEFAULT 'market'",
+        "hl_post_only": "BOOLEAN DEFAULT 0",
+        "hl_maker_offset_bps": "FLOAT DEFAULT 1.0",
+        "hl_order_ttl_seconds": "INTEGER DEFAULT 3",
+        "hl_unfilled_action": "VARCHAR(32) DEFAULT 'cancel'",
+        "single_leg_action": "VARCHAR(32) DEFAULT 'manual_intervention'",
+        "mt5_open_order_type": "VARCHAR(16) DEFAULT 'market'",
+        "mt5_close_order_type": "VARCHAR(16) DEFAULT 'market'",
+        "mt5_pre_close_no_open_minutes": "INTEGER DEFAULT 15",
+        "mt5_post_open_cooldown_minutes": "INTEGER DEFAULT 10",
+        "allow_hold_through_mt5_close": "BOOLEAN DEFAULT 0",
+    }
+    with engine.begin() as conn:
+        for name, ddl in columns.items():
+            if name not in existing:
+                conn.execute(text(f"ALTER TABLE symbol_mappings ADD COLUMN {name} {ddl}"))
+    if "orders" in inspector.get_table_names():
+        existing_orders = {column["name"] for column in inspector.get_columns("orders")}
+        order_columns = {
+            "post_only": "BOOLEAN DEFAULT 0",
+            "ttl_seconds": "INTEGER DEFAULT 0",
+        }
+        with engine.begin() as conn:
+            for name, ddl in order_columns.items():
+                if name not in existing_orders:
+                    conn.execute(text(f"ALTER TABLE orders ADD COLUMN {name} {ddl}"))
+    if "risk_settings" in inspector.get_table_names():
+        existing_risk = {column["name"] for column in inspector.get_columns("risk_settings")}
+        risk_columns = {
+            "max_new_margin_fraction": "FLOAT DEFAULT 0.30",
+            "new_order_leverage": "FLOAT DEFAULT 20.0",
+        }
+        with engine.begin() as conn:
+            for name, ddl in risk_columns.items():
+                if name not in existing_risk:
+                    conn.execute(text(f"ALTER TABLE risk_settings ADD COLUMN {name} {ddl}"))
+    if "account_snapshots" in inspector.get_table_names():
+        existing_accounts = {column["name"] for column in inspector.get_columns("account_snapshots")}
+        account_columns = {
+            "portfolio_value": "FLOAT DEFAULT 0.0",
+            "perp_equity": "FLOAT DEFAULT 0.0",
+            "spot_balance": "FLOAT DEFAULT 0.0",
+            "spot_hold": "FLOAT DEFAULT 0.0",
+            "withdrawable": "FLOAT DEFAULT 0.0",
+            "free_collateral": "FLOAT DEFAULT 0.0",
+            "data_source": "VARCHAR(64) DEFAULT ''",
+        }
+        with engine.begin() as conn:
+            for name, ddl in account_columns.items():
+                if name not in existing_accounts:
+                    conn.execute(text(f"ALTER TABLE account_snapshots ADD COLUMN {name} {ddl}"))
+            conn.execute(
+                text(
+                    """
+                    UPDATE account_snapshots
+                    SET portfolio_value = CASE WHEN portfolio_value = 0.0 THEN equity ELSE portfolio_value END,
+                        perp_equity = CASE WHEN perp_equity = 0.0 THEN equity ELSE perp_equity END,
+                        withdrawable = CASE WHEN withdrawable = 0.0 THEN available_balance ELSE withdrawable END,
+                        free_collateral = CASE WHEN free_collateral = 0.0 THEN available_balance ELSE free_collateral END
+                    """
+                )
+            )
+    if "strategy_settings" in inspector.get_table_names():
+        existing_strategy = {column["name"] for column in inspector.get_columns("strategy_settings")}
+        strategy_columns = {
+            "signal_mode": "VARCHAR(32) DEFAULT 'statistical'",
+            "statistical_lookback_range": "VARCHAR(16) DEFAULT '1h'",
+            "statistical_min_samples": "INTEGER DEFAULT 200",
+            "reachable_entry_percentile": "FLOAT DEFAULT 0.75",
+            "reachable_entry_zscore": "FLOAT DEFAULT 1.0",
+            "cost_guard_percentile": "FLOAT DEFAULT 0.90",
+            "min_unit_edge": "FLOAT DEFAULT 0.0",
+            "min_total_profit": "FLOAT DEFAULT 0.5",
+            "auto_close_enabled": "BOOLEAN DEFAULT 1",
+            "exit_target_percentile": "FLOAT DEFAULT 0.25",
+            "auto_close_unit_profit_buffer": "FLOAT DEFAULT 20.0",
+            "auto_close_min_profit": "FLOAT DEFAULT 0.0",
+            "paper_use_live_account_risk": "BOOLEAN DEFAULT 0",
+            "auto_execute_enabled": "BOOLEAN DEFAULT 0",
+            "auto_execute_paper_only": "BOOLEAN DEFAULT 1",
+            "auto_execute_min_hold_ms": "INTEGER DEFAULT 300",
+            "auto_execute_confirm_ticks": "INTEGER DEFAULT 2",
+            "auto_execute_cooldown_seconds": "INTEGER DEFAULT 30",
+            "auto_execute_max_per_symbol_open_groups": "INTEGER DEFAULT 1",
+            "auto_execute_max_global_open_groups": "INTEGER DEFAULT 3",
+            "auto_execute_min_net_profit": "FLOAT DEFAULT 0.0",
+            "paper_decision_delay_ms_min": "INTEGER DEFAULT 50",
+            "paper_decision_delay_ms_max": "INTEGER DEFAULT 200",
+            "paper_hyperliquid_latency_ms_min": "INTEGER DEFAULT 80",
+            "paper_hyperliquid_latency_ms_max": "INTEGER DEFAULT 200",
+            "paper_mt5_latency_ms_min": "INTEGER DEFAULT 120",
+            "paper_mt5_latency_ms_max": "INTEGER DEFAULT 350",
+        }
+        with engine.begin() as conn:
+            for name, ddl in strategy_columns.items():
+                if name not in existing_strategy:
+                    conn.execute(text(f"ALTER TABLE strategy_settings ADD COLUMN {name} {ddl}"))
+    if "spread_snapshots" in inspector.get_table_names():
+        existing_spreads = {column["name"] for column in inspector.get_columns("spread_snapshots")}
+        spread_columns = {
+            "quantity": "FLOAT DEFAULT 1.0",
+            "mt5_quantity": "FLOAT DEFAULT 1.0",
+            "hyperliquid_quantity": "FLOAT DEFAULT 1.0",
+            "notional_currency": "VARCHAR(16) DEFAULT 'USD'",
+            "fx_rate_to_usd": "FLOAT DEFAULT 1.0",
+            "unit_cost": "FLOAT DEFAULT 0.0",
+            "unit_net_profit": "FLOAT DEFAULT 0.0",
+        }
+        with engine.begin() as conn:
+            for name, ddl in spread_columns.items():
+                if name not in existing_spreads:
+                    conn.execute(text(f"ALTER TABLE spread_snapshots ADD COLUMN {name} {ddl}"))
+            conn.execute(
+                text(
+                    """
+                    UPDATE spread_snapshots
+                    SET unit_cost = CASE WHEN quantity > 0 THEN total_cost / quantity ELSE total_cost END,
+                        unit_net_profit = CASE WHEN quantity > 0 THEN net_profit / quantity ELSE net_profit END
+                    WHERE unit_cost = 0.0 AND total_cost != 0.0
+                    """
+                )
+            )
+    if "arbitrage_opportunities" in inspector.get_table_names():
+        existing_opportunities = {column["name"] for column in inspector.get_columns("arbitrage_opportunities")}
+        opportunity_columns = {
+            "mt5_quantity": "FLOAT DEFAULT 1.0",
+            "hyperliquid_quantity": "FLOAT DEFAULT 1.0",
+            "notional_currency": "VARCHAR(16) DEFAULT 'USD'",
+            "fx_rate_to_usd": "FLOAT DEFAULT 1.0",
+            "unit_cost": "FLOAT DEFAULT 0.0",
+            "unit_net_profit": "FLOAT DEFAULT 0.0",
+            "entry_threshold": "FLOAT DEFAULT 0.0",
+            "exit_target": "FLOAT DEFAULT 0.0",
+            "overheat_threshold": "FLOAT DEFAULT 0.0",
+            "signal_sample_count": "INTEGER DEFAULT 0",
+        }
+        with engine.begin() as conn:
+            for name, ddl in opportunity_columns.items():
+                if name not in existing_opportunities:
+                    conn.execute(text(f"ALTER TABLE arbitrage_opportunities ADD COLUMN {name} {ddl}"))
+            conn.execute(
+                text(
+                    """
+                    UPDATE arbitrage_opportunities
+                    SET unit_cost = CASE WHEN quantity > 0 THEN total_cost / quantity ELSE total_cost END,
+                        unit_net_profit = CASE WHEN quantity > 0 THEN net_profit / quantity ELSE net_profit END
+                    WHERE unit_cost = 0.0 AND total_cost != 0.0
+                    """
+                )
+            )
+    if "spread_current" in inspector.get_table_names():
+        existing_current = {column["name"] for column in inspector.get_columns("spread_current")}
+        current_columns = {
+            "mt5_quantity": "FLOAT DEFAULT 1.0",
+            "hyperliquid_quantity": "FLOAT DEFAULT 1.0",
+            "notional_currency": "VARCHAR(16) DEFAULT 'USD'",
+            "fx_rate_to_usd": "FLOAT DEFAULT 1.0",
+        }
+        with engine.begin() as conn:
+            for name, ddl in current_columns.items():
+                if name not in existing_current:
+                    conn.execute(text(f"ALTER TABLE spread_current ADD COLUMN {name} {ddl}"))
+    if "hedge_groups" in inspector.get_table_names():
+        existing_groups = {column["name"] for column in inspector.get_columns("hedge_groups")}
+        group_columns = {
+            "mt5_quantity": "FLOAT DEFAULT 1.0",
+            "hyperliquid_quantity": "FLOAT DEFAULT 1.0",
+            "entry_spread": "FLOAT DEFAULT 0.0",
+            "entry_threshold": "FLOAT DEFAULT 0.0",
+            "exit_target": "FLOAT DEFAULT 0.0",
+            "overheat_threshold": "FLOAT DEFAULT 0.0",
+            "close_reason": "TEXT DEFAULT ''",
+        }
+        with engine.begin() as conn:
+            for name, ddl in group_columns.items():
+                if name not in existing_groups:
+                    conn.execute(text(f"ALTER TABLE hedge_groups ADD COLUMN {name} {ddl}"))
+
+
+def seed_defaults(db: Session) -> None:
+    settings = get_settings()
+    if not db.query(User).filter(User.username == settings.admin_username).first():
+        db.add(
+            User(
+                username=settings.admin_username,
+                password_hash=hash_password(settings.admin_password),
+                role="admin",
+            )
+        )
+    if not db.query(StrategySetting).first():
+        db.add(StrategySetting(execution_mode=settings.default_execution_mode))
+    if not db.query(RiskSetting).first():
+        db.add(RiskSetting())
+    if not db.query(SystemSetting).filter(SystemSetting.key == "live_trading_enabled").first():
+        db.add(SystemSetting(key="live_trading_enabled", value="false"))
+    db.commit()
+    ensure_initial_account_snapshots(db)
+    seed_flag = db.query(SystemSetting).filter(SystemSetting.key == "symbol_mappings_seeded").first()
+    if not seed_flag:
+        # 中文注释：配置文件只作为首次启动的种子数据，后续增删改都以数据库为准，避免重启覆盖前端保存的映射。
+        if not db.query(SymbolMapping).first():
+            seed_symbol_mappings_from_file(db)
+        db.add(SystemSetting(key="symbol_mappings_seeded", value="true"))
+        db.commit()

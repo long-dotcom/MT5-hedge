@@ -1,0 +1,130 @@
+html,
+body,
+#root {
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  background: #f5f7fb;
+}
+
+.app-shell {
+  min-height: 100vh;
+}
+
+.side-nav {
+  border-right: 1px solid #e8ebf0;
+}
+
+.brand {
+  height: 56px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 0 20px;
+  font-weight: 700;
+  font-size: 16px;
+}
+
+.topbar {
+  height: 56px;
+  background: #fff;
+  border-bottom: 1px solid #e8ebf0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 20px;
+}
+
+.page-content {
+  padding: 20px;
+  overflow: auto;
+}
+
+.full-width {
+  width: 100%;
+}
+
+.page-title-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.metric-card {
+  height: 112px;
+}
+
+.chart-card {
+  min-height: 390px;
+}
+
+.analytics-control {
+  width: 132px;
+}
+
+.analytics-control-wide {
+  width: 220px;
+}
+
+.analytics-reason {
+  max-width: 420px;
+}
+
+.analytics-chart-card {
+  min-height: 472px;
+}
+
+.analytics-side-card {
+  min-height: 472px;
+}
+
+.analytics-line {
+  height: 34px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  border-bottom: 1px solid #f0f2f5;
+}
+
+.analytics-line span {
+  color: #6b7280;
+}
+
+.analytics-line strong {
+  max-width: 180px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  text-align: right;
+}
+
+.login-page {
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: #eef2f8;
+}
+
+.login-card {
+  width: 360px;
+  border-radius: 8px;
+}
+
+.settings-form {
+  max-width: 520px;
+}
+
+.settings-form .ant-input-number {
+  width: 100%;
+}
+
+.form-alert {
+  margin-bottom: 16px;
+}
+
+.ant-table-cell {
+  white-space: nowrap;
+}

@@ -1,0 +1,128 @@
+from datetime import datetime
+from typing import Any
+
+from pydantic import BaseModel, ConfigDict, field_validator
+
+
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+
+class TokenResponse(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+    user: dict[str, Any]
+
+
+class StrategySettingsIn(BaseModel):
+    min_net_profit: float
+    min_annualized_return: float
+    signal_mode: str = "statistical"
+    statistical_lookback_range: str = "1h"
+    statistical_min_samples: int = 200
+    reachable_entry_percentile: float = 0.75
+    reachable_entry_zscore: float = 1.0
+    cost_guard_percentile: float = 0.90
+    min_unit_edge: float = 0.0
+    min_total_profit: float = 0.5
+    auto_close_enabled: bool = True
+    exit_target_percentile: float = 0.25
+    auto_close_unit_profit_buffer: float = 20.0
+    auto_close_min_profit: float = 0.0
+    default_notional: float
+    max_holding_minutes: int
+    execution_mode: str
+    paper_use_live_account_risk: bool = False
+    auto_execute_enabled: bool = False
+    auto_execute_paper_only: bool = True
+    auto_execute_min_hold_ms: int = 300
+    auto_execute_confirm_ticks: int = 2
+    auto_execute_cooldown_seconds: int = 30
+    auto_execute_max_per_symbol_open_groups: int = 1
+    auto_execute_max_global_open_groups: int = 3
+    auto_execute_min_net_profit: float = 0.0
+    paper_decision_delay_ms_min: int = 50
+    paper_decision_delay_ms_max: int = 200
+    paper_hyperliquid_latency_ms_min: int = 80
+    paper_hyperliquid_latency_ms_max: int = 200
+    paper_mt5_latency_ms_min: int = 120
+    paper_mt5_latency_ms_max: int = 350
+
+
+class RiskSettingsIn(BaseModel):
+    mode: str
+    max_order_notional: float
+    max_symbol_exposure: float
+    max_total_leverage: float
+    max_new_margin_fraction: float
+    new_order_leverage: float
+    min_margin_ratio: float
+    max_slippage_bps: float
+    max_market_age_seconds: int
+    max_api_errors: int
+
+
+class LiveTradingIn(BaseModel):
+    enabled: bool
+    confirmation: str = ""
+
+
+class RiskModeIn(BaseModel):
+    mode: str
+
+
+class CloseHedgeGroupIn(BaseModel):
+    reason: str = "manual"
+
+
+class SymbolMappingIn(BaseModel):
+    symbol: str
+    hyperliquid_symbol: str
+    mt5_symbol: str
+    base_asset: str = ""
+    quote_asset: str = "USD"
+    contract_multiplier: float = 1.0
+    min_order_size: float = 0.001
+    mt5_min_lot: float = 0.0
+    mt5_volume_step: float = 0.0
+    mt5_contract_size: float = 1.0
+    mt5_currency_base: str = ""
+    mt5_currency_profit: str = "USD"
+    mt5_currency_margin: str = "USD"
+    mt5_calc_mode: int = 0
+    mt5_min_base_size: float = 0.0
+    hyperliquid_min_base_size: float = 0.0
+    hyperliquid_min_notional: float = 10.0
+    execution_style: str = "taker_taker"
+    hl_open_order_type: str = "market"
+    hl_close_order_type: str = "market"
+    hl_post_only: bool = False
+    hl_maker_offset_bps: float = 1.0
+    hl_order_ttl_seconds: int = 3
+    hl_unfilled_action: str = "cancel"
+    single_leg_action: str = "manual_intervention"
+    mt5_open_order_type: str = "market"
+    mt5_close_order_type: str = "market"
+    mt5_pre_close_no_open_minutes: int = 15
+    mt5_post_open_cooldown_minutes: int = 10
+    allow_hold_through_mt5_close: bool = False
+    quantity_precision: int = 4
+    price_precision: int = 2
+    min_tick: float = 0.01
+    max_slippage_bps: float = 8.0
+    enabled: bool = True
+
+    @field_validator("symbol", "hyperliquid_symbol", "mt5_symbol", "base_asset", "quote_asset", "mt5_currency_base", "mt5_currency_profit", "mt5_currency_margin")
+    @classmethod
+    def strip_symbol_text(cls, value: str) -> str:
+        return value.strip()
+
+
+class ORMModel(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+
+class RowResponse(ORMModel):
+    id: int
+    created_at: datetime

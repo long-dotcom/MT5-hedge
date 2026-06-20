@@ -1,0 +1,556 @@
+from dataclasses import dataclass
+from datetime import datetime
+from time import perf_counter
+
+from sqlalchemy.orm import Session
+
+from app.config.settings import get_settings
+from app.db.models import ArbitrageOpportunity, MarketSnapshot, SpreadBucket, SpreadCurrent, SpreadSnapshot, StrategySetting, SystemLog, WorkerRun
+from app.db.retention import prune_table_by_id
+from app.market.symbols import enabled_mappings
+from app.market.fx import fx_to_usd
+from app.market.quotes import quote_synchronizer
+from app.market.mt5_sessions import mt5_action_allowed, mt5_session_state
+from app.strategy.cost import estimate_cost
+from app.strategy.live_costs import hyperliquid_cost_inputs, mt5_cost_inputs
+from app.strategy.statistical_signal import evaluate_entry_signal
+
+
+@dataclass
+class BucketAccumulator:
+    symbol: str
+    direction: str
+    bucket_start: datetime
+    bucket_seconds: int
+    open_spread: float
+    high_spread: float
+    low_spread: float
+    close_spread: float
+    unit_cost_sum: float
+    unit_net_profit_sum: float
+    spread_sum: float
+    sample_count: int
+
+
+@dataclass
+class PositionSizing:
+    mt5_quantity: float
+    mt5_base_quantity: float
+    mt5_point_value_usd: float
+    hyperliquid_quantity: float
+    notional_usd: float
+    currency: str
+    fx_rate_to_usd: float
+    fx_source: str
+
+
+_bucket_accumulators: dict[tuple[str, str], BucketAccumulator] = {}
+_last_snapshot_flush: dict[tuple[str, str], float] = {}
+
+
+def get_strategy_setting(db: Session) -> StrategySetting:
+    setting = db.query(StrategySetting).first()
+    if not setting:
+        setting = StrategySetting()
+        db.add(setting)
+        db.commit()
+        db.refresh(setting)
+    return setting
+
+
+def run_scan(db: Session) -> int:
+    started = perf_counter()
+    created = 0
+    strategy = get_strategy_setting(db)
+    settings = get_settings()
+    try:
+        for mapping in enabled_mappings(db):
+            session_state = mt5_session_state(mapping)
+            if not session_state.can_quote:
+                _upsert_current_spread(
+                    db,
+                    symbol=mapping.symbol,
+                    direction="none",
+                    hyperliquid_bid=0,
+                    hyperliquid_ask=0,
+                    mt5_bid=0,
+                    mt5_ask=0,
+                    quantity=0,
+                    gross_spread=0,
+                    unit_cost=0,
+                    unit_net_profit=0,
+                    total_cost=0,
+                    net_profit=0,
+                    annualized_return=0,
+                    status="rejected",
+                    reason=f"MT5 不可报价/不可交易: {session_state.status}，{session_state.reason}",
+                )
+                continue
+            synced, sync_reason = quote_synchronizer.synchronized(
+                mapping.symbol,
+                mode="loose",
+                max_time_diff_ms=settings.loose_quote_sync_ms,
+                max_age_ms=max(settings.quote_stale_ms, settings.loose_quote_sync_ms),
+            )
+            if not synced:
+                _upsert_current_spread(
+                    db,
+                    symbol=mapping.symbol,
+                    direction="none",
+                    hyperliquid_bid=0,
+                    hyperliquid_ask=0,
+                    mt5_bid=0,
+                    mt5_ask=0,
+                    quantity=0,
+                    gross_spread=0,
+                    unit_cost=0,
+                    unit_net_profit=0,
+                    total_cost=0,
+                    net_profit=0,
+                    annualized_return=0,
+                    status="rejected",
+                    reason=sync_reason,
+                )
+                continue
+            hl = synced.hyperliquid
+            mt = synced.mt5
+
+            try:
+                sizing = _position_sizing(mapping, mt.mid, hl.mid, strategy.default_notional)
+            except ValueError as exc:
+                _upsert_current_spread(
+                    db,
+                    symbol=mapping.symbol,
+                    direction="none",
+                    hyperliquid_bid=hl.bid,
+                    hyperliquid_ask=hl.ask,
+                    mt5_bid=mt.bid,
+                    mt5_ask=mt.ask,
+                    quantity=0,
+                    mt5_quantity=0,
+                    hyperliquid_quantity=0,
+                    notional_currency=(mapping.mt5_currency_profit or mapping.quote_asset or "USD"),
+                    fx_rate_to_usd=0,
+                    gross_spread=0,
+                    unit_cost=0,
+                    unit_net_profit=0,
+                    total_cost=0,
+                    net_profit=0,
+                    annualized_return=0,
+                    status="rejected",
+                    reason=str(exc),
+                )
+                continue
+            long_hl_profit = (mt.bid - hl.ask) * sizing.mt5_point_value_usd
+            long_mt5_profit = (hl.bid - mt.ask) * sizing.mt5_point_value_usd
+            direction = "long_hyperliquid_short_mt5" if long_hl_profit >= long_mt5_profit else "long_mt5_short_hyperliquid"
+            gross_profit = long_hl_profit if direction == "long_hyperliquid_short_mt5" else long_mt5_profit
+            gross_spread = gross_profit / sizing.hyperliquid_quantity if sizing.hyperliquid_quantity > 0 else 0.0
+            quantity = sizing.mt5_quantity
+            notional = sizing.notional_usd
+            hyperliquid_side = "buy" if direction == "long_hyperliquid_short_mt5" else "sell"
+            mt5_side = "sell" if direction == "long_hyperliquid_short_mt5" else "buy"
+            holding_hours = max(strategy.max_holding_minutes / 60, 1)
+            hl_costs = hyperliquid_cost_inputs(mapping.hyperliquid_symbol)
+            mt5_costs = mt5_cost_inputs(mapping.mt5_symbol, mt5_side, sizing.mt5_quantity, holding_hours / 24)
+            cost = estimate_cost(
+                notional,
+                mt.bid,
+                mt.ask,
+                min(mapping.max_slippage_bps, settings.default_slippage_bps),
+                quantity=sizing.hyperliquid_quantity,
+                hyperliquid_bid=hl.bid,
+                hyperliquid_ask=hl.ask,
+                hyperliquid_fee_rate=_hl_fee_rate(mapping.hl_open_order_type, hl_costs),
+                hyperliquid_fee_round_trips=settings.hyperliquid_fee_round_trips,
+                hyperliquid_close_fee_rate=_hl_fee_rate(mapping.hl_close_order_type, hl_costs),
+                hyperliquid_funding_rate=hl_costs.funding_rate,
+                hyperliquid_side=hyperliquid_side,
+                mt5_commission_rate=mt5_costs.commission_rate,
+                mt5_swap_cost=mt5_costs.swap_cost,
+                holding_hours=holding_hours,
+                mt5_spread_rebate_rate=settings.mt5_spread_rebate_rate,
+                fx_cost_rate=settings.default_fx_cost_rate,
+                source=f"{hl_costs.source};{mt5_costs.source}",
+            )
+            net_profit = gross_profit - cost.total
+            unit_cost = cost.total / sizing.hyperliquid_quantity if sizing.hyperliquid_quantity > 0 else cost.total
+            unit_net_profit = gross_spread - unit_cost
+            annualized_return = (net_profit / notional) * (365 * 24 / holding_hours)
+            statistical_signal = evaluate_entry_signal(
+                db,
+                strategy,
+                mapping.symbol,
+                direction,
+                gross_spread,
+                unit_cost,
+                unit_net_profit,
+                net_profit,
+                annualized_return,
+            )
+            signal = statistical_signal.result
+            if signal.status in {"candidate", "executable"} and hl.depth_notional > 0 and notional > hl.depth_notional:
+                signal.status = "candidate"
+                signal.reason = f"Hyperliquid 顶层深度不足: 目标 {notional:.2f} USD > 深度 {hl.depth_notional:.2f} USD"
+            mt5_open_allowed, mt5_open_reason = mt5_action_allowed(session_state, direction, "open")
+            if not mt5_open_allowed:
+                signal.status = "rejected"
+                signal.reason = mt5_open_reason
+
+            reason = signal.reason or f"loose_sync={synced.time_diff_ms:.0f}ms; mt5_session={session_state.status}"
+            _upsert_current_spread(
+                db,
+                symbol=mapping.symbol,
+                direction=direction,
+                hyperliquid_bid=hl.bid,
+                hyperliquid_ask=hl.ask,
+                mt5_bid=mt.bid,
+                mt5_ask=mt.ask,
+                quantity=quantity,
+                mt5_quantity=sizing.mt5_quantity,
+                hyperliquid_quantity=sizing.hyperliquid_quantity,
+                notional_currency=sizing.currency,
+                fx_rate_to_usd=sizing.fx_rate_to_usd,
+                gross_spread=gross_spread,
+                unit_cost=unit_cost,
+                unit_net_profit=unit_net_profit,
+                total_cost=cost.total,
+                net_profit=net_profit,
+                annualized_return=annualized_return,
+                status=signal.status,
+                reason=reason,
+            )
+            _record_spread_history(
+                db,
+                symbol=mapping.symbol,
+                direction=direction,
+                hyperliquid=hl,
+                mt5=mt,
+                quantity=quantity,
+                mt5_quantity=sizing.mt5_quantity,
+                hyperliquid_quantity=sizing.hyperliquid_quantity,
+                notional_currency=sizing.currency,
+                fx_rate_to_usd=sizing.fx_rate_to_usd,
+                gross_spread=gross_spread,
+                unit_cost=unit_cost,
+                unit_net_profit=unit_net_profit,
+                total_cost=cost.total,
+                net_profit=net_profit,
+                annualized_return=annualized_return,
+                status=signal.status,
+                reason=reason,
+                settings=settings,
+            )
+            if _sync_current_opportunity(
+                db,
+                symbol=mapping.symbol,
+                direction=direction,
+                notional=notional,
+                quantity=quantity,
+                mt5_quantity=sizing.mt5_quantity,
+                hyperliquid_quantity=sizing.hyperliquid_quantity,
+                notional_currency=sizing.currency,
+                fx_rate_to_usd=sizing.fx_rate_to_usd,
+                gross_spread=gross_spread,
+                unit_cost=unit_cost,
+                unit_net_profit=unit_net_profit,
+                total_cost=cost.total,
+                net_profit=net_profit,
+                annualized_return=annualized_return,
+                entry_threshold=statistical_signal.reachable_entry,
+                exit_target=statistical_signal.exit_target,
+                overheat_threshold=statistical_signal.overheat,
+                signal_sample_count=statistical_signal.sample_count,
+                status=signal.status,
+                reason=signal.reason,
+            ):
+                created += 1
+        db.commit()
+        return created
+    except Exception as exc:
+        db.rollback()
+        db.add(WorkerRun(worker_name="spread_scanner", status="failed", duration_ms=int((perf_counter() - started) * 1000), error_message=str(exc)))
+        db.add(SystemLog(level="error", category="scanner", message="价差扫描失败", context=str(exc)))
+        prune_table_by_id(db, WorkerRun)
+        prune_table_by_id(db, SystemLog)
+        db.commit()
+        raise
+
+
+def _round_up_to_step(value: float, step: float, precision: int) -> float:
+    if step <= 0:
+        return round(value, precision)
+    units = int(value / step)
+    if units * step < value:
+        units += 1
+    return round(units * step, precision)
+
+
+def _position_sizing(mapping, mt5_mid: float, hyperliquid_mid: float, target_notional_usd: float) -> PositionSizing:
+    currency = (mapping.mt5_currency_profit or mapping.quote_asset or "USD").upper()
+    fx = fx_to_usd(currency)
+    contract_size = mapping.mt5_contract_size or mapping.contract_multiplier or 1.0
+    lot_min = mapping.mt5_min_lot or mapping.min_order_size or 0.0
+    lot_step = mapping.mt5_volume_step or lot_min or 0.0
+    if mt5_mid <= 0 or hyperliquid_mid <= 0:
+        raise ValueError("报价异常，无法计算名义价值")
+    lot_notional_usd = mt5_mid * contract_size * fx.rate_to_usd
+    if lot_notional_usd <= 0:
+        raise ValueError("MT5 单手 USD 名义价值异常")
+    raw_lots = max(target_notional_usd / lot_notional_usd, lot_min)
+    mt5_lots = _round_up_to_step(raw_lots, lot_step, _decimal_places(lot_step))
+    mt5_base_quantity = mt5_lots * contract_size
+    mt5_point_value_usd = mt5_base_quantity * fx.rate_to_usd
+    notional_usd = mt5_mid * mt5_base_quantity * fx.rate_to_usd
+    hyperliquid_quantity = mt5_point_value_usd
+    if hyperliquid_quantity <= 0:
+        raise ValueError("Hyperliquid 数量异常")
+    return PositionSizing(
+        mt5_quantity=mt5_lots,
+        mt5_base_quantity=mt5_base_quantity,
+        mt5_point_value_usd=mt5_point_value_usd,
+        hyperliquid_quantity=round(hyperliquid_quantity, 8),
+        notional_usd=notional_usd,
+        currency=currency,
+        fx_rate_to_usd=fx.rate_to_usd,
+        fx_source=fx.source,
+    )
+
+
+def _decimal_places(value: float) -> int:
+    text = f"{value:.12f}".rstrip("0").rstrip(".")
+    return len(text.split(".", 1)[1]) if "." in text else 0
+
+
+def _hl_fee_rate(order_type: str, hl_costs) -> float:
+    return hl_costs.maker_fee_rate if order_type == "limit" else hl_costs.taker_fee_rate
+
+
+def _upsert_current_spread(
+    db: Session,
+    *,
+    symbol: str,
+    direction: str,
+    hyperliquid_bid: float,
+    hyperliquid_ask: float,
+    mt5_bid: float,
+    mt5_ask: float,
+    quantity: float,
+    gross_spread: float,
+    unit_cost: float,
+    unit_net_profit: float,
+    total_cost: float,
+    net_profit: float,
+    annualized_return: float,
+    status: str,
+    reason: str,
+    mt5_quantity: float = 0.0,
+    hyperliquid_quantity: float = 0.0,
+    notional_currency: str = "USD",
+    fx_rate_to_usd: float = 1.0,
+) -> SpreadCurrent:
+    row = db.query(SpreadCurrent).filter(SpreadCurrent.symbol == symbol).first()
+    if not row:
+        row = SpreadCurrent(symbol=symbol)
+        db.add(row)
+    row.direction = direction
+    row.hyperliquid_bid = hyperliquid_bid
+    row.hyperliquid_ask = hyperliquid_ask
+    row.mt5_bid = mt5_bid
+    row.mt5_ask = mt5_ask
+    row.quantity = quantity
+    row.mt5_quantity = mt5_quantity or quantity
+    row.hyperliquid_quantity = hyperliquid_quantity or quantity
+    row.notional_currency = notional_currency
+    row.fx_rate_to_usd = fx_rate_to_usd
+    row.gross_spread = gross_spread
+    row.unit_cost = unit_cost
+    row.unit_net_profit = unit_net_profit
+    row.total_cost = total_cost
+    row.net_profit = net_profit
+    row.annualized_return = annualized_return
+    row.status = status
+    row.reason = reason
+    row.sampled_at = datetime.utcnow()
+    return row
+
+
+def _record_spread_history(
+    db: Session,
+    *,
+    symbol: str,
+    direction: str,
+    hyperliquid,
+    mt5,
+    quantity: float,
+    mt5_quantity: float,
+    hyperliquid_quantity: float,
+    notional_currency: str,
+    fx_rate_to_usd: float,
+    gross_spread: float,
+    unit_cost: float,
+    unit_net_profit: float,
+    total_cost: float,
+    net_profit: float,
+    annualized_return: float,
+    status: str,
+    reason: str,
+    settings,
+) -> None:
+    now = datetime.utcnow()
+    bucket_seconds = max(settings.spread_bucket_seconds, 1)
+    bucket_start_ts = int(now.timestamp()) // bucket_seconds * bucket_seconds
+    bucket_start = datetime.utcfromtimestamp(bucket_start_ts)
+    key = (symbol, direction)
+    accumulator = _bucket_accumulators.get(key)
+    if not accumulator or accumulator.bucket_start != bucket_start:
+        if accumulator:
+            _flush_bucket(db, accumulator)
+        accumulator = BucketAccumulator(
+            symbol=symbol,
+            direction=direction,
+            bucket_start=bucket_start,
+            bucket_seconds=bucket_seconds,
+            open_spread=gross_spread,
+            high_spread=gross_spread,
+            low_spread=gross_spread,
+            close_spread=gross_spread,
+            unit_cost_sum=unit_cost,
+            unit_net_profit_sum=unit_net_profit,
+            spread_sum=gross_spread,
+            sample_count=1,
+        )
+        _bucket_accumulators[key] = accumulator
+    else:
+        accumulator.high_spread = max(accumulator.high_spread, gross_spread)
+        accumulator.low_spread = min(accumulator.low_spread, gross_spread)
+        accumulator.close_spread = gross_spread
+        accumulator.unit_cost_sum += unit_cost
+        accumulator.unit_net_profit_sum += unit_net_profit
+        accumulator.spread_sum += gross_spread
+        accumulator.sample_count += 1
+
+    history_interval = max(settings.spread_history_interval_seconds, 1)
+    last_flush = _last_snapshot_flush.get(key, 0.0)
+    if now.timestamp() - last_flush >= history_interval:
+        _flush_bucket(db, accumulator)
+        _last_snapshot_flush[key] = now.timestamp()
+        db.add(MarketSnapshot(platform="hyperliquid", symbol=symbol, bid=hyperliquid.bid, ask=hyperliquid.ask, mid=hyperliquid.mid, depth_notional=hyperliquid.depth_notional, captured_at=hyperliquid.local_recv_ts))
+        db.add(MarketSnapshot(platform="mt5", symbol=symbol, bid=mt5.bid, ask=mt5.ask, mid=mt5.mid, depth_notional=mt5.depth_notional, captured_at=mt5.local_recv_ts))
+        db.add(
+            SpreadSnapshot(
+                symbol=symbol,
+                direction=direction,
+                hyperliquid_bid=hyperliquid.bid,
+                hyperliquid_ask=hyperliquid.ask,
+                mt5_bid=mt5.bid,
+                mt5_ask=mt5.ask,
+                quantity=quantity,
+                mt5_quantity=mt5_quantity,
+                hyperliquid_quantity=hyperliquid_quantity,
+                notional_currency=notional_currency,
+                fx_rate_to_usd=fx_rate_to_usd,
+                gross_spread=gross_spread,
+                unit_cost=unit_cost,
+                unit_net_profit=unit_net_profit,
+                total_cost=total_cost,
+                net_profit=net_profit,
+                annualized_return=annualized_return,
+                status=status,
+                reason=reason,
+            )
+        )
+
+
+def _flush_bucket(db: Session, accumulator: BucketAccumulator) -> None:
+    row = (
+        db.query(SpreadBucket)
+        .filter(
+            SpreadBucket.symbol == accumulator.symbol,
+            SpreadBucket.direction == accumulator.direction,
+            SpreadBucket.bucket_start == accumulator.bucket_start,
+            SpreadBucket.bucket_seconds == accumulator.bucket_seconds,
+        )
+        .first()
+    )
+    if not row:
+        row = SpreadBucket(
+            symbol=accumulator.symbol,
+            direction=accumulator.direction,
+            bucket_start=accumulator.bucket_start,
+            bucket_seconds=accumulator.bucket_seconds,
+        )
+        db.add(row)
+    row.open_spread = accumulator.open_spread
+    row.high_spread = accumulator.high_spread
+    row.low_spread = accumulator.low_spread
+    row.close_spread = accumulator.close_spread
+    row.avg_spread = accumulator.spread_sum / max(accumulator.sample_count, 1)
+    row.avg_unit_cost = accumulator.unit_cost_sum / max(accumulator.sample_count, 1)
+    row.avg_unit_net_profit = accumulator.unit_net_profit_sum / max(accumulator.sample_count, 1)
+    row.sample_count = accumulator.sample_count
+
+
+def _sync_current_opportunity(
+    db: Session,
+    *,
+    symbol: str,
+    direction: str,
+    notional: float,
+    quantity: float,
+    mt5_quantity: float,
+    hyperliquid_quantity: float,
+    notional_currency: str,
+    fx_rate_to_usd: float,
+    gross_spread: float,
+    unit_cost: float,
+    unit_net_profit: float,
+    total_cost: float,
+    net_profit: float,
+    annualized_return: float,
+    entry_threshold: float,
+    exit_target: float,
+    overheat_threshold: float,
+    signal_sample_count: int,
+    status: str,
+    reason: str,
+) -> bool:
+    active_statuses = ("candidate", "executable", "executing")
+    active_rows = db.query(ArbitrageOpportunity).filter(ArbitrageOpportunity.symbol == symbol, ArbitrageOpportunity.status.in_(active_statuses)).all()
+    if status not in active_statuses:
+        for row in active_rows:
+            row.status = "rejected"
+            row.reject_reason = reason or "价差回落，不再满足候选条件"
+        return False
+
+    current = next((row for row in active_rows if row.direction == direction), None)
+    if not current:
+        current = ArbitrageOpportunity(symbol=symbol, direction=direction)
+        db.add(current)
+    elif current.status == "executing":
+        current.reject_reason = "自动执行中，扫描不覆盖该机会"
+        return False
+    for stale in active_rows:
+        if stale is not current:
+            stale.status = "rejected"
+            stale.reject_reason = "方向切换或价差回落，移出当前候选池"
+
+    current.notional = notional
+    current.quantity = quantity
+    current.mt5_quantity = mt5_quantity
+    current.hyperliquid_quantity = hyperliquid_quantity
+    current.notional_currency = notional_currency
+    current.fx_rate_to_usd = fx_rate_to_usd
+    current.gross_spread = gross_spread
+    current.unit_cost = unit_cost
+    current.unit_net_profit = unit_net_profit
+    current.total_cost = total_cost
+    current.net_profit = net_profit
+    current.annualized_return = annualized_return
+    current.entry_threshold = entry_threshold
+    current.exit_target = exit_target
+    current.overheat_threshold = overheat_threshold
+    current.signal_sample_count = signal_sample_count
+    current.status = status
+    current.reject_reason = reason
+    return True

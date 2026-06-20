@@ -1,0 +1,77 @@
+# API 文档
+
+后端服务默认地址为 `http://127.0.0.1:8000`，所有业务接口以 `/api` 开头。除登录外，其余接口都需要 `Authorization: Bearer <token>`。
+
+## 认证
+
+- `POST /api/auth/login`：管理员登录。
+- `POST /api/auth/logout`：退出登录。
+- `GET /api/auth/me`：获取当前用户。
+
+默认本地账号为 `admin/admin123`，生产环境必须通过 `.env` 修改。
+
+## 仪表盘
+
+- `GET /api/dashboard/summary`：总权益、PnL、风险模式、对冲组和告警摘要。
+- `GET /api/dashboard/equity-curve`：账户权益曲线。
+- `GET /api/dashboard/risk-summary`：风控配置和最近风控事件。
+
+## 行情与机会
+
+- `POST /api/markets/scan`：手动触发一次价差扫描。
+- `GET /api/stream?token=<access_token>`：SSE 实时推送当前价差、候选机会、账户快照和价差研究 bucket 变更信号。
+- `GET /api/markets/symbols`：查看手动品种映射。
+- `GET /api/markets/quotes`：查看实时行情缓存中的最新报价、来源和本地接收时间。
+- `GET /api/markets/trading-sessions`：查看每个品种的 MT5 交易时段状态和动作级权限。
+- `GET /api/markets/spreads?page=1&page_size=20`：查看每个品种最新一条实时价差快照，页面不展示历史扫描记录；展示口径使用 `gross_spread`、`unit_cost`、`unit_net_profit`。
+- `GET /api/analytics/spread-summary?symbol=BTC&direction=long_mt5_short_hyperliquid&range=1h`：查看价差均值、标准差、Z-Score、分位数、半衰期和回归概率。
+- `GET /api/analytics/spread-series?symbol=BTC&direction=long_mt5_short_hyperliquid&range=1h`：查看后端降采样后的价差曲线，支持 `15m/1h/4h/24h/7d`。
+- `GET /api/analytics/funding-series?symbol=JP225&range=7d&bucket=day`：查看单个品种历史资金费率曲线和统计，后端会按品种映射自动查询 Hyperliquid/HIP-3 合约，支持 `24h/7d/30d/90d` 和 `raw/hour/day` 聚合。
+- `GET /api/analytics/lead-lag?symbol=JP225&window_seconds=300&threshold_bps=3&max_lag_ms=2000`：查看最近报价领先/滞后分析，用内存报价历史判断 HL 与 MT5 谁先跳动、另一边是否跟随、滞后毫秒和滞后期间最大 mid 差。
+- `GET /api/opportunities?page=1&page_size=20`：查看当前仍满足条件的候选机会；价差回落后对应机会会从当前池移除；展示口径使用 `gross_spread`、`unit_cost`、`unit_net_profit`。
+- `GET /api/opportunities/{id}`：查看单个机会。
+- `POST /api/opportunities/{id}/execute`：按当前执行模式创建对冲组。
+
+## 对冲组
+
+- `GET /api/hedge-groups?page=1&page_size=20`：分页查看对冲组。
+- `GET /api/hedge-groups/{id}`：查看对冲组详情、事件和订单。
+- `POST /api/hedge-groups/{id}/close`：手动平仓。
+- `POST /api/hedge-groups/{id}/mark-manual`：标记为需要人工处理。
+- Paper 自动平仓由后台调度器执行，不需要前端点击；对冲组会返回 `entry_spread`、`entry_threshold`、`exit_target`、`overheat_threshold` 和 `close_reason`。
+
+## 账户、仓位、订单
+
+- `GET /api/accounts`：同步并返回 Hyperliquid、MT5 两个平台的最新账户状态；Hyperliquid 会分开展示 Perp 权益、Spot USDC、可提取和可用保证金，读取失败时回退 Paper 账户。
+- `GET /api/accounts/snapshots`：账户快照分页。
+- `GET /api/positions`：当前仓位。
+- `GET /api/orders`：订单分页。
+- `GET /api/fills`：成交分页。
+
+## 风控
+
+- `GET /api/risk/status`：当前风控参数。
+- `GET /api/risk/events`：风控事件分页。
+- `POST /api/risk/mode`：切换 `normal/reduce_only/paused/emergency_stop`。
+- `POST /api/risk/emergency-stop`：触发紧急停止。
+
+## 设置
+
+- `GET/PUT /api/settings/strategy`：策略参数，包含统计入场线、Paper 自动执行和 Paper 自动平仓参数；自动平仓退出线按 `max(低分位价差, 成本保护线 + 每份利润缓冲)` 计算。
+- `GET/PUT /api/settings/risk`：风控参数。
+- `GET/PUT /api/settings/symbol-mappings`：品种映射。
+- `POST /api/settings/symbol-mappings`：新增单条品种映射。
+- `PUT /api/settings/symbol-mappings/{id}`：更新单条品种映射。
+- `DELETE /api/settings/symbol-mappings/{id}`：删除单条品种映射。
+- `POST /api/settings/symbol-mappings/{id}/sync-broker`：从 MT5 `symbol_info()` 同步最小手数、步进、合约大小、价格精度和最小跳动。
+- 品种映射包含执行策略字段：`execution_style`、`hl_open_order_type`、`hl_close_order_type`、`hl_post_only`、`hl_maker_offset_bps`、`hl_order_ttl_seconds`、`hl_unfilled_action`、`single_leg_action`。
+- 品种映射包含 MT5 会话保护字段：`mt5_pre_close_no_open_minutes`、`mt5_post_open_cooldown_minutes`、`allow_hold_through_mt5_close`。
+- `GET/PUT /api/settings/live-trading`：实盘开关。
+
+开启实盘时必须传入确认短语 `ENABLE LIVE TRADING`。
+
+## 日志与告警
+
+- `GET /api/logs`：系统日志分页。
+- `GET /api/alerts`：站内告警分页。
+- `POST /api/alerts/{id}/ack`：确认告警。

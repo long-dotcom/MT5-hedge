@@ -2,12 +2,12 @@ import { BrowserRouter, Navigate, Route, Routes } from 'react-router-dom';
 import { AppLayout } from './layouts/AppLayout';
 import { LoginPage } from './pages/LoginPage';
 import { DashboardPage } from './pages/DashboardPage';
-import { SpreadsPage } from './pages/SpreadsPage';
 import { SpreadAnalyticsPage } from './pages/SpreadAnalyticsPage';
 import { FundingAnalyticsPage } from './pages/FundingAnalyticsPage';
 import { LeadLagPage } from './pages/LeadLagPage';
-import { OpportunitiesPage } from './pages/OpportunitiesPage';
+import { PipelinePage } from './pages/PipelinePage';
 import { HedgeGroupsPage } from './pages/HedgeGroupsPage';
+import { ExecutionPage } from './pages/ExecutionPage';
 import { AccountsPage } from './pages/AccountsPage';
 import { PositionsPage } from './pages/PositionsPage';
 import { RiskPage } from './pages/RiskPage';
@@ -27,12 +27,12 @@ export default function App() {
         <Route path="/login" element={<LoginPage />} />
         <Route element={<ProtectedRoute />}>
           <Route path="/" element={<DashboardPage />} />
-          <Route path="/spreads" element={<SpreadsPage />} />
           <Route path="/analytics" element={<SpreadAnalyticsPage />} />
           <Route path="/funding" element={<FundingAnalyticsPage />} />
           <Route path="/lead-lag" element={<LeadLagPage />} />
-          <Route path="/opportunities" element={<OpportunitiesPage />} />
+          <Route path="/pipeline" element={<PipelinePage />} />
           <Route path="/hedge-groups" element={<HedgeGroupsPage />} />
+          <Route path="/execution" element={<ExecutionPage />} />
           <Route path="/accounts" element={<AccountsPage />} />
           <Route path="/positions" element={<PositionsPage />} />
           <Route path="/risk" element={<RiskPage />} />

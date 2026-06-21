@@ -6,11 +6,11 @@ from sqlalchemy.orm import Session
 
 from app.analytics.spreads import load_spread_points
 from app.config.settings import get_settings
-from app.db.models import HedgeGroup, StrategySetting, SystemLog, WorkerRun
+from app.db.models import HedgeGroup, StrategySetting, SystemLog, SystemSetting, WorkerRun
 from app.db.retention import prune_table_by_id
-from app.execution.engine import paper_close_hedge_group
+from app.execution.engine import close_hedge_group, paper_close_hedge_group
 from app.market.quotes import quote_synchronizer
-from app.strategy.statistical_signal import _percentile
+from app.strategy.statistical_signal import _exit_target_with_profit_buffer, _percentile
 
 
 @dataclass(frozen=True)
@@ -32,21 +32,27 @@ def run_auto_close(db: Session) -> int:
     if not strategy.auto_close_enabled:
         return 0
 
-    groups = (
-        db.query(HedgeGroup)
-        .filter(HedgeGroup.status.in_(AUTO_CLOSE_STATUSES), HedgeGroup.execution_mode == "paper")
-        .order_by(HedgeGroup.opened_at)
-        .limit(50)
-        .all()
-    )
+    modes = ["paper"]
+    if strategy.auto_close_live_enabled:
+        modes.append("live")
+    groups = db.query(HedgeGroup).filter(HedgeGroup.status.in_(AUTO_CLOSE_STATUSES), HedgeGroup.execution_mode.in_(modes)).order_by(HedgeGroup.opened_at).limit(50).all()
     for group in groups:
         try:
+            if group.execution_mode == "live" and not _live_auto_close_allowed(db):
+                db.add(SystemLog(level="warning", category="auto_close", message=f"跳过 live 自动平仓: {group.symbol} #{group.id}", context="live_trading_enabled 未开启"))
+                prune_table_by_id(db, SystemLog)
+                db.commit()
+                continue
             evaluation = evaluate_auto_close(db, strategy, group)
             group.unrealized_pnl = evaluation.estimated_profit
             if not evaluation.should_close:
                 continue
-            paper_close_hedge_group(db, group.id, evaluation.reason, evaluation.estimated_profit)
-            db.add(SystemLog(level="info", category="auto_close", message=f"自动纸面平仓成功: {group.symbol} #{group.id}", context=evaluation.reason))
+            if group.execution_mode == "live":
+                close_hedge_group(db, group.id, f"auto_live: {evaluation.reason}")
+                db.add(SystemLog(level="info", category="auto_close", message=f"自动实盘平仓已提交: {group.symbol} #{group.id}", context=evaluation.reason))
+            else:
+                paper_close_hedge_group(db, group.id, evaluation.reason, evaluation.estimated_profit)
+                db.add(SystemLog(level="info", category="auto_close", message=f"自动纸面平仓成功: {group.symbol} #{group.id}", context=evaluation.reason))
             prune_table_by_id(db, SystemLog)
             db.commit()
             closed += 1
@@ -102,12 +108,23 @@ def _fallback_exit_target(db: Session, strategy: StrategySetting, group: HedgeGr
     if len(points) < strategy.statistical_min_samples:
         return 0.0
     spreads = [point.spread for point in points]
-    costs = [point.total_cost for point in points]
-    cost_guard = _percentile(costs, strategy.cost_guard_percentile)
-    return max(_percentile(spreads, strategy.exit_target_percentile), cost_guard + max(strategy.auto_close_unit_profit_buffer, 0.0))
+    quantity = group.hyperliquid_quantity or group.quantity or 1.0
+    entry_spread = group.entry_spread or group.entry_threshold
+    unit_open_cost = group.open_cost / max(quantity, 1e-12)
+    return _exit_target_with_profit_buffer(
+        percentile_target=_percentile(spreads, strategy.exit_target_percentile),
+        entry_spread=entry_spread,
+        unit_cost=unit_open_cost,
+        unit_profit_buffer=strategy.auto_close_unit_profit_buffer,
+    )
 
 
 def _hold_expired(group: HedgeGroup, strategy: StrategySetting) -> bool:
     if not group.opened_at:
         return False
     return datetime.utcnow() - group.opened_at >= timedelta(minutes=max(strategy.max_holding_minutes, 1))
+
+
+def _live_auto_close_allowed(db: Session) -> bool:
+    row = db.query(SystemSetting).filter(SystemSetting.key == "live_trading_enabled").first()
+    return bool(row and row.value == "true")

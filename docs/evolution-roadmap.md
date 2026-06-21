@@ -15,11 +15,11 @@
 - SSE 实时推送。
 - SQLite 本地数据库。
 
-当前系统还没有真正启用实盘交易能力：
+当前系统已经开始具备受保护的实盘交易能力，但还没有完成生产级闭环：
 
-- Hyperliquid live 下单适配器仍返回保护性失败。
-- MT5 live 下单适配器仍返回保护性失败。
-- live 模式路径存在，但真实下单、撤单、成交回报、异常补偿还没有完成。
+- Hyperliquid 可通过 NautilusTrader bridge Strategy 提交单腿 market/limit 订单，但默认关闭，且启动恢复、挂单查询、仓位 reconciliation 还没有完成。
+- MT5 live market order 已有受保护提交路径，但默认关闭，且订单查询、成交回报轮询、历史恢复还没有完成。
+- live 模式路径存在，但完整撤单、成交回报、异常补偿还没有完成。
 - 自动平仓目前只支持 Paper 对冲组，不会对 live 对冲组发反向单。
 
 因此当前更准确的定位是：
@@ -315,6 +315,16 @@ NautilusTrader 管 order/position lifecycle
 
 这样后续是否接 NautilusTrader，都不会影响上层策略和前端。
 
+当前已完成 N0 落地：
+
+- `backend/app/execution/gateway.py` 定义统一执行意图和事件对象。
+- `AdapterExecutionGateway` 把现有 `HyperliquidAdapter` / `MT5Adapter` 的返回值转换为 `OrderEvent` / `FillEvent`。
+- `build_execution_gateway()` 是后续替换 Hyperliquid NautilusTrader gateway 的集中入口。
+- `open_hedge_group()`、`close_hedge_group()` 和 `paper_close_hedge_group()` 的下单记录路径已经通过 gateway 提交单腿订单，再写回原有 `orders` / `fills` 表。
+- 当前没有引入 NautilusTrader 运行时依赖，也没有改变 Paper/Live 保护边界。
+
+后续 N1 可以在不改 HedgeGroup Manager 的前提下新增 NautilusTrader Hyperliquid gateway 实现。
+
 #### 阶段 N1：Hyperliquid 单腿 PoC
 
 目标：
@@ -328,6 +338,28 @@ NautilusTrader 管 order/position lifecycle
 - 不接 MT5。
 - 不做完整双腿自动套利。
 - 不直接启用 live 自动执行。
+
+当前已完成 N1 代码接入：
+
+- `NautilusHyperliquidGateway` 作为 `ExecutionGateway` 的 Hyperliquid-only 实现，负责把系统 `LegOrderIntent` 映射到 NautilusTrader Hyperliquid instrument id，并把 Nautilus 提交结果映射回 `OrderEvent` / `FillEvent`。
+- `build_execution_gateway()` 在 `NAUTILUS_HYPERLIQUID_ENABLED=true` 且平台为 `hyperliquid` 时切换到 Nautilus gateway；MT5 始终保留现有 `MT5Adapter` 桥接层。
+- Nautilus TradingNode 按官方 Hyperliquid adapter 路径构建：`HyperliquidDataClientConfig`、`HyperliquidExecClientConfig`、`HyperliquidLiveDataClientFactory`、`HyperliquidLiveExecClientFactory`。
+- `NautilusTradingNodeSubmitter` 已注册 bridge Strategy；当 `NAUTILUS_HYPERLIQUID_SUBMIT_ENABLED=true` 时，支持提交 Hyperliquid market/limit 单，并把 accepted/filled/rejected 事件映射为系统订单结果。bridge 已按 NautilusTrader 1.228.0 的 `OrderFactory.market/limit` 接口传入原生 `ClientOrderId`，平仓/补偿腿也会透传 `reduce_only`。
+- 已支持 `testnet/mainnet` 环境、`PERP/PERP_HIP3` 产品类型、私钥、vault、主账户 `account_address` 和 trader id 配置。
+- 单元测试已覆盖 Hyperliquid 符号映射、Nautilus 提交结果到系统订单/成交事件的映射、实盘提交保护开关，以及 gateway 工厂开关。
+
+N1 的运行前置条件：
+
+- 安装可用的 `nautilus_trader` Python 包和 Hyperliquid adapter。
+- 准备 Hyperliquid testnet 或小额主网钱包，设置 `NAUTILUS_HYPERLIQUID_PRIVATE_KEY`；agent wallet 还需要设置 `HYPERLIQUID_ACCOUNT_ADDRESS`。
+- 先在 testnet 或极小主网仓位验证订单接受、拒绝和成交事件，再允许接入自动双腿实盘路径。
+
+当前仍然不做：
+
+- 不让 NautilusTrader 接管 MT5。
+- 不让 NautilusTrader 直接表达双腿对冲组。
+- 不把完整自动套利切到 NautilusTrader。
+- 不把 Nautilus cache/portfolio reconciliation 当成已经完成；启动恢复、挂单查询、残余仓位校验仍需要在 N2/N3 补齐。
 
 #### 阶段 N2：Execution Gateway 桥接
 
@@ -363,6 +395,27 @@ NautilusTrader 管 order/position lifecycle
   - `failed`
 
 这一步才开始让 NautilusTrader 间接参与完整套利执行。
+
+当前已落地的 N3 子集：
+
+- `open_hedge_group()` 已通过 `ExecutionGateway` 执行双腿开仓。
+- 手工关闭 `paper/live` 对冲组都会通过同一套反向订单路径提交两条平仓腿，不再只改数据库状态。
+- 对冲组状态区分 `closing`：外部订单已 accepted/submitted 但未成交时不会误标为 `closed`。
+- 自动执行器和 dashboard 已把 `closing` 视为未完成对冲组，避免重复开同品种新组。
+- `execution_reconciler` 已接入启动和周期调度，会回查 `opening` / `closing` 对冲组的 pending 订单，补写成交并推进 `open` / `closed` / `manual_intervention`。
+- Nautilus Hyperliquid gateway 在同一进程内复用 submitter/node/bridge Strategy，便于订单回查访问同一个本地事件缓存。
+- MT5Adapter 已补充 live 订单/成交查询入口，用于 reconciliation 消费 MT5 active/history order 与 deal 信息。
+- 自动平仓已支持受保护的 live 路径：`auto_close_live_enabled=true` 且 `live_trading_enabled=true` 时，live 对冲组达到退出条件会提交两条实盘平仓腿。
+- `execution_reconciler` 会刷新 live positions；Hyperliquid 读取 `clearinghouseState` perp 仓位，MT5 读取终端 `positions_get()`。已 `closed` 的 live 对冲组发现残仓时会回到 `manual_intervention` 并告警；账户中无法匹配任何 live 对冲组的仓位会生成“外部孤儿仓位”告警。
+- 单腿成交且另一腿仍 pending 时，系统会尝试撤销未成交腿；默认进入 `manual_intervention`，当品种映射 `single_leg_action=auto_close/reverse_filled_leg` 时，会反向冲销已成交腿。
+- Nautilus Hyperliquid gateway 会在本地 cache 查不到订单时，用 Hyperliquid `orderStatus` 主动查询外部订单；成交订单再用 `userFills` 回填成交量、均价和手续费。
+- `execution_reconciler` 会读取 Hyperliquid 账户级 `openOrders` / `userFills` 快照，用于恢复已有外部订单号的 pending 单，以及唯一匹配的缺失外部订单号。
+- 外部 pending 订单状态仍不可重建时，系统会在 `execution_reconcile_pending_stale_seconds` 后尝试撤销并升级人工处理，避免进程重启后无限卡在 `opening/closing`。
+
+仍未完成：
+
+- 更完整的历史恢复：跨更长时间窗口分页扫描 recent fills / historical orders，并处理本地完全没有订单记录的外部遗留仓位或孤儿订单。
+- 自动补偿策略的实盘回归：当前已支持反向冲销已成交腿，还需要 testnet/小额主网验证 Hyperliquid 与 MT5 两侧真实成交回报和重复触发保护。
 
 #### 阶段 N4：正式 MT5 Nautilus adapter 评估
 

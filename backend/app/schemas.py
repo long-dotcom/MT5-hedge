@@ -1,7 +1,7 @@
 from datetime import datetime
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, field_validator
+from pydantic import BaseModel, ConfigDict, field_validator, model_validator
 
 
 class LoginRequest(BaseModel):
@@ -27,6 +27,7 @@ class StrategySettingsIn(BaseModel):
     min_unit_edge: float = 0.0
     min_total_profit: float = 0.5
     auto_close_enabled: bool = True
+    auto_close_live_enabled: bool = False
     exit_target_percentile: float = 0.25
     auto_close_unit_profit_buffer: float = 20.0
     auto_close_min_profit: float = 0.0
@@ -76,6 +77,11 @@ class CloseHedgeGroupIn(BaseModel):
     reason: str = "manual"
 
 
+class AdoptPositionIn(BaseModel):
+    reason: str = "adopt external live position"
+    symbol: str = ""
+
+
 class SymbolMappingIn(BaseModel):
     symbol: str
     hyperliquid_symbol: str
@@ -117,6 +123,15 @@ class SymbolMappingIn(BaseModel):
     @classmethod
     def strip_symbol_text(cls, value: str) -> str:
         return value.strip()
+
+    @model_validator(mode="after")
+    def validate_hyperliquid_symbol(self) -> "SymbolMappingIn":
+        value = self.hyperliquid_symbol.strip()
+        normalized = value.upper()
+        if ":" not in value and "." not in value and "-" not in value and normalized.endswith("USD"):
+            base = value[:-3]
+            raise ValueError(f"Hyperliquid 标准永续请填写基础币符号 `{base}`，不要填写 MT5 符号 `{value}`")
+        return self
 
 
 class ORMModel(BaseModel):

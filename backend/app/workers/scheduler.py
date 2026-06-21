@@ -7,6 +7,7 @@ from app.config.settings import get_settings
 from app.db.session import SessionLocal
 from app.execution.auto_closer import run_auto_close
 from app.execution.auto_executor import run_auto_execute
+from app.execution.reconciler import run_execution_reconcile
 from app.market.scanner import run_scan
 
 
@@ -20,6 +21,7 @@ def scanner_job() -> None:
         run_scan(db)
         run_auto_execute(db)
         run_auto_close(db)
+        run_execution_reconcile(db)
     except Exception as exc:
         logger.exception(f"扫描任务失败: {exc}")
     finally:

@@ -5,6 +5,8 @@ from pathlib import Path
 
 
 ROOT_DIR = Path(__file__).resolve().parents[3]
+HYPERLIQUID_MAINNET_INFO_URL = "https://api.hyperliquid.xyz/info"
+HYPERLIQUID_TESTNET_INFO_URL = "https://api.hyperliquid-testnet.xyz/info"
 
 
 def _load_env_file() -> dict[str, str]:
@@ -58,6 +60,9 @@ class Settings:
     loose_quote_sync_ms: int = 3000
     strict_quote_sync_ms: int = 500
     quote_stale_ms: int = 1500
+    hyperliquid_market_data_source: str = "native"
+    hyperliquid_market_data_fallback: str = "native"
+    hyperliquid_l2book_fast_enabled: bool = True
     hyperliquid_info_url: str = "https://api.hyperliquid.xyz/info"
     hyperliquid_ws_url: str = "wss://api.hyperliquid.xyz/ws"
     hyperliquid_default_taker_fee_rate: float = 0.00045
@@ -74,12 +79,36 @@ class Settings:
     fx_fallback_rates: str = '{"JPY":0.00625}'
     cost_cache_ttl_seconds: int = 60
 
-    hyperliquid_private_key: str = ""
-    hyperliquid_wallet_address: str = ""
     hyperliquid_account_address: str = ""
+    nautilus_hyperliquid_enabled: bool = False
+    nautilus_hyperliquid_submit_enabled: bool = False
+    nautilus_hyperliquid_order_timeout_seconds: float = 15.0
+    execution_reconcile_pending_stale_seconds: int = 300
+    nautilus_hyperliquid_environment: str = "testnet"
+    nautilus_hyperliquid_product_types: str = "PERP,PERP_HIP3"
+    nautilus_hyperliquid_private_key: str = ""
+    nautilus_hyperliquid_vault_address: str = ""
+    nautilus_trader_id: str = "MT5-HEDGE-001"
+    mt5_live_order_enabled: bool = False
+    mt5_order_deviation_points: int = 20
+    mt5_order_magic: int = 260620
     mt5_login: str = ""
     mt5_password: str = ""
     mt5_server: str = ""
+
+
+def hyperliquid_execution_info_url(settings: Settings | None = None) -> str:
+    settings = settings or get_settings()
+    configured_url = getattr(settings, "hyperliquid_info_url", HYPERLIQUID_MAINNET_INFO_URL)
+    known_urls = {HYPERLIQUID_MAINNET_INFO_URL, HYPERLIQUID_TESTNET_INFO_URL}
+    if configured_url not in known_urls:
+        return configured_url
+    environment = str(getattr(settings, "nautilus_hyperliquid_environment", "") or "").strip().lower()
+    if environment == "testnet":
+        return HYPERLIQUID_TESTNET_INFO_URL
+    if environment == "mainnet":
+        return HYPERLIQUID_MAINNET_INFO_URL
+    return configured_url
 
 
 @lru_cache

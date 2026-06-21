@@ -22,7 +22,7 @@ _confirmations: dict[tuple[int, str, str], OpportunityConfirmation] = {}
 _cooldown_until: dict[tuple[str, str], float] = {}
 
 
-OPEN_GROUP_STATUSES = ("opening", "open", "open_partial", "manual_intervention")
+OPEN_GROUP_STATUSES = ("opening", "open", "open_partial", "closing", "manual_intervention")
 
 
 def run_auto_execute(db: Session) -> int:

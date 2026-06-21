@@ -6,7 +6,7 @@ from sqlalchemy import desc
 from sqlalchemy.orm import Session
 
 from app.adapters.paper import PaperAdapter
-from app.config.settings import get_settings
+from app.config.settings import get_settings, hyperliquid_execution_info_url
 from app.db.models import AccountSnapshot
 
 
@@ -47,7 +47,7 @@ def ensure_initial_account_snapshots(db: Session) -> None:
 
 def _hyperliquid_account_snapshot() -> AccountSnapshot:
     settings = get_settings()
-    account_address = settings.hyperliquid_account_address or settings.hyperliquid_wallet_address
+    account_address = settings.hyperliquid_account_address or settings.nautilus_hyperliquid_vault_address
     if account_address:
         try:
             data = _post_hyperliquid_info({"type": "clearinghouseState", "user": account_address})
@@ -74,7 +74,7 @@ def _hyperliquid_account_snapshot() -> AccountSnapshot:
                 spot_hold=spot_hold,
                 withdrawable=withdrawable,
                 free_collateral=free_collateral,
-                data_source="hyperliquid_testnet" if "testnet" in settings.hyperliquid_info_url else "hyperliquid",
+                data_source="hyperliquid_testnet" if "testnet" in hyperliquid_execution_info_url(settings) else "hyperliquid",
             )
         except Exception as exc:
             logger.warning(f"Hyperliquid 账户读取失败，回退 Paper 账户: {exc}")
@@ -165,7 +165,7 @@ def _spot_usdc_balance(data: dict) -> tuple[float, float]:
 def _post_hyperliquid_info(payload: dict):
     settings = get_settings()
     req = request.Request(
-        settings.hyperliquid_info_url,
+        hyperliquid_execution_info_url(settings),
         data=json.dumps(payload).encode("utf-8"),
         headers={"Content-Type": "application/json"},
         method="POST",

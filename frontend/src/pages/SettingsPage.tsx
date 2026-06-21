@@ -1,5 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { Alert, Button, Card, Collapse, Form, Input, InputNumber, Modal, Popconfirm, Select, Space, Switch, Table, Tabs, Typography, message } from 'antd';
+import { Alert, Button, Card, Collapse, Form, Input, InputNumber, List, Modal, Popconfirm, Select, Space, Switch, Table, Tabs, Tag, Typography, message } from 'antd';
 import type { ColumnsType } from 'antd/es/table';
 import { useState } from 'react';
 import { api } from '../api/client';
@@ -14,9 +14,10 @@ export function SettingsPage() {
   const risk = useQuery({ queryKey: ['settings-risk'], queryFn: async () => (await api.get('/settings/risk')).data });
   const symbols = useQuery({ queryKey: ['settings-symbols'], queryFn: async () => (await api.get('/settings/symbol-mappings')).data });
   const live = useQuery({ queryKey: ['settings-live'], queryFn: async () => (await api.get('/settings/live-trading')).data });
+  const liveReadiness = useQuery({ queryKey: ['settings-live-readiness'], queryFn: async () => (await api.get('/settings/live-readiness')).data });
   const saveStrategy = useMutation({ mutationFn: async (v: any) => (await api.put('/settings/strategy', v)).data, onSuccess: () => { messageApi.success('策略已保存'); queryClient.invalidateQueries({ queryKey: ['settings-strategy'] }); } });
   const saveRisk = useMutation({ mutationFn: async (v: any) => (await api.put('/settings/risk', v)).data, onSuccess: () => { messageApi.success('风控已保存'); queryClient.invalidateQueries({ queryKey: ['settings-risk'] }); } });
-  const saveLive = useMutation({ mutationFn: async (v: any) => (await api.put('/settings/live-trading', v)).data, onSuccess: () => { messageApi.success('实盘开关已保存'); queryClient.invalidateQueries({ queryKey: ['settings-live'] }); } });
+  const saveLive = useMutation({ mutationFn: async (v: any) => (await api.put('/settings/live-trading', v)).data, onSuccess: () => { messageApi.success('实盘开关已保存'); queryClient.invalidateQueries({ queryKey: ['settings-live'] }); queryClient.invalidateQueries({ queryKey: ['settings-live-readiness'] }); } });
   const saveSymbol = useMutation({
     mutationFn: async (v: any) => editingSymbol ? (await api.put(`/settings/symbol-mappings/${editingSymbol.id}`, v)).data : (await api.post('/settings/symbol-mappings', v)).data,
     onSuccess: () => {
@@ -25,6 +26,9 @@ export function SettingsPage() {
       setEditingSymbol(null);
       symbolForm.resetFields();
       queryClient.invalidateQueries({ queryKey: ['settings-symbols'] });
+      queryClient.invalidateQueries({ queryKey: ['market-symbols'] });
+      queryClient.invalidateQueries({ queryKey: ['spreads'] });
+      queryClient.invalidateQueries({ queryKey: ['opportunities'] });
     },
     onError: (err: any) => messageApi.error(err.response?.data?.detail || '保存失败')
   });
@@ -33,6 +37,9 @@ export function SettingsPage() {
     onSuccess: () => {
       messageApi.success('品种映射已删除');
       queryClient.invalidateQueries({ queryKey: ['settings-symbols'] });
+      queryClient.invalidateQueries({ queryKey: ['market-symbols'] });
+      queryClient.invalidateQueries({ queryKey: ['spreads'] });
+      queryClient.invalidateQueries({ queryKey: ['opportunities'] });
     }
   });
   const syncBroker = useMutation({
@@ -136,7 +143,8 @@ export function SettingsPage() {
                   <Form.Item name="min_total_profit" label="最小总净利润 USD"><InputNumber min={0} step={0.1} /></Form.Item>
                   <Form.Item name="execution_mode" label="执行模式"><Select options={[{ value: 'dry_run' }, { value: 'paper' }, { value: 'live' }]} /></Form.Item>
                   <Form.Item name="auto_execute_enabled" label="自动执行" valuePropName="checked"><Switch /></Form.Item>
-                  <Form.Item name="auto_close_enabled" label="Paper 自动平仓" valuePropName="checked"><Switch /></Form.Item>
+                  <Form.Item name="auto_close_enabled" label="自动平仓" valuePropName="checked"><Switch /></Form.Item>
+                  <Form.Item name="auto_close_live_enabled" label="Live 自动平仓" valuePropName="checked"><Switch /></Form.Item>
                   <Form.Item name="exit_target_percentile" label="退出线低分位数"><InputNumber min={0.05} max={0.5} step={0.01} /></Form.Item>
                   <Form.Item name="auto_close_unit_profit_buffer" label="每份平仓利润缓冲"><InputNumber min={0} step={1} /></Form.Item>
                   <Form.Item name="auto_close_min_profit" label="自动平仓最小利润 USD"><InputNumber min={0} step={0.1} /></Form.Item>
@@ -221,12 +229,34 @@ export function SettingsPage() {
               key: 'live',
               label: '实盘开关',
               children: (
-                <Form key={String(live.data?.enabled)} layout="vertical" className="settings-form" initialValues={{ enabled: live.data?.enabled, confirmation: '' }} onFinish={(v) => saveLive.mutate(v)}>
+                <Space direction="vertical" size={12} className="full-width">
                   <Alert type="warning" showIcon message="真实下单默认关闭。开启前请确认 API 凭证、MT5 登录、风控参数和品种映射。" className="form-alert" />
-                  <Form.Item name="enabled" label="允许实盘" valuePropName="checked"><Switch /></Form.Item>
-                  <Form.Item name="confirmation" label="确认短语"><Input placeholder="ENABLE LIVE TRADING" /></Form.Item>
-                  <Button danger htmlType="submit">保存实盘开关</Button>
-                </Form>
+                  <Card size="small" title="实盘就绪检查">
+                    <Space direction="vertical" size={8} className="full-width">
+                      <Tag color={liveReadiness.data?.status === 'ready' ? 'green' : liveReadiness.data?.status === 'warning' ? 'gold' : 'red'}>
+                        {liveReadiness.data?.status || 'loading'}
+                      </Tag>
+                      <List
+                        size="small"
+                        loading={liveReadiness.isLoading}
+                        dataSource={liveReadiness.data?.checks || []}
+                        renderItem={(item: any) => (
+                          <List.Item>
+                            <Space>
+                              <Tag color={item.status === 'ok' ? 'green' : item.status === 'warn' ? 'gold' : 'red'}>{item.status}</Tag>
+                              <Typography.Text>{item.message}</Typography.Text>
+                            </Space>
+                          </List.Item>
+                        )}
+                      />
+                    </Space>
+                  </Card>
+                  <Form key={String(live.data?.enabled)} layout="vertical" className="settings-form" initialValues={{ enabled: live.data?.enabled, confirmation: '' }} onFinish={(v) => saveLive.mutate(v)}>
+                    <Form.Item name="enabled" label="允许实盘" valuePropName="checked"><Switch /></Form.Item>
+                    <Form.Item name="confirmation" label="确认短语"><Input placeholder="ENABLE LIVE TRADING" /></Form.Item>
+                    <Button danger htmlType="submit">保存实盘开关</Button>
+                  </Form>
+                </Space>
               )
             }
           ]}

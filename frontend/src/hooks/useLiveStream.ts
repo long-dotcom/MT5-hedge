@@ -6,6 +6,7 @@ type StreamSnapshot = {
   opportunities?: { total: number; items: any[] };
   accounts?: any[];
   latest_bucket_id?: number;
+  pipeline?: any;
 };
 
 export function useLiveStream() {
@@ -27,6 +28,9 @@ export function useLiveStream() {
       }
       if (data.accounts) {
         queryClient.setQueryData(['accounts'], data.accounts);
+      }
+      if (data.pipeline) {
+        queryClient.setQueryData(['pipeline-diagnostics'], data.pipeline);
       }
       if (data.latest_bucket_id && data.latest_bucket_id !== latestBucketId.current) {
         latestBucketId.current = data.latest_bucket_id;

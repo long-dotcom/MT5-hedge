@@ -5,7 +5,7 @@ from urllib import request
 
 from sqlalchemy.orm import Session
 
-from app.config.settings import Settings, get_settings
+from app.config.settings import Settings, get_settings, hyperliquid_execution_info_url
 from app.db.models import HedgeGroup, Position, SymbolMapping, SystemSetting
 
 
@@ -58,14 +58,14 @@ def _hyperliquid_nautilus_checks(settings: Settings) -> list[ReadinessCheck]:
             "NautilusTrader Hyperliquid 实盘提交已开启" if settings.nautilus_hyperliquid_submit_enabled else "NAUTILUS_HYPERLIQUID_SUBMIT_ENABLED 未开启",
         ),
         ReadinessCheck(
-            "hyperliquid_private_key",
+            "nautilus_hyperliquid_private_key",
             "ok" if settings.nautilus_hyperliquid_private_key else "block",
             "NautilusTrader Hyperliquid private key 已配置" if settings.nautilus_hyperliquid_private_key else "NAUTILUS_HYPERLIQUID_PRIVATE_KEY 未配置",
         ),
         ReadinessCheck(
             "hyperliquid_account_address",
             "ok" if user else "block",
-            "Hyperliquid 账户地址已配置" if user else "HYPERLIQUID_ACCOUNT_ADDRESS 或钱包/ vault 地址未配置，无法做账户级回查",
+            "Hyperliquid 账户地址已配置" if user else "HYPERLIQUID_ACCOUNT_ADDRESS 或 NAUTILUS_HYPERLIQUID_VAULT_ADDRESS 未配置，无法做账户级回查",
         ),
     ]
     try:
@@ -202,13 +202,13 @@ def _position_label(position: Position) -> str:
 
 
 def _hyperliquid_user_address(settings: Settings) -> str:
-    return settings.hyperliquid_account_address or settings.hyperliquid_wallet_address or settings.nautilus_hyperliquid_vault_address
+    return settings.hyperliquid_account_address or settings.nautilus_hyperliquid_vault_address
 
 
 def _hyperliquid_read_probe(settings: Settings, user: str) -> ReadinessCheck:
     try:
         payload = json.dumps({"type": "clearinghouseState", "user": user}).encode("utf-8")
-        req = request.Request(settings.hyperliquid_info_url, data=payload, headers={"Content-Type": "application/json"}, method="POST")
+        req = request.Request(hyperliquid_execution_info_url(settings), data=payload, headers={"Content-Type": "application/json"}, method="POST")
         with request.urlopen(req, timeout=10) as resp:
             data = json.loads(resp.read().decode("utf-8"))
         if isinstance(data, dict) and ("marginSummary" in data or "crossMarginSummary" in data or "assetPositions" in data):

@@ -19,13 +19,14 @@
 ## 行情与机会
 
 - `POST /api/markets/scan`：手动触发一次价差扫描。
-- `GET /api/stream?token=<access_token>`：SSE 实时推送当前价差、候选机会、账户快照和价差研究 bucket 变更信号。
+- `GET /api/stream?token=<access_token>`：SSE 实时推送当前价差、候选机会、账户快照和价差研究 bucket 变更信号；当前价差和候选机会优先来自内存扫描状态，扫描尚未完成时回退数据库当前表。
 - `GET /api/markets/symbols`：查看手动品种映射。
 - `GET /api/markets/quotes`：查看实时行情缓存中的最新报价、来源和本地接收时间。
 - `GET /api/markets/trading-sessions`：查看每个品种的 MT5 交易时段状态和动作级权限。
+- `GET /api/diagnostics/pipeline`：查看“链路监控”页面使用的结构化诊断状态，包含每个启用品种的 HL/MT5 报价年龄、同步时间差、扫描状态、候选状态、主阻塞环节、`blockers` 多阻塞原因列表，以及当前活跃对冲组池和生命周期泳道计数。`metrics` 中的 `quote_sync_duration_ms`、`symbol_scan_duration_ms`、`cost_duration_ms`、`signal_duration_ms`、`candidate_sync_duration_ms`、`persist_duration_ms` 来自扫描器本轮真实计算耗时；`scan_age_ms` 仅表示结果新鲜度。
 - `GET /api/markets/spreads?page=1&page_size=20`：查看每个品种最新一条实时价差快照，页面不展示历史扫描记录；展示口径使用 `gross_spread`、`unit_cost`、`unit_net_profit`。
 - `GET /api/analytics/spread-summary?symbol=BTC&direction=long_mt5_short_hyperliquid&range=1h`：查看价差均值、标准差、Z-Score、分位数、半衰期和回归概率。
-- `GET /api/analytics/spread-series?symbol=BTC&direction=long_mt5_short_hyperliquid&range=1h`：查看后端降采样后的价差曲线，支持 `15m/1h/4h/24h/7d`。
+- `GET /api/analytics/spread-series?symbol=BTC&direction=long_mt5_short_hyperliquid&range=1h`：查看后端降采样后的价差曲线，支持 `15m/1h/4h/24h/7d`；`15m/1h/4h` 优先用原始快照统计，`24h/7d` 优先用聚合桶。
 - `GET /api/analytics/funding-series?symbol=JP225&range=7d&bucket=day`：查看单个品种历史资金费率曲线和统计，后端会按品种映射自动查询 Hyperliquid/HIP-3 合约，支持 `24h/7d/30d/90d` 和 `raw/hour/day` 聚合。
 - `GET /api/analytics/lead-lag?symbol=JP225&window_seconds=300&threshold_bps=3&max_lag_ms=2000`：查看最近报价领先/滞后分析，用内存报价历史判断 HL 与 MT5 谁先跳动、另一边是否跟随、滞后毫秒和滞后期间最大 mid 差。
 - `GET /api/opportunities?page=1&page_size=20`：查看当前仍满足条件的候选机会；价差回落后对应机会会从当前池移除；展示口径使用 `gross_spread`、`unit_cost`、`unit_net_profit`。

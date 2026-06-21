@@ -1,13 +1,14 @@
 import {
-  AlertOutlined,
   ApiOutlined,
-  BarChartOutlined,
+  MenuFoldOutlined,
+  MenuUnfoldOutlined,
   DashboardOutlined,
   DatabaseOutlined,
   ExperimentOutlined,
   FundOutlined,
   LineChartOutlined,
   NodeIndexOutlined,
+  PartitionOutlined,
   HistoryOutlined,
   OrderedListOutlined,
   SafetyCertificateOutlined,
@@ -15,6 +16,7 @@ import {
   StockOutlined
 } from '@ant-design/icons';
 import { Button, Layout, Menu, Space, Typography } from 'antd';
+import { useState } from 'react';
 import { Outlet, useLocation, useNavigate } from 'react-router-dom';
 import { useLiveStream } from '../hooks/useLiveStream';
 
@@ -22,11 +24,10 @@ const { Header, Sider, Content } = Layout;
 
 const items = [
   { key: '/', icon: <DashboardOutlined />, label: '仪表盘' },
-  { key: '/spreads', icon: <BarChartOutlined />, label: '价差扫描' },
   { key: '/analytics', icon: <ExperimentOutlined />, label: '价差研究' },
   { key: '/funding', icon: <LineChartOutlined />, label: '资金费研究' },
   { key: '/lead-lag', icon: <NodeIndexOutlined />, label: '报价领先滞后' },
-  { key: '/opportunities', icon: <AlertOutlined />, label: '候选机会' },
+  { key: '/pipeline', icon: <PartitionOutlined />, label: '链路监控' },
   { key: '/hedge-groups', icon: <HistoryOutlined />, label: '对冲组' },
   { key: '/execution', icon: <OrderedListOutlined />, label: '执行记录' },
   { key: '/accounts', icon: <FundOutlined />, label: '账户' },
@@ -39,6 +40,7 @@ const items = [
 export function AppLayout() {
   const navigate = useNavigate();
   const location = useLocation();
+  const [collapsed, setCollapsed] = useState(false);
   useLiveStream();
   const logout = () => {
     localStorage.removeItem('token');
@@ -48,16 +50,24 @@ export function AppLayout() {
 
   return (
     <Layout className="app-shell">
-      <Sider width={224} theme="light" className="side-nav">
-        <div className="brand">
-          <ApiOutlined />
-          <span>MT5 Hedge</span>
+      <Sider width={224} collapsedWidth={72} collapsed={collapsed} trigger={null} theme="light" className="side-nav">
+        <div className={`brand ${collapsed ? 'collapsed' : ''}`}>
+          <div className="brand-mark"><ApiOutlined /></div>
+          {!collapsed && <span>MT5 Hedge</span>}
         </div>
-        <Menu mode="inline" selectedKeys={[location.pathname]} items={items} onClick={(event) => navigate(event.key)} />
+        <Menu mode="inline" selectedKeys={[location.pathname]} items={items} onClick={(event) => navigate(event.key)} inlineCollapsed={collapsed} />
       </Sider>
       <Layout>
         <Header className="topbar">
-          <Typography.Text strong>Hyperliquid + MT5 套利管理台</Typography.Text>
+          <Space size={12}>
+            <Button
+              type="text"
+              className="side-collapse-button"
+              icon={collapsed ? <MenuUnfoldOutlined /> : <MenuFoldOutlined />}
+              onClick={() => setCollapsed((value) => !value)}
+            />
+            <Typography.Text strong>Hyperliquid + MT5 套利管理台</Typography.Text>
+          </Space>
           <Space>
             <Typography.Text type="secondary">admin</Typography.Text>
             <Button onClick={logout}>退出</Button>

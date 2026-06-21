@@ -47,8 +47,10 @@ def sync_live_positions(db: Session) -> int:
     platforms = [adapter.platform for adapter in adapters]
     db.query(Position).filter(Position.platform.in_(platforms)).delete(synchronize_session=False)
     count = 0
+    hyperliquid_dexes = _hyperliquid_position_dexes(db)
     for adapter in adapters:
-        for item in adapter.get_positions():
+        positions = adapter.get_positions(dexes=hyperliquid_dexes) if isinstance(adapter, HyperliquidAdapter) else adapter.get_positions()
+        for item in positions:
             quantity = float(item.get("quantity", 0.0) or 0.0)
             if abs(quantity) <= 0:
                 continue
@@ -67,6 +69,19 @@ def sync_live_positions(db: Session) -> int:
             )
             count += 1
     return count
+
+
+def _hyperliquid_position_dexes(db: Session) -> list[str]:
+    dexes: list[str] = []
+    rows = db.query(SymbolMapping.hyperliquid_symbol).filter(SymbolMapping.enabled.is_(True)).all()
+    for (symbol,) in rows:
+        value = str(symbol or "")
+        if ":" not in value:
+            continue
+        dex = value.split(":", 1)[0].strip()
+        if dex and dex not in dexes:
+            dexes.append(dex)
+    return dexes
 
 
 def reconcile_hedge_group(db: Session, group: HedgeGroup) -> bool:

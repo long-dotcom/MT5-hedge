@@ -9,11 +9,12 @@ import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
-from app.analytics.spreads import SpreadPoint, downsample_spreads, summarize_spreads
+from app.analytics.spreads import SpreadPoint, downsample_spreads, load_spread_points, summarize_spreads
 from app.analytics.funding import FundingPoint, bucket_funding_points, summarize_funding
 from app.analytics.lead_lag import lead_lag_report
+from app.market import scanner as scanner_module
 from app.market import symbols as symbol_module
-from app.db.models import Alert, ArbitrageOpportunity, AuditLog, Base, Fill, HedgeGroup, HedgeGroupEvent, Order, Position, RiskSetting, StrategySetting, SymbolMapping, SystemSetting, User
+from app.db.models import Alert, ArbitrageOpportunity, AuditLog, Base, Fill, HedgeGroup, HedgeGroupEvent, Order, Position, RiskSetting, SpreadCurrent, StrategySetting, SymbolMapping, SystemSetting, User
 from app.execution.auto_closer import evaluate_auto_close, run_auto_close
 from app.execution import gateway as gateway_module
 from app.execution.engine import _has_position_effect, _is_pending_result, close_hedge_group, open_hedge_group
@@ -22,8 +23,11 @@ from app.execution.nautilus_hyperliquid import NautilusHyperliquidGateway, Nauti
 from app.execution import nautilus_hyperliquid as nautilus_module
 from app.execution.readiness import live_execution_readiness
 from app.execution.reconciler import reconcile_hedge_group, reconcile_orphan_positions, reconcile_residual_positions, sync_live_positions
+from app.config.settings import HYPERLIQUID_MAINNET_INFO_URL, HYPERLIQUID_TESTNET_INFO_URL, hyperliquid_execution_info_url
 from app.api import router as api_router
 from app.market.mt5_sessions import MT5SessionState, mt5_action_allowed
+from app.market.nautilus_hyperliquid import market_symbols_from_mappings, write_all_dexs_asset_ctxs_to_quote_cache, write_cached_order_book_to_quote_cache, write_depth_to_quote_cache, write_quote_tick_to_quote_cache
+from app.market.scan_state import scan_state_store
 from app.risk.engine import pre_trade_check
 from app.market.quotes import QuoteCache, QuoteSynchronizer, quote_cache
 from app.adapters.paper import PaperAdapter
@@ -31,10 +35,12 @@ from app.adapters.base import AdapterOrder, AdapterOrderResult
 from app.adapters.hyperliquid import HyperliquidAdapter
 from app.adapters.mt5 import MT5Adapter
 from app.schemas import AdoptPositionIn
+from app.schemas import SymbolMappingIn
 from app.strategy.cost import estimate_cost
 from app.strategy.live_costs import _estimate_mt5_swap_cost, _hyperliquid_effective_fee_rates
 from app.strategy.statistical_signal import evaluate_entry_signal
 from app.strategy.signals import evaluate_signal
+from app.workers.market_data import MarketDataManager, _exchange_time_from_hyperliquid_ms, hyperliquid_symbol_map, l2book_subscription
 
 
 def test_cost_model_positive_total() -> None:
@@ -107,6 +113,191 @@ def test_quote_synchronizer_accepts_aligned_quotes() -> None:
     synced, reason = sync.synchronized("BTC", "strict", max_time_diff_ms=500, max_age_ms=1000)
     assert synced is not None
     assert reason == ""
+
+
+def test_nautilus_depth_bridge_writes_hyperliquid_quote_cache() -> None:
+    cache = QuoteCache()
+    depth = SimpleNamespace(
+        instrument_id="BTC-USD-PERP.HYPERLIQUID",
+        bids=[SimpleNamespace(price=100.0, size=2.0)],
+        asks=[SimpleNamespace(price=101.0, size=3.0)],
+        ts_event=1_700_000_000_000_000_000,
+    )
+
+    ok = write_depth_to_quote_cache(depth, {"BTC-USD-PERP.HYPERLIQUID": "BTC"}, cache)
+
+    quote = cache.latest("hyperliquid", "BTC")
+    assert ok
+    assert quote is not None
+    assert quote.bid == 100
+    assert quote.ask == 101
+    assert quote.depth_notional == 200
+    assert quote.source == "nautilus_order_book_depth"
+
+
+def test_nautilus_quote_tick_bridge_writes_hyperliquid_quote_cache() -> None:
+    cache = QuoteCache()
+    tick = SimpleNamespace(
+        instrument_id="ETH-USD-PERP.HYPERLIQUID",
+        bid_price=2000.0,
+        ask_price=2001.0,
+        bid_size=0.5,
+        ask_size=0.25,
+    )
+
+    ok = write_quote_tick_to_quote_cache(tick, {"ETH-USD-PERP.HYPERLIQUID": "ETH"}, cache)
+
+    quote = cache.latest("hyperliquid", "ETH")
+    assert ok
+    assert quote is not None
+    assert quote.bid == 2000
+    assert quote.ask == 2001
+    assert quote.depth_notional == 500.25
+    assert quote.source == "nautilus_quote_tick"
+
+
+def test_nautilus_managed_book_bridge_writes_hyperliquid_quote_cache() -> None:
+    cache = QuoteCache()
+    event = SimpleNamespace(instrument_id="BTC-USD-PERP.HYPERLIQUID", ts_event=1_700_000_000_000_000_000)
+
+    class FakeNautilusCache:
+        def order_book(self, instrument_id):
+            assert str(instrument_id) == "BTC-USD-PERP.HYPERLIQUID"
+            return SimpleNamespace(
+                best_bid_price=lambda: 100.0,
+                best_ask_price=lambda: 101.0,
+                best_bid_size=lambda: 4.0,
+                best_ask_size=lambda: 2.0,
+            )
+
+    ok = write_cached_order_book_to_quote_cache(event, {"BTC-USD-PERP.HYPERLIQUID": "BTC"}, FakeNautilusCache(), cache)
+
+    quote = cache.latest("hyperliquid", "BTC")
+    assert ok
+    assert quote is not None
+    assert quote.bid == 100
+    assert quote.ask == 101
+    assert quote.depth_notional == 202
+    assert quote.source == "nautilus_order_book_deltas"
+
+
+def test_nautilus_all_dexs_asset_ctxs_bridge_writes_hyperliquid_quote_cache() -> None:
+    cache = QuoteCache()
+    payload = SimpleNamespace(
+        entries=[
+            SimpleNamespace(
+                instrument_id="xyz:JP225-USD-PERP.HYPERLIQUID",
+                impact_prices=SimpleNamespace(bid=39000.0, ask=39002.0),
+                open_interest=10.0,
+            ),
+            SimpleNamespace(
+                instrument_id="xyz:SP500-USD-PERP.HYPERLIQUID",
+                impact_prices=SimpleNamespace(bid=5500.0, ask=5501.0),
+                open_interest=1.0,
+            ),
+        ],
+        ts_event=1_700_000_000_000_000_000,
+    )
+
+    updated = write_all_dexs_asset_ctxs_to_quote_cache(
+        payload,
+        {"xyz:JP225-USD-PERP.HYPERLIQUID": "JP225"},
+        cache,
+    )
+
+    quote = cache.latest("hyperliquid", "JP225")
+    assert updated == 1
+    assert quote is not None
+    assert quote.bid == 39000
+    assert quote.ask == 39002
+    assert quote.depth_notional == 390010
+    assert quote.source == "nautilus_all_dexs_asset_ctxs"
+
+
+def test_nautilus_all_dexs_does_not_override_fresh_fast_l2book_quote() -> None:
+    cache = QuoteCache()
+    cache.put("hyperliquid", "JP225", 72301, 72499, 36.97, "hyperliquid_l2Book_fast")
+    payload = SimpleNamespace(
+        entries=[
+            SimpleNamespace(
+                instrument_id="xyz:JP225-USD-PERP.HYPERLIQUID",
+                impact_prices=SimpleNamespace(bid=39000.0, ask=39002.0),
+                open_interest=10.0,
+            ),
+        ],
+        ts_event=1_700_000_000_000_000_000,
+    )
+
+    updated = write_all_dexs_asset_ctxs_to_quote_cache(
+        payload,
+        {"xyz:JP225-USD-PERP.HYPERLIQUID": "JP225"},
+        cache,
+    )
+
+    quote = cache.latest("hyperliquid", "JP225")
+    assert updated == 0
+    assert quote is not None
+    assert quote.bid == 72301
+    assert quote.source == "hyperliquid_l2Book_fast"
+
+
+def test_nautilus_market_symbols_use_hyperliquid_instrument_ids() -> None:
+    symbols = market_symbols_from_mappings(
+        [
+            SimpleNamespace(symbol="BTC", hyperliquid_symbol="BTC"),
+            SimpleNamespace(symbol="JP225", hyperliquid_symbol="xyz:JP225"),
+        ]
+    )
+
+    assert symbols[0].instrument_id == "BTC-USD-PERP.HYPERLIQUID"
+    assert symbols[1].instrument_id == "xyz:JP225-USD-PERP.HYPERLIQUID"
+
+
+def test_hyperliquid_fast_l2book_subscription_includes_fast_flag() -> None:
+    assert l2book_subscription("xyz:JP225", fast=True) == {"type": "l2Book", "coin": "xyz:JP225", "fast": True}
+    assert l2book_subscription("BTC", fast=False) == {"type": "l2Book", "coin": "BTC"}
+
+
+def test_hyperliquid_symbol_map_can_include_standard_and_hip3_symbols() -> None:
+    mappings = [
+        SimpleNamespace(symbol="BTC", hyperliquid_symbol="BTC"),
+        SimpleNamespace(symbol="JP225", hyperliquid_symbol="xyz:JP225"),
+    ]
+
+    assert hyperliquid_symbol_map(mappings, hip3_only=False) == {"BTC": "BTC", "xyz:JP225": "JP225"}
+    assert hyperliquid_symbol_map(mappings, hip3_only=True) == {"xyz:JP225": "JP225"}
+
+
+def test_hyperliquid_l2book_message_writes_exchange_timestamp() -> None:
+    manager = MarketDataManager()
+    cache = QuoteCache()
+    import app.workers.market_data as market_data_module
+
+    original_worker_cache = market_data_module.quote_cache
+    try:
+        market_data_module.quote_cache = cache
+        payload = {
+            "channel": "l2Book",
+            "data": {
+                "coin": "xyz:JP225",
+                "time": 1_782_040_271_224,
+                "levels": [
+                    [{"px": "72301.0", "sz": "0.00051", "n": 1}],
+                    [{"px": "72499.0", "sz": "0.00048", "n": 1}],
+                ],
+            },
+        }
+
+        manager._handle_hyperliquid_message(payload, {"xyz:JP225": "JP225"}, "hyperliquid_l2Book_fast")
+
+        quote = cache.latest("hyperliquid", "JP225")
+        assert quote is not None
+        assert quote.bid == 72301.0
+        assert quote.ask == 72499.0
+        assert quote.source == "hyperliquid_l2Book_fast"
+        assert quote.exchange_ts == _exchange_time_from_hyperliquid_ms(1_782_040_271_224)
+    finally:
+        market_data_module.quote_cache = original_worker_cache
 
 
 def test_mt5_points_swap_cost() -> None:
@@ -444,14 +635,16 @@ def test_hyperliquid_live_positions_read_clearinghouse_state(monkeypatch) -> Non
     adapter = HyperliquidAdapter(live=True)
     adapter.settings = SimpleNamespace(
         hyperliquid_account_address="0xabc",
-        hyperliquid_wallet_address="",
         nautilus_hyperliquid_vault_address="",
         hyperliquid_info_url="https://example.test/info",
     )
 
     positions = adapter.get_positions()
 
-    assert calls == [{"type": "clearinghouseState", "user": "0xabc"}]
+    assert calls == [
+        {"type": "allMids"},
+        {"type": "clearinghouseState", "user": "0xabc"},
+    ]
     assert positions == [
         {
             "platform": "hyperliquid",
@@ -467,11 +660,124 @@ def test_hyperliquid_live_positions_read_clearinghouse_state(monkeypatch) -> Non
     ]
 
 
+def test_hyperliquid_live_positions_read_hip3_dex_positions(monkeypatch) -> None:
+    class FakeResponse:
+        def __init__(self, payload):
+            self.payload = payload
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self):
+            if self.payload.get("type") == "allMids":
+                return json.dumps({"xyz:JP225": "72015"}).encode("utf-8")
+            dex = self.payload.get("dex")
+            positions = []
+            if dex == "xyz":
+                positions = [
+                    {
+                        "position": {
+                            "coin": "xyz:JP225",
+                            "szi": "0.0002",
+                            "entryPx": "71875",
+                            "unrealizedPnl": "0.03",
+                            "marginUsed": "0.75",
+                            "liquidationPx": "70034",
+                        }
+                    }
+                ]
+            return json.dumps({"assetPositions": positions}).encode("utf-8")
+
+    calls = []
+
+    def fake_urlopen(req, timeout):
+        payload = json.loads(req.data.decode("utf-8"))
+        calls.append(payload)
+        return FakeResponse(payload)
+
+    monkeypatch.setattr("app.adapters.hyperliquid.request.urlopen", fake_urlopen)
+    adapter = HyperliquidAdapter(live=True)
+    adapter.settings = SimpleNamespace(
+        hyperliquid_account_address="0xabc",
+        nautilus_hyperliquid_vault_address="",
+        hyperliquid_info_url="https://example.test/info",
+    )
+
+    positions = adapter.get_positions(dexes=["xyz"])
+
+    assert calls == [
+        {"type": "allMids"},
+        {"type": "allMids", "dex": "xyz"},
+        {"type": "clearinghouseState", "user": "0xabc"},
+        {"type": "clearinghouseState", "user": "0xabc", "dex": "xyz"},
+    ]
+    assert positions == [
+        {
+            "platform": "hyperliquid",
+            "symbol": "xyz:JP225",
+            "side": "long",
+            "quantity": 0.0002,
+            "entry_price": 71875.0,
+            "mark_price": 72015.0,
+            "unrealized_pnl": 0.03,
+            "margin_used": 0.75,
+            "liquidation_price": 70034.0,
+        }
+    ]
+
+
+def test_hyperliquid_execution_info_url_follows_nautilus_environment() -> None:
+    settings = SimpleNamespace(
+        hyperliquid_info_url=HYPERLIQUID_MAINNET_INFO_URL,
+        nautilus_hyperliquid_environment="testnet",
+    )
+
+    assert hyperliquid_execution_info_url(settings) == HYPERLIQUID_TESTNET_INFO_URL
+
+
+def test_hyperliquid_live_positions_use_execution_info_url(monkeypatch) -> None:
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self):
+            return json.dumps({"assetPositions": []}).encode("utf-8")
+
+    urls = []
+
+    def fake_urlopen(req, timeout):
+        urls.append(req.full_url)
+        return FakeResponse()
+
+    monkeypatch.setattr("app.adapters.hyperliquid.request.urlopen", fake_urlopen)
+    adapter = HyperliquidAdapter(live=True)
+    adapter.settings = SimpleNamespace(
+        hyperliquid_account_address="0xabc",
+        nautilus_hyperliquid_vault_address="",
+        hyperliquid_info_url=HYPERLIQUID_MAINNET_INFO_URL,
+        nautilus_hyperliquid_environment="testnet",
+    )
+
+    assert adapter.get_positions() == []
+    assert urls == [HYPERLIQUID_TESTNET_INFO_URL, HYPERLIQUID_TESTNET_INFO_URL]
+
+
 def test_nautilus_hyperliquid_symbol_mapping() -> None:
     assert hyperliquid_instrument_id("BTC") == "BTC-USD-PERP.HYPERLIQUID"
     assert hyperliquid_instrument_id("xyz:JP225") == "xyz:JP225-USD-PERP.HYPERLIQUID"
     assert hyperliquid_instrument_id("HYPE-USDC-SPOT") == "HYPE-USDC-SPOT.HYPERLIQUID"
     assert hyperliquid_instrument_id("ETH-USD-PERP.HYPERLIQUID") == "ETH-USD-PERP.HYPERLIQUID"
+
+
+def test_symbol_mapping_rejects_mt5_style_hyperliquid_symbol() -> None:
+    with pytest.raises(ValueError, match="Hyperliquid 标准永续"):
+        SymbolMappingIn(symbol="BTC", hyperliquid_symbol="BTCUSD", mt5_symbol="BTCUSD")
 
 
 def test_nautilus_hyperliquid_gateway_maps_submit_result() -> None:
@@ -607,7 +913,6 @@ def test_nautilus_build_node_passes_account_address(monkeypatch) -> None:
         nautilus_hyperliquid_private_key="agent-secret",
         nautilus_hyperliquid_vault_address="",
         hyperliquid_account_address="0xmain",
-        hyperliquid_wallet_address="0xagent",
     )
     submitter = NautilusTradingNodeSubmitter(settings)
 
@@ -649,7 +954,6 @@ def test_nautilus_submitter_queries_hyperliquid_when_local_cache_missing(monkeyp
 
     settings = SimpleNamespace(
         hyperliquid_account_address="0xabc",
-        hyperliquid_wallet_address="",
         nautilus_hyperliquid_vault_address="",
         hyperliquid_info_url="https://example.test/info",
     )
@@ -691,7 +995,6 @@ def test_hyperliquid_order_status_backfills_fill_details(monkeypatch) -> None:
 
     settings = SimpleNamespace(
         hyperliquid_account_address="0xabc",
-        hyperliquid_wallet_address="",
         nautilus_hyperliquid_vault_address="",
         hyperliquid_info_url="https://example.test/info",
     )
@@ -1177,7 +1480,9 @@ def test_sync_live_positions_replaces_current_rows(monkeypatch) -> None:
     Session = sessionmaker(bind=engine, future=True)
     db = Session()
     db.add(Position(platform="mt5", symbol="OLD", side="long", quantity=1, entry_price=1, mark_price=1))
+    db.add(SymbolMapping(symbol="JP225", hyperliquid_symbol="xyz:JP225", mt5_symbol="JP225"))
     db.commit()
+    captured = {}
 
     class FakeHyperAdapter:
         platform = "hyperliquid"
@@ -1185,8 +1490,9 @@ def test_sync_live_positions_replaces_current_rows(monkeypatch) -> None:
         def __init__(self, live=False):
             pass
 
-        def get_positions(self):
-            return []
+        def get_positions(self, dexes=None):
+            captured["dexes"] = dexes
+            return [{"platform": "hyperliquid", "symbol": "xyz:JP225", "side": "long", "quantity": 0.0002, "entry_price": 71875, "mark_price": 72015, "unrealized_pnl": 0.03}]
 
     class FakeMT5Adapter:
         platform = "mt5"
@@ -1203,8 +1509,12 @@ def test_sync_live_positions_replaces_current_rows(monkeypatch) -> None:
     db.commit()
 
     rows = db.query(Position).all()
-    assert count == 1
-    assert [(row.platform, row.symbol, row.side, row.quantity) for row in rows] == [("mt5", "USOIL", "short", 0.1)]
+    assert captured["dexes"] == ["xyz"]
+    assert count == 2
+    assert [(row.platform, row.symbol, row.side, row.quantity) for row in rows] == [
+        ("hyperliquid", "xyz:JP225", "long", 0.0002),
+        ("mt5", "USOIL", "short", 0.1),
+    ]
 
 
 def test_reconcile_residual_positions_marks_closed_group_manual() -> None:
@@ -1266,7 +1576,6 @@ def test_hyperliquid_live_position_sync_triggers_residual_reconcile(monkeypatch)
     monkeypatch.setattr("app.adapters.hyperliquid.request.urlopen", lambda req, timeout: FakeResponse())
     monkeypatch.setattr("app.adapters.hyperliquid.get_settings", lambda: SimpleNamespace(
         hyperliquid_account_address="0xabc",
-        hyperliquid_wallet_address="",
         nautilus_hyperliquid_vault_address="",
         hyperliquid_info_url="https://example.test/info",
     ))
@@ -1558,6 +1867,83 @@ def test_spread_analytics_empty_summary() -> None:
     assert summary["sample_count"] == 0
 
 
+def test_spread_and_opportunity_apis_prefer_memory_scan_state() -> None:
+    engine = create_engine("sqlite:///:memory:", future=True)
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine, future=True)
+    db = Session()
+    db.add(SymbolMapping(symbol="BTC", hyperliquid_symbol="BTC", mt5_symbol="BTCUSD", enabled=True))
+    db.add(SymbolMapping(symbol="ETH", hyperliquid_symbol="ETH", mt5_symbol="ETHUSD", enabled=True))
+    db.commit()
+    scan_state_store.update(
+        [
+            {
+                "id": 10,
+                "symbol": "BTC",
+                "direction": "long_mt5_short_hyperliquid",
+                "hyperliquid_bid": 100.0,
+            }
+        ],
+        [
+            {
+                "id": 20,
+                "symbol": "ETH",
+                "direction": "long_hyperliquid_short_mt5",
+                "status": "candidate",
+                "created_at": datetime.utcnow(),
+            }
+        ],
+    )
+
+    spreads_payload = api_router.spreads(SimpleNamespace(), db, page=1, page_size=20)
+    opportunities_payload = api_router.opportunities(SimpleNamespace(), db, page=1, page_size=20)
+
+    assert spreads_payload["items"][0]["symbol"] == "BTC"
+    assert opportunities_payload["items"][0]["symbol"] == "ETH"
+
+
+def test_scan_state_spread_dict_includes_compute_timings() -> None:
+    scanner_module._scan_timings["BTC"] = {
+        "symbol_scan_duration_ms": 2.5,
+        "signal_duration_ms": 0.4,
+        "candidate_sync_duration_ms": 0.2,
+    }
+    row = SimpleNamespace(
+        symbol="BTC",
+        status="rejected",
+        __table__=SimpleNamespace(columns=[SimpleNamespace(name="symbol"), SimpleNamespace(name="status")]),
+    )
+
+    data = scanner_module._spread_state_dict(row)
+
+    assert data["symbol"] == "BTC"
+    assert data["symbol_scan_duration_ms"] == 2.5
+    assert data["signal_duration_ms"] == 0.4
+    assert data["candidate_sync_duration_ms"] == 0.2
+
+
+def test_delete_symbol_mapping_clears_current_scan_state() -> None:
+    engine = create_engine("sqlite:///:memory:", future=True)
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine, future=True)
+    db = Session()
+    mapping = SymbolMapping(symbol="BTC", hyperliquid_symbol="BTC", mt5_symbol="BTCUSD", enabled=True)
+    db.add(mapping)
+    db.flush()
+    db.add(SpreadCurrent(symbol="BTC", direction="none", hyperliquid_bid=1, hyperliquid_ask=1, mt5_bid=1, mt5_ask=1, quantity=1, gross_spread=0, unit_cost=0, unit_net_profit=0, total_cost=0, net_profit=0, annualized_return=0, status="rejected"))
+    db.add(ArbitrageOpportunity(symbol="BTC", direction="long_mt5_short_hyperliquid", notional=1, quantity=1, gross_spread=1, total_cost=0, net_profit=1, annualized_return=1, status="candidate"))
+    db.commit()
+    scan_state_store.update([{"symbol": "BTC"}], [{"symbol": "BTC", "status": "candidate"}])
+
+    api_router.delete_symbol_mapping(mapping.id, SimpleNamespace(id=1), db)
+
+    state = scan_state_store.snapshot()
+    assert state["spreads"] == []
+    assert state["opportunities"] == []
+    assert db.query(SpreadCurrent).filter(SpreadCurrent.symbol == "BTC").count() == 0
+    assert db.query(ArbitrageOpportunity).filter(ArbitrageOpportunity.symbol == "BTC", ArbitrageOpportunity.status == "candidate").count() == 0
+
+
 def test_spread_analytics_detects_mean_reversion_shape() -> None:
     now = datetime.utcnow()
     values = [1.0 + (0.4 * (0.92 ** index)) for index in range(160)]
@@ -1580,6 +1966,104 @@ def test_spread_series_downsamples_large_window() -> None:
     series = downsample_spreads(points, "1h")
     assert len(series) <= 720
     assert series[0]["count"] >= 1
+
+
+def test_spread_analytics_uses_raw_snapshots_through_4h() -> None:
+    engine = create_engine("sqlite:///:memory:", future=True)
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine, future=True)
+    now = datetime.utcnow()
+    with Session() as db:
+        from app.db.models import SpreadBucket, SpreadSnapshot
+
+        db.add(
+            SpreadBucket(
+                symbol="BTC",
+                direction="long_mt5_short_hyperliquid",
+                bucket_start=now - timedelta(minutes=10),
+                bucket_seconds=5,
+                open_spread=100,
+                high_spread=100,
+                low_spread=100,
+                close_spread=100,
+                avg_spread=100,
+                avg_unit_cost=10,
+                avg_unit_net_profit=90,
+                sample_count=1,
+            )
+        )
+        db.add(
+            SpreadSnapshot(
+                symbol="BTC",
+                direction="long_mt5_short_hyperliquid",
+                hyperliquid_bid=1,
+                hyperliquid_ask=1,
+                mt5_bid=1,
+                mt5_ask=1,
+                gross_spread=200,
+                unit_cost=20,
+                unit_net_profit=180,
+                total_cost=20,
+                net_profit=180,
+                annualized_return=0,
+                status="candidate",
+                created_at=now - timedelta(minutes=5),
+            )
+        )
+        db.commit()
+
+        points = load_spread_points(db, "BTC", "long_mt5_short_hyperliquid", "4h")
+
+    assert [point.spread for point in points] == [200]
+
+
+def test_spread_analytics_uses_buckets_for_24h_and_7d() -> None:
+    engine = create_engine("sqlite:///:memory:", future=True)
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine, future=True)
+    now = datetime.utcnow()
+    with Session() as db:
+        from app.db.models import SpreadBucket, SpreadSnapshot
+
+        db.add(
+            SpreadBucket(
+                symbol="BTC",
+                direction="long_mt5_short_hyperliquid",
+                bucket_start=now - timedelta(hours=6),
+                bucket_seconds=5,
+                open_spread=100,
+                high_spread=100,
+                low_spread=100,
+                close_spread=100,
+                avg_spread=100,
+                avg_unit_cost=10,
+                avg_unit_net_profit=90,
+                sample_count=1,
+            )
+        )
+        db.add(
+            SpreadSnapshot(
+                symbol="BTC",
+                direction="long_mt5_short_hyperliquid",
+                hyperliquid_bid=1,
+                hyperliquid_ask=1,
+                mt5_bid=1,
+                mt5_ask=1,
+                gross_spread=200,
+                unit_cost=20,
+                unit_net_profit=180,
+                total_cost=20,
+                net_profit=180,
+                annualized_return=0,
+                status="candidate",
+                created_at=now - timedelta(hours=6),
+            )
+        )
+        db.commit()
+
+        points = load_spread_points(db, "BTC", "long_mt5_short_hyperliquid", "7d")
+
+    assert [point.spread for point in points] == [100]
 
 
 def test_funding_day_bucket_and_positive_bias() -> None:
@@ -1803,7 +2287,6 @@ def test_live_execution_readiness_blocks_missing_live_prerequisites(monkeypatch)
         nautilus_hyperliquid_submit_enabled=False,
         nautilus_hyperliquid_private_key="",
         hyperliquid_account_address="",
-        hyperliquid_wallet_address="",
         nautilus_hyperliquid_vault_address="",
         mt5_live_order_enabled=False,
         mt5_login="",
@@ -1815,7 +2298,7 @@ def test_live_execution_readiness_blocks_missing_live_prerequisites(monkeypatch)
 
     assert result["status"] == "blocked"
     blocked = {item["component"] for item in result["checks"] if item["status"] == "block"}
-    assert {"global_live_switch", "nautilus_hyperliquid_enabled", "hyperliquid_private_key", "metatrader5_import"} <= blocked
+    assert {"global_live_switch", "nautilus_hyperliquid_enabled", "nautilus_hyperliquid_private_key", "metatrader5_import"} <= blocked
 
 
 def test_live_execution_readiness_allows_ready_with_complete_config(monkeypatch) -> None:
@@ -1842,7 +2325,6 @@ def test_live_execution_readiness_allows_ready_with_complete_config(monkeypatch)
         nautilus_hyperliquid_submit_enabled=True,
         nautilus_hyperliquid_private_key="secret",
         hyperliquid_account_address="0xabc",
-        hyperliquid_wallet_address="",
         nautilus_hyperliquid_vault_address="",
         hyperliquid_info_url="https://example.test/info",
         mt5_live_order_enabled=True,
@@ -1919,7 +2401,6 @@ def test_live_execution_readiness_blocks_failed_read_probes(monkeypatch) -> None
         nautilus_hyperliquid_submit_enabled=True,
         nautilus_hyperliquid_private_key="secret",
         hyperliquid_account_address="0xabc",
-        hyperliquid_wallet_address="",
         nautilus_hyperliquid_vault_address="",
         hyperliquid_info_url="https://example.test/info",
         mt5_live_order_enabled=True,
@@ -1975,7 +2456,6 @@ def test_live_execution_readiness_blocks_unmanaged_live_positions(monkeypatch) -
         nautilus_hyperliquid_submit_enabled=True,
         nautilus_hyperliquid_private_key="secret",
         hyperliquid_account_address="0xabc",
-        hyperliquid_wallet_address="",
         nautilus_hyperliquid_vault_address="",
         hyperliquid_info_url="https://example.test/info",
         mt5_live_order_enabled=True,
@@ -2044,7 +2524,6 @@ def test_live_execution_readiness_requires_managed_position_side_and_quantity(mo
         nautilus_hyperliquid_submit_enabled=True,
         nautilus_hyperliquid_private_key="secret",
         hyperliquid_account_address="0xabc",
-        hyperliquid_wallet_address="",
         nautilus_hyperliquid_vault_address="",
         hyperliquid_info_url="https://example.test/info",
         mt5_live_order_enabled=True,
@@ -2111,7 +2590,6 @@ def test_live_execution_readiness_blocks_residual_closed_group_position(monkeypa
         nautilus_hyperliquid_submit_enabled=True,
         nautilus_hyperliquid_private_key="secret",
         hyperliquid_account_address="0xabc",
-        hyperliquid_wallet_address="",
         nautilus_hyperliquid_vault_address="",
         hyperliquid_info_url="https://example.test/info",
         mt5_live_order_enabled=True,

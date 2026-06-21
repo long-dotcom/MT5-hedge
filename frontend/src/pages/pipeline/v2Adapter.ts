@@ -1,0 +1,113 @@
+import type { HedgePoolItem, PipelineDiagnostics, PipelineNode, PipelineStatus, SymbolPipeline } from './types';
+import type { V2DashboardData, V2HedgeGroup, V2HedgeStatus, V2NodeStatus, V2PipelineSymbol } from './v2Types';
+
+function toNodeStatus(status?: PipelineStatus): V2NodeStatus {
+  if (status === 'flowing' || status === 'pass') return 'active';
+  if (status === 'blocked') return 'blocked';
+  if (status === 'warning') return 'warning';
+  return 'inactive';
+}
+
+function getNode(symbol: SymbolPipeline, key: string): PipelineNode | undefined {
+  return symbol.nodes.find((node) => node.key === key);
+}
+
+function ms(value?: number | null): number {
+  if (value === undefined || value === null || !Number.isFinite(value)) return 0;
+  return Math.max(Math.round(value), 0);
+}
+
+function pipelineStatus(symbol: SymbolPipeline, key: string): V2NodeStatus {
+  if (symbol.blocked_stage === key) return 'blocked';
+  return toNodeStatus(getNode(symbol, key)?.status);
+}
+
+function toPipeline(symbol: SymbolPipeline): V2PipelineSymbol {
+  const status = symbol.status === 'blocked' ? 'blocked' : 'normal';
+  return {
+    symbol: symbol.symbol,
+    direction: symbol.metrics.gross_spread && symbol.metrics.gross_spread < 0 ? 'long_hyperliquid_short_mt5' : 'long_mt5_short_hyperliquid',
+    spread: Number(symbol.metrics.unit_net_profit ?? symbol.metrics.gross_spread ?? 0),
+    pipelineStatus: status,
+    blockReason: symbol.reason,
+    nodes: {
+      sync: pipelineStatus(symbol, 'sync'),
+      scan: pipelineStatus(symbol, 'scan'),
+      signal: pipelineStatus(symbol, 'signal'),
+      candidate: pipelineStatus(symbol, 'candidate'),
+    },
+    delays: {
+      hlToSync: ms(symbol.metrics.hl_age_ms),
+      mt5ToSync: ms(symbol.metrics.mt5_age_ms),
+      syncToScan: ms(symbol.metrics.symbol_scan_duration_ms),
+      scanToSignal: ms(symbol.metrics.signal_duration_ms),
+      signalToCandidate: ms(symbol.metrics.candidate_sync_duration_ms),
+    },
+    timings: {
+      scan: ms(symbol.metrics.symbol_scan_duration_ms),
+      cost: ms(symbol.metrics.cost_duration_ms),
+      signal: ms(symbol.metrics.signal_duration_ms),
+      persist: ms(symbol.metrics.persist_duration_ms),
+      resultAge: ms(symbol.metrics.scan_age_ms),
+    },
+    netPnl: Number(symbol.metrics.unit_net_profit ?? 0),
+    annualized: Number(symbol.metrics.annualized_return ?? 0) * 100,
+  };
+}
+
+function toHedgeStatus(item: HedgePoolItem): V2HedgeStatus {
+  if (item.stage === 'ready_to_close') return 'closable';
+  if (item.stage === 'opening' || item.stage === 'pending') return 'building';
+  if (item.stage === 'manual') return 'manual';
+  return 'holding';
+}
+
+function toHedgeGroup(item: HedgePoolItem): V2HedgeGroup {
+  return {
+    id: item.id,
+    symbol: item.symbol,
+    status: toHedgeStatus(item),
+    pnl: Number(item.unrealized_pnl || 0),
+    entrySpread: Number(item.entry_spread || 0),
+    currentSpread: Number(item.exit_target || 0),
+  };
+}
+
+function laneCount(data: PipelineDiagnostics, key: string): number {
+  return data.pool.lanes.find((lane) => lane.key === key)?.count || 0;
+}
+
+export function toV2DashboardData(data: PipelineDiagnostics): V2DashboardData {
+  const hedgeGroups = data.pool.items.map(toHedgeGroup);
+  const floatingPnl = hedgeGroups.reduce((sum, item) => sum + Number(item.pnl || 0), 0);
+  const usedMargin = data.pool.items.reduce((sum, item) => sum + Number(item.notional || 0), 0);
+  return {
+    sseStatus: {
+      online: true,
+      latency: 0.8,
+      lastPush: 0.8,
+      enabledSymbols: data.summary.enabled_symbols,
+      normalFlow: data.summary.flowing,
+      blockedFlow: data.summary.blocked,
+    },
+    pipelines: data.symbols.map(toPipeline),
+    hedgeGroups,
+    lifecycle: {
+      pending: laneCount(data, 'pending'),
+      building: laneCount(data, 'opening'),
+      holding: laneCount(data, 'open'),
+      closable: laneCount(data, 'ready_to_close'),
+      closing: laneCount(data, 'closing'),
+      abnormal: laneCount(data, 'manual'),
+    },
+    stats: {
+      totalHedgeGroups: data.pool.active_total,
+      usedMargin,
+      floatingPnl,
+      todayClosed: data.summary.ready_to_close,
+      todayReleased: 0,
+    },
+    releasedCount: data.summary.ready_to_close,
+    archivedCount: 0,
+  };
+}

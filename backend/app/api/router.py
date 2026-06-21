@@ -37,10 +37,12 @@ from app.db.models import (
     User,
 )
 from app.db.session import SessionLocal, get_db
+from app.diagnostics.pipeline import build_pipeline_diagnostics
 from app.execution.engine import close_hedge_group, open_hedge_group
 from app.execution.readiness import live_execution_readiness
 from app.execution.reconciler import run_execution_reconcile
 from app.market.scanner import run_scan
+from app.market.scan_state import scan_state_store
 from app.market.quotes import quote_cache
 from app.market.mt5_sessions import as_session_dict, mt5_session_state
 from app.config.settings import get_settings
@@ -53,6 +55,17 @@ router = APIRouter(prefix="/api")
 def as_dict(row: Any) -> dict[str, Any]:
     data = {column.name: getattr(row, column.name) for column in row.__table__.columns}
     return data
+
+
+def _paginate_rows(rows: list[dict[str, Any]], page: int, page_size: int) -> dict[str, Any]:
+    safe_page = max(int(page), 1)
+    safe_page_size = max(int(page_size), 1)
+    start = (safe_page - 1) * safe_page_size
+    return {"total": len(rows), "items": rows[start : start + safe_page_size]}
+
+
+def _enabled_symbol_names(db: Session) -> set[str]:
+    return {row.symbol.upper() for row in db.query(SymbolMapping.symbol).filter(SymbolMapping.enabled.is_(True)).all()}
 
 
 def json_default(value: Any) -> str:
@@ -149,9 +162,24 @@ def trading_sessions(_: User = Depends(get_current_user), db: Session = Depends(
     return [as_session_dict(mt5_session_state(row)) for row in rows]
 
 
+@router.get("/diagnostics/pipeline")
+def pipeline_diagnostics(_: User = Depends(get_current_user), db: Session = Depends(get_db)) -> dict[str, Any]:
+    return build_pipeline_diagnostics(db)
+
+
 @router.get("/markets/spreads")
 def spreads(_: User = Depends(get_current_user), db: Session = Depends(get_db), page: int = 1, page_size: int = 20, symbol: str = "") -> dict[str, Any]:
+    enabled_symbols = _enabled_symbol_names(db)
+    state = scan_state_store.snapshot()
+    if state["ready"]:
+        rows = [row for row in state["spreads"] if str(row.get("symbol", "")).upper() in enabled_symbols]
+        if symbol:
+            needle = symbol.upper()
+            rows = [row for row in rows if needle in str(row.get("symbol", "")).upper()]
+        rows = sorted(rows, key=lambda row: str(row.get("symbol", "")))
+        return _paginate_rows(rows, page, page_size)
     query = db.query(SpreadCurrent)
+    query = query.filter(SpreadCurrent.symbol.in_(enabled_symbols)) if enabled_symbols else query.filter(False)
     if symbol:
         query = query.filter(SpreadCurrent.symbol.contains(symbol.upper()))
     total = query.count()
@@ -188,15 +216,34 @@ async def stream(token: str) -> StreamingResponse:
 
 
 def _stream_snapshot(db: Session) -> dict[str, Any]:
-    spread_rows = db.query(SpreadCurrent).order_by(SpreadCurrent.symbol).all()
-    opportunity_rows = db.query(ArbitrageOpportunity).filter(ArbitrageOpportunity.status.in_(["candidate", "executable", "executing"])).order_by(desc(ArbitrageOpportunity.updated_at)).limit(50).all()
+    state = scan_state_store.snapshot()
+    enabled_symbols = _enabled_symbol_names(db)
+    if state["ready"]:
+        spread_rows = [row for row in state["spreads"] if str(row.get("symbol", "")).upper() in enabled_symbols]
+        opportunity_rows = [row for row in state["opportunities"] if str(row.get("symbol", "")).upper() in enabled_symbols]
+        spreads_payload = {"total": len(spread_rows), "items": spread_rows}
+        opportunities_payload = {"total": len(opportunity_rows), "items": opportunity_rows}
+    else:
+        spread_rows = db.query(SpreadCurrent).filter(SpreadCurrent.symbol.in_(enabled_symbols)).order_by(SpreadCurrent.symbol).all() if enabled_symbols else []
+        opportunity_rows = (
+            db.query(ArbitrageOpportunity)
+            .filter(ArbitrageOpportunity.symbol.in_(enabled_symbols), ArbitrageOpportunity.status.in_(["candidate", "executable", "executing"]))
+            .order_by(desc(ArbitrageOpportunity.updated_at))
+            .limit(50)
+            .all()
+            if enabled_symbols
+            else []
+        )
+        spreads_payload = {"total": len(spread_rows), "items": [as_dict(row) for row in spread_rows]}
+        opportunities_payload = {"total": len(opportunity_rows), "items": [as_dict(row) for row in opportunity_rows]}
     account_rows = latest_account_snapshots(db)
     latest_bucket = db.query(SpreadBucket).order_by(desc(SpreadBucket.id)).first()
     return {
-        "spreads": {"total": len(spread_rows), "items": [as_dict(row) for row in spread_rows]},
-        "opportunities": {"total": len(opportunity_rows), "items": [as_dict(row) for row in opportunity_rows]},
+        "spreads": spreads_payload,
+        "opportunities": opportunities_payload,
         "accounts": [as_dict(row) for row in account_rows],
         "latest_bucket_id": latest_bucket.id if latest_bucket else 0,
+        "pipeline": build_pipeline_diagnostics(db),
     }
 
 
@@ -257,7 +304,13 @@ def lead_lag(
 
 @router.get("/opportunities")
 def opportunities(_: User = Depends(get_current_user), db: Session = Depends(get_db), page: int = 1, page_size: int = 20) -> dict[str, Any]:
-    query = db.query(ArbitrageOpportunity).filter(ArbitrageOpportunity.status.in_(["candidate", "executable", "executing"]))
+    enabled_symbols = _enabled_symbol_names(db)
+    state = scan_state_store.snapshot()
+    if state["ready"]:
+        rows = [row for row in state["opportunities"] if str(row.get("symbol", "")).upper() in enabled_symbols]
+        rows = sorted(rows, key=lambda row: row.get("created_at") or datetime.min, reverse=True)
+        return _paginate_rows(rows, page, page_size)
+    query = db.query(ArbitrageOpportunity).filter(ArbitrageOpportunity.symbol.in_(enabled_symbols), ArbitrageOpportunity.status.in_(["candidate", "executable", "executing"])) if enabled_symbols else db.query(ArbitrageOpportunity).filter(False)
     total = query.count()
     rows = query.order_by(desc(ArbitrageOpportunity.created_at)).offset((page - 1) * page_size).limit(page_size).all()
     return {"total": total, "items": [as_dict(row) for row in rows]}
@@ -518,13 +571,20 @@ def get_symbol_mappings(_: User = Depends(get_current_user), db: Session = Depen
 
 @router.put("/settings/symbol-mappings")
 def put_symbol_mappings(payload: list[SymbolMappingIn], user: User = Depends(require_admin), db: Session = Depends(get_db)) -> list[dict[str, Any]]:
+    stale_symbols: set[str] = set()
     for item in payload:
         row = db.query(SymbolMapping).filter(SymbolMapping.symbol == item.symbol).first()
         if not row:
             row = SymbolMapping(symbol=item.symbol, hyperliquid_symbol=item.hyperliquid_symbol, mt5_symbol=item.mt5_symbol)
+        old_symbol = row.symbol
         for key, value in item.model_dump().items():
             setattr(row, key, value)
+        if old_symbol != row.symbol or not row.enabled:
+            stale_symbols.add(old_symbol)
+        if not row.enabled:
+            stale_symbols.add(row.symbol)
         db.add(row)
+    _clear_scan_results_for_symbols(db, stale_symbols)
     audit(db, user.id, "update_symbol_mappings", "settings")
     db.commit()
     return [as_dict(row) for row in db.query(SymbolMapping).order_by(SymbolMapping.symbol).all()]
@@ -547,11 +607,16 @@ def update_symbol_mapping(mapping_id: int, payload: SymbolMappingIn, user: User 
     row = db.get(SymbolMapping, mapping_id)
     if not row:
         raise HTTPException(status_code=404, detail="品种映射不存在")
+    old_symbol = row.symbol
     duplicated = db.query(SymbolMapping).filter(SymbolMapping.symbol == payload.symbol, SymbolMapping.id != mapping_id).first()
     if duplicated:
         raise HTTPException(status_code=400, detail="内部品种已存在")
     for key, value in payload.model_dump().items():
         setattr(row, key, value)
+    stale_symbols = {old_symbol} if old_symbol != row.symbol or not row.enabled else set()
+    if not row.enabled:
+        stale_symbols.add(row.symbol)
+    _clear_scan_results_for_symbols(db, stale_symbols)
     audit(db, user.id, "update_symbol_mapping", "settings", payload.symbol)
     db.commit()
     db.refresh(row)
@@ -565,9 +630,25 @@ def delete_symbol_mapping(mapping_id: int, user: User = Depends(require_admin), 
         raise HTTPException(status_code=404, detail="品种映射不存在")
     symbol = row.symbol
     db.delete(row)
+    _clear_scan_results_for_symbols(db, {symbol})
     audit(db, user.id, "delete_symbol_mapping", "settings", symbol)
     db.commit()
     return {"status": "ok"}
+
+
+def _clear_scan_results_for_symbols(db: Session, symbols: set[str]) -> None:
+    normalized = {symbol.upper() for symbol in symbols if symbol}
+    if not normalized:
+        return
+    db.query(SpreadCurrent).filter(SpreadCurrent.symbol.in_(normalized)).delete(synchronize_session=False)
+    active_rows = db.query(ArbitrageOpportunity).filter(
+        ArbitrageOpportunity.symbol.in_(normalized),
+        ArbitrageOpportunity.status.in_(["candidate", "executable", "executing"]),
+    ).all()
+    for row in active_rows:
+        row.status = "rejected"
+        row.reject_reason = "品种映射已删除或停用，移出当前候选池"
+    scan_state_store.remove_symbols(normalized)
 
 
 @router.post("/settings/symbol-mappings/{mapping_id}/sync-broker")

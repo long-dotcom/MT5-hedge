@@ -71,6 +71,8 @@ QUOTE_SOURCE_MODE=paper
 PAPER_QUOTE_INTERVAL_MS=200
 MT5_QUOTE_POLL_INTERVAL_MS=200
 HYPERLIQUID_HTTP_POLL_INTERVAL_MS=1000
+HYPERLIQUID_MARKET_DATA_SOURCE=native
+HYPERLIQUID_MARKET_DATA_FALLBACK=native
 LOOSE_QUOTE_SYNC_MS=3000
 STRICT_QUOTE_SYNC_MS=500
 QUOTE_STALE_MS=1500
@@ -86,8 +88,6 @@ DEFAULT_SLIPPAGE_BPS=0
 DEFAULT_FX_COST_RATE=0
 FX_FALLBACK_RATES={"JPY":0.00625}
 COST_CACHE_TTL_SECONDS=60
-HYPERLIQUID_PRIVATE_KEY=
-HYPERLIQUID_WALLET_ADDRESS=
 HYPERLIQUID_ACCOUNT_ADDRESS=
 MT5_LOGIN=
 MT5_PASSWORD=
@@ -103,9 +103,11 @@ HYPERLIQUID_INFO_URL=https://api.hyperliquid-testnet.xyz/info
 HYPERLIQUID_WS_URL=wss://api.hyperliquid-testnet.xyz/ws
 ```
 
-如果使用 API wallet/agent private key，`HYPERLIQUID_ACCOUNT_ADDRESS` 应填写有余额的主账户地址；余额、手续费等账户查询会优先使用该地址。NautilusTrader Hyperliquid 执行客户端也会把该地址传入 `HyperliquidExecClientConfig.account_address`，避免 agent wallet 场景下只知道签名私钥、不知道主账户归属。
+如果使用 API wallet/agent private key，`NAUTILUS_HYPERLIQUID_PRIVATE_KEY` 填 agent 私钥，`HYPERLIQUID_ACCOUNT_ADDRESS` 填有余额的主账户地址；余额、手续费等账户查询会优先使用该地址。NautilusTrader Hyperliquid 执行客户端也会把该地址传入 `HyperliquidExecClientConfig.account_address`，避免 agent wallet 场景下只知道签名私钥、不知道主账户归属。
 
-NautilusTrader Hyperliquid 执行回查也使用同一个账户地址。系统先查本进程 Nautilus bridge Strategy 的订单事件；本地 cache 查不到时，会调用 Hyperliquid info API 的 `orderStatus`，成交订单再用 `userFills` 回填成交明细。execution reconciler 还会读取账户级 `openOrders` / `userFills` 快照，用于恢复 pending 订单和唯一匹配的缺失外部订单号。因此实盘或 testnet 使用 API wallet 时，必须配置实际账户地址，而不是只配置 agent wallet 地址。
+NautilusTrader Hyperliquid 执行回查也使用同一个账户地址。账户、仓位、订单状态这类执行侧私有查询会跟随 `NAUTILUS_HYPERLIQUID_ENVIRONMENT` 选择 mainnet/testnet info API，避免 testnet 下单却去主网查仓位。本地 cache 查不到订单事件时，系统会调用 Hyperliquid info API 的 `orderStatus`，成交订单再用 `userFills` 回填成交明细。execution reconciler 还会读取账户级 `openOrders` / `userFills` 快照，用于恢复 pending 订单和唯一匹配的缺失外部订单号。因此实盘或 testnet 使用 API wallet 时，必须配置实际账户地址，而不是只配置 agent wallet 地址。
+
+HIP-3 DEX 仓位不会出现在默认 `clearinghouseState` 响应里。系统会从启用的品种映射中提取 `xyz:*` 这类 DEX 前缀，并额外用 `dex=xyz` 查询账户仓位，所以仓位页可以展示 `xyz:JP225` 这类主网 DEX 仓位。
 
 ## 品种映射
 
@@ -129,7 +131,10 @@ symbols:
 
 切换到 `QUOTE_SOURCE_MODE=live` 后：
 
-- Hyperliquid worker 连接 `HYPERLIQUID_WS_URL` 并订阅每个映射品种的 `l2Book`。
+- 默认 `HYPERLIQUID_MARKET_DATA_SOURCE=native` 时，Hyperliquid worker 连接 `HYPERLIQUID_WS_URL` 并订阅每个映射品种的 `l2Book`；`HYPERLIQUID_L2BOOK_FAST_ENABLED=true` 时订阅会携带 `fast: true`，使用浅层高频盘口。
+- 设置 `HYPERLIQUID_MARKET_DATA_SOURCE=nautilus` 后，Hyperliquid 行情改由 NautilusTrader data client 订阅 L2 订单簿；bridge Strategy 会把 Nautilus 维护的顶层报价和深度写入系统 `QuoteCache`，扫描器、价差计算和数据库写入路径不变。
+- `xyz:*` 这类 HIP-3 DEX 品种通过 NautilusTrader `HyperliquidAllDexsAssetCtxs` custom data 接入；当 `HYPERLIQUID_L2BOOK_FAST_ENABLED=true` 时，系统会额外对所有启用扫描的 Hyperliquid 品种订阅原生 `l2Book fast`，用约 0.5s 浅盘口覆盖 15s 批量资产上下文，并为 BTC/ETH 等标准永续提供独立于 Nautilus 生命周期的实时报价。
+- `HYPERLIQUID_MARKET_DATA_FALLBACK=native` 会保留原生 HTTP 轮询兜底；当 Nautilus 报价新鲜时，HTTP 轮询会跳过该品种。
 - 如果当前网络无法建立 Hyperliquid WebSocket，系统会用 HTTP `l2Book` 按 `HYPERLIQUID_HTTP_POLL_INTERVAL_MS` 轮询兜底。
 - MT5 worker 初始化本机 MetaTrader5 终端，并对映射品种调用 `symbol_select(symbol, True)` 和 `symbol_info_tick()` 高频轮询。
 - 扫描器只读取同步后的行情缓存，不直接请求报价。

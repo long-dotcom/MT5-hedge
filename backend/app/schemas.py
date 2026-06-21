@@ -1,7 +1,7 @@
 from datetime import datetime
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, field_validator
+from pydantic import BaseModel, ConfigDict, field_validator, model_validator
 
 
 class LoginRequest(BaseModel):
@@ -123,6 +123,15 @@ class SymbolMappingIn(BaseModel):
     @classmethod
     def strip_symbol_text(cls, value: str) -> str:
         return value.strip()
+
+    @model_validator(mode="after")
+    def validate_hyperliquid_symbol(self) -> "SymbolMappingIn":
+        value = self.hyperliquid_symbol.strip()
+        normalized = value.upper()
+        if ":" not in value and "." not in value and "-" not in value and normalized.endswith("USD"):
+            base = value[:-3]
+            raise ValueError(f"Hyperliquid 标准永续请填写基础币符号 `{base}`，不要填写 MT5 符号 `{value}`")
+        return self
 
 
 class ORMModel(BaseModel):

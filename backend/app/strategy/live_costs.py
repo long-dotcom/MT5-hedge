@@ -101,7 +101,7 @@ def _hyperliquid_user_fee_rates() -> tuple[float, float]:
     cached_at, cached = _hl_user_fee_cache
     if cached and now - cached_at < settings.cost_cache_ttl_seconds:
         return cached
-    account_address = settings.hyperliquid_account_address or settings.hyperliquid_wallet_address
+    account_address = settings.hyperliquid_account_address or settings.nautilus_hyperliquid_vault_address
     if not account_address:
         return settings.hyperliquid_default_taker_fee_rate, settings.hyperliquid_default_maker_fee_rate
     try:

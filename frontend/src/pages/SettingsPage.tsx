@@ -26,6 +26,9 @@ export function SettingsPage() {
       setEditingSymbol(null);
       symbolForm.resetFields();
       queryClient.invalidateQueries({ queryKey: ['settings-symbols'] });
+      queryClient.invalidateQueries({ queryKey: ['market-symbols'] });
+      queryClient.invalidateQueries({ queryKey: ['spreads'] });
+      queryClient.invalidateQueries({ queryKey: ['opportunities'] });
     },
     onError: (err: any) => messageApi.error(err.response?.data?.detail || '保存失败')
   });
@@ -34,6 +37,9 @@ export function SettingsPage() {
     onSuccess: () => {
       messageApi.success('品种映射已删除');
       queryClient.invalidateQueries({ queryKey: ['settings-symbols'] });
+      queryClient.invalidateQueries({ queryKey: ['market-symbols'] });
+      queryClient.invalidateQueries({ queryKey: ['spreads'] });
+      queryClient.invalidateQueries({ queryKey: ['opportunities'] });
     }
   });
   const syncBroker = useMutation({

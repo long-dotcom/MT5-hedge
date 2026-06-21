@@ -34,6 +34,8 @@ REVERSION_HORIZONS = {
     "60m": 60 * 60,
 }
 
+RAW_POINT_RANGES = {"15m", "1h", "4h"}
+
 
 @dataclass(frozen=True)
 class SpreadPoint:
@@ -50,7 +52,37 @@ def parse_range(range_value: str) -> tuple[str, datetime, int]:
 
 
 def load_spread_points(db: Session, symbol: str, direction: str, range_value: str) -> list[SpreadPoint]:
-    _, start_at, _ = parse_range(range_value)
+    range_key, start_at, _ = parse_range(range_value)
+    if range_key in RAW_POINT_RANGES:
+        snapshot_points = _load_snapshot_points(db, symbol, direction, start_at)
+        return snapshot_points or _load_bucket_points(db, symbol, direction, start_at)
+    bucket_points = _load_bucket_points(db, symbol, direction, start_at)
+    return bucket_points or _load_snapshot_points(db, symbol, direction, start_at)
+
+
+def _load_snapshot_points(db: Session, symbol: str, direction: str, start_at: datetime) -> list[SpreadPoint]:
+    rows = (
+        db.query(SpreadSnapshot)
+        .filter(
+            SpreadSnapshot.symbol == symbol.upper(),
+            SpreadSnapshot.direction == direction,
+            SpreadSnapshot.created_at >= start_at,
+        )
+        .order_by(SpreadSnapshot.created_at)
+        .all()
+    )
+    return [
+        SpreadPoint(
+            created_at=row.created_at,
+            spread=float(row.gross_spread),
+            total_cost=float(row.unit_cost),
+            net_profit=float(row.unit_net_profit),
+        )
+        for row in rows
+    ]
+
+
+def _load_bucket_points(db: Session, symbol: str, direction: str, start_at: datetime) -> list[SpreadPoint]:
     bucket_rows = (
         db.query(SpreadBucket)
         .filter(
@@ -71,25 +103,7 @@ def load_spread_points(db: Session, symbol: str, direction: str, range_value: st
             )
             for row in bucket_rows
         ]
-    rows = (
-        db.query(SpreadSnapshot)
-        .filter(
-            SpreadSnapshot.symbol == symbol.upper(),
-            SpreadSnapshot.direction == direction,
-            SpreadSnapshot.created_at >= start_at,
-        )
-        .order_by(SpreadSnapshot.created_at)
-        .all()
-    )
-    return [
-        SpreadPoint(
-            created_at=row.created_at,
-            spread=float(row.gross_spread),
-            total_cost=float(row.unit_cost),
-            net_profit=float(row.unit_net_profit),
-        )
-        for row in rows
-    ]
+    return []
 
 
 def summarize_spreads(points: list[SpreadPoint], range_value: str) -> dict[str, object]:

@@ -3,13 +3,14 @@ from datetime import datetime
 import json
 from threading import Event
 from threading import Lock
+from threading import Thread
 from time import monotonic
 from typing import Protocol
 from urllib import request
 from uuid import uuid4
 
 from app.adapters.base import AdapterOrderResult
-from app.config.settings import Settings, get_settings
+from app.config.settings import Settings, get_settings, hyperliquid_execution_info_url
 from app.execution.gateway import FillEvent, GatewayOrderResult, HedgeGroupState, LegOrderIntent, OrderEvent
 
 
@@ -115,6 +116,7 @@ class NautilusTradingNodeSubmitter:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
         self._node = None
+        self._node_thread: Thread | None = None
         self._strategy = None
         self._lock = Lock()
 
@@ -225,7 +227,7 @@ class NautilusTradingNodeSubmitter:
         node.trader.add_strategy(strategy)
         node.build()
         if not node.is_running():
-            node.run_async()
+            self._node_thread = _start_node(node, "nautilus-hyperliquid-exec-node")
         return node, strategy
 
 
@@ -482,7 +484,7 @@ def _nautilus_product_types(enum_cls, raw_value: str):
 
 
 def _nautilus_account_address(settings: Settings) -> str | None:
-    return settings.hyperliquid_account_address or settings.hyperliquid_wallet_address or None
+    return settings.hyperliquid_account_address or None
 
 
 def _event_client_order_id(event) -> str:
@@ -530,14 +532,14 @@ def _event_message(event) -> str:
 
 
 def _query_hyperliquid_order_status(settings: Settings, external_order_id: str) -> dict:
-    user = settings.hyperliquid_account_address or settings.hyperliquid_wallet_address or settings.nautilus_hyperliquid_vault_address
+    user = settings.hyperliquid_account_address or settings.nautilus_hyperliquid_vault_address
     if not user:
         return {"status": "not_supported", "external_order_id": external_order_id, "message": "未配置 Hyperliquid 用户地址，无法主动查询外部订单"}
     oid = _hyperliquid_oid(external_order_id)
     if oid is None:
         return {"status": "not_supported", "external_order_id": external_order_id, "message": "external_order_id 不能转换为 Hyperliquid oid/cloid"}
     try:
-        payload = _hyperliquid_info(settings.hyperliquid_info_url, {"type": "orderStatus", "user": user, "oid": oid})
+        payload = _hyperliquid_info(hyperliquid_execution_info_url(settings), {"type": "orderStatus", "user": user, "oid": oid})
     except Exception as exc:
         return {"status": "not_ready", "external_order_id": external_order_id, "message": f"Hyperliquid orderStatus 查询失败: {exc}"}
 
@@ -551,7 +553,7 @@ def _query_hyperliquid_order_status(settings: Settings, external_order_id: str) 
 
 def _query_hyperliquid_fills(settings: Settings, user: str, oid) -> dict:
     try:
-        payload = _hyperliquid_info(settings.hyperliquid_info_url, {"type": "userFills", "user": user, "aggregateByTime": False})
+        payload = _hyperliquid_info(hyperliquid_execution_info_url(settings), {"type": "userFills", "user": user, "aggregateByTime": False})
     except Exception:
         return {}
     fills = payload if isinstance(payload, list) else []
@@ -569,12 +571,12 @@ def _query_hyperliquid_fills(settings: Settings, user: str, oid) -> dict:
 
 
 def _query_hyperliquid_account_order_snapshots(settings: Settings) -> list[dict]:
-    user = settings.hyperliquid_account_address or settings.hyperliquid_wallet_address or settings.nautilus_hyperliquid_vault_address
+    user = settings.hyperliquid_account_address or settings.nautilus_hyperliquid_vault_address
     if not user:
         return []
     snapshots: dict[str, dict] = {}
     try:
-        open_orders = _hyperliquid_info(settings.hyperliquid_info_url, {"type": "openOrders", "user": user})
+        open_orders = _hyperliquid_info(hyperliquid_execution_info_url(settings), {"type": "openOrders", "user": user})
     except Exception:
         open_orders = []
     for item in open_orders if isinstance(open_orders, list) else []:
@@ -584,7 +586,7 @@ def _query_hyperliquid_account_order_snapshots(settings: Settings) -> list[dict]
             snapshots[str(external_order_id)] = snapshot
 
     try:
-        fills = _hyperliquid_info(settings.hyperliquid_info_url, {"type": "userFills", "user": user, "aggregateByTime": False})
+        fills = _hyperliquid_info(hyperliquid_execution_info_url(settings), {"type": "userFills", "user": user, "aggregateByTime": False})
     except Exception:
         fills = []
     for item in fills if isinstance(fills, list) else []:
@@ -700,3 +702,15 @@ def _normalize_hyperliquid_order_status(status: str) -> str:
     if value:
         return "failed" if "Rejected" in value or "Canceled" in value else value
     return "not_ready"
+
+
+def _start_node(node, name: str) -> Thread | None:
+    run = getattr(node, "run", None)
+    if callable(run):
+        thread = Thread(target=run, name=name, daemon=True)
+        thread.start()
+        return thread
+    run_async = getattr(node, "run_async", None)
+    if callable(run_async):
+        run_async()
+    return None

@@ -25,12 +25,36 @@ NAUTILUS_TRADER_ID=MT5-HEDGE-001
 
 ## 后端启动
 
+推荐直接使用 Windows 脚本：
+
 ```powershell
-cd C:\Users\a1998\Documents\MT5-hedge\backend
-python -m venv .venv
+.\create_env.cmd
+.\install_packages.cmd
+.\start_project.cmd
+```
+
+停止项目：
+
+```powershell
+.\stop_project.cmd
+```
+
+前端生产构建：
+
+```powershell
+.\build_frontend.cmd
+```
+
+如果需要手工启动，命令如下：
+
+```powershell
+cd C:\Users\a1998\Documents\MT5-hedge
+py -3.14 -m venv .venv
 .\.venv\Scripts\Activate.ps1
-python -m pip install -r requirements.txt
-uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
+python -m pip install --upgrade pip setuptools wheel
+python -m pip install -r backend\requirements.txt
+cd backend
+python -m uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
 ```
 
 首次启动会自动：

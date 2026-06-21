@@ -13,7 +13,16 @@ from app.execution.nautilus_hyperliquid import hyperliquid_instrument_id
 from app.market.quotes import QuoteCache, quote_cache
 
 
-FAST_L2BOOK_OVERRIDE_MS = 2_000
+ORDER_BOOK_OVERRIDE_MS = 10_000
+ORDER_BOOK_SOURCES = {
+    "hyperliquid_l2Book",
+    "hyperliquid_l2Book_fast",
+    "hyperliquid_http_l2Book",
+    "nautilus_order_book",
+    "nautilus_order_book_depth",
+    "nautilus_order_book_deltas",
+    "nautilus_quote_tick",
+}
 
 
 @dataclass(frozen=True)
@@ -157,7 +166,7 @@ def build_nautilus_quote_bridge_strategy(symbols: tuple[NautilusMarketSymbol, ..
             super().__init__(StrategyConfig(strategy_id="MT5-HEDGE-HL-MD-BRIDGE-001"))
             self._cache = cache
             self._by_instrument_id = {item.instrument_id: item.internal_symbol for item in symbols}
-            self._book_instrument_ids = [InstrumentId.from_str(item.instrument_id) for item in symbols if ":" not in item.hyperliquid_symbol]
+            self._book_instrument_ids = [InstrumentId.from_str(item.instrument_id) for item in symbols]
             self._has_dex_symbols = any(":" in item.hyperliquid_symbol for item in symbols)
             self._dex_data_type = DataType(HyperliquidAllDexsAssetCtxs) if self._has_dex_symbols else None
 
@@ -284,7 +293,7 @@ def write_all_dexs_asset_ctxs_to_quote_cache(payload, by_instrument_id: dict[str
             ask = mid
         if bid <= 0 or ask <= 0:
             continue
-        if _has_fresh_fast_l2book_quote(cache, symbol):
+        if _has_fresh_order_book_quote(cache, symbol):
             continue
         open_interest = _to_float(getattr(entry, "open_interest", 0.0))
         depth_notional = open_interest * ((bid + ask) / 2) if open_interest > 0 else 0.0
@@ -337,12 +346,12 @@ def _event_time(event) -> datetime | None:
     return datetime.utcfromtimestamp(value / 1_000_000_000)
 
 
-def _has_fresh_fast_l2book_quote(cache: QuoteCache, symbol: str) -> bool:
+def _has_fresh_order_book_quote(cache: QuoteCache, symbol: str) -> bool:
     latest = cache.latest("hyperliquid", symbol)
-    if latest is None or latest.source != "hyperliquid_l2Book_fast":
+    if latest is None or latest.source not in ORDER_BOOK_SOURCES:
         return False
     age_ms = (datetime.utcnow() - latest.local_recv_ts).total_seconds() * 1000
-    return age_ms <= FAST_L2BOOK_OVERRIDE_MS
+    return age_ms <= ORDER_BOOK_OVERRIDE_MS
 
 
 def _nautilus_environment(enum_cls, value: str):

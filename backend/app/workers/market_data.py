@@ -15,7 +15,7 @@ from app.adapters.hyperliquid import HyperliquidAdapter
 from app.adapters.mt5 import MT5Adapter
 from app.config.settings import get_settings
 from app.db.session import SessionLocal
-from app.market.nautilus_hyperliquid import NautilusHyperliquidMarketDataBridge, market_symbols_from_mappings
+from app.market.nautilus_hyperliquid import ORDER_BOOK_OVERRIDE_MS, ORDER_BOOK_SOURCES, NautilusHyperliquidMarketDataBridge, market_symbols_from_mappings
 from app.market.quotes import quote_cache
 from app.market.symbols import enabled_mappings
 
@@ -170,8 +170,6 @@ class MarketDataManager:
                 try:
                     if self._has_fresh_hyperliquid_ws_quote(mapping.symbol):
                         continue
-                    if get_settings().hyperliquid_market_data_source.strip().lower() == "nautilus" and ":" in mapping.hyperliquid_symbol:
-                        continue
                     if ":" in mapping.hyperliquid_symbol:
                         self._write_hyperliquid_dex_quote(mapping.symbol, mapping.hyperliquid_symbol)
                     else:
@@ -203,7 +201,10 @@ class MarketDataManager:
         }:
             return False
         age_ms = (datetime.utcnow() - quote.local_recv_ts).total_seconds() * 1000
-        return age_ms <= max(get_settings().quote_stale_ms, 1000)
+        max_age_ms = max(get_settings().quote_stale_ms, 1000)
+        if quote.source in ORDER_BOOK_SOURCES:
+            max_age_ms = max(max_age_ms, ORDER_BOOK_OVERRIDE_MS)
+        return age_ms <= max_age_ms
 
     async def _hyperliquid_l2book_main(self, *, fast: bool, hip3_only: bool, source: str) -> None:
         try:
@@ -213,29 +214,52 @@ class MarketDataManager:
             return
         settings = get_settings()
         while not self._stop.is_set():
-            db = SessionLocal()
-            try:
-                mappings = enabled_mappings(db)
-                by_hl_symbol = hyperliquid_symbol_map(mappings, hip3_only=hip3_only)
-            finally:
-                db.close()
+            by_hl_symbol = self._load_hyperliquid_symbol_map(hip3_only=hip3_only)
             if not by_hl_symbol:
                 await asyncio.sleep(2)
                 continue
             try:
                 async with websockets.connect(settings.hyperliquid_ws_url, ping_interval=20, ping_timeout=20) as ws:
+                    subscribed: set[str] = set()
                     for coin in by_hl_symbol:
                         await ws.send(json.dumps({"method": "subscribe", "subscription": l2book_subscription(coin, fast=fast)}))
+                        subscribed.add(coin)
                     mode = "fast" if fast else "default"
                     scope = "HIP-3" if hip3_only else "all"
                     logger.info(f"Hyperliquid l2Book WS 已订阅: {len(by_hl_symbol)} 个品种, mode={mode}, scope={scope}")
-                    async for raw in ws:
+                    last_refresh = time.monotonic()
+                    while not self._stop.is_set():
+                        if time.monotonic() - last_refresh >= 2:
+                            next_by_hl_symbol = self._load_hyperliquid_symbol_map(hip3_only=hip3_only)
+                            for coin in set(next_by_hl_symbol) - subscribed:
+                                await ws.send(json.dumps({"method": "subscribe", "subscription": l2book_subscription(coin, fast=fast)}))
+                                subscribed.add(coin)
+                                logger.info(f"Hyperliquid l2Book WS 动态订阅: {coin}")
+                            removed = subscribed - set(next_by_hl_symbol)
+                            for coin in removed:
+                                await ws.send(json.dumps({"method": "unsubscribe", "subscription": l2book_subscription(coin, fast=fast)}))
+                                subscribed.remove(coin)
+                                logger.info(f"Hyperliquid l2Book WS 取消订阅: {coin}")
+                            by_hl_symbol = next_by_hl_symbol
+                            last_refresh = time.monotonic()
+                        try:
+                            raw = await asyncio.wait_for(ws.recv(), timeout=1)
+                        except asyncio.TimeoutError:
+                            continue
                         if self._stop.is_set():
                             break
                         self._handle_hyperliquid_message(json.loads(raw), by_hl_symbol, source)
             except Exception as exc:
                 logger.error(f"Hyperliquid WS 断开，准备重连: {exc}")
                 await asyncio.sleep(2)
+
+    def _load_hyperliquid_symbol_map(self, *, hip3_only: bool) -> dict[str, str]:
+        db = SessionLocal()
+        try:
+            mappings = enabled_mappings(db)
+            return hyperliquid_symbol_map(mappings, hip3_only=hip3_only)
+        finally:
+            db.close()
 
     def _handle_hyperliquid_message(self, payload: dict[str, Any], by_hl_symbol: dict[str, str], source: str = "hyperliquid_l2Book") -> None:
         channel = payload.get("channel")

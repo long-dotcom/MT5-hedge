@@ -16,8 +16,8 @@
 
 - Hyperliquid 默认使用原生 WebSocket 订阅 `l2Book`，HTTP `l2Book` 作为兜底；`HYPERLIQUID_L2BOOK_FAST_ENABLED=true` 时订阅携带 `fast: true`，用于扫描浅层高频盘口。
 - 当 `HYPERLIQUID_MARKET_DATA_SOURCE=nautilus` 时，Hyperliquid 行情由 NautilusTrader data client 订阅和维护 L2 订单簿，bridge Strategy 会把顶层 bid/ask、size 折算出的 `depth_notional` 写入系统 `QuoteCache`，扫描器、价差计算和入库逻辑保持不变。
-- `xyz:*` 这类 HIP-3 DEX 品种使用 NautilusTrader `HyperliquidAllDexsAssetCtxs` custom data 订阅，bridge Strategy 会按 instrument id 分发到系统内部品种；由于该批量流约 15s 一包，系统在 fast 开关开启时会额外对所有启用扫描的 Hyperliquid 品种订阅原生 `l2Book fast`，并以 `hyperliquid_l2Book_fast` 写入 `QuoteCache` 作为扫描主报价。这样 BTC/ETH 等标准永续也不会因 Nautilus 行情桥重启失败而缺少报价。
-- `HYPERLIQUID_MARKET_DATA_FALLBACK=native` 时，系统仍保留原生 HTTP 轮询兜底；如果 Nautilus 行情足够新，HTTP 轮询不会覆盖该报价。
+- `xyz:*` 这类 HIP-3 DEX 品种同样通过 NautilusTrader 订阅 `l2Book` 并维护 L2 订单簿，例如 `xyz:JP225-USD-PERP.HYPERLIQUID`。`HyperliquidAllDexsAssetCtxs` custom data 只作为 DEX 资产上下文、impact price 和兜底信息来源；由于该批量流约 15s 一包，不再作为 HIP-3 的主扫描报价。
+- `HYPERLIQUID_MARKET_DATA_FALLBACK=native` 时，系统仍保留原生 HTTP 轮询兜底；如果 Nautilus/原生订单簿报价在约 10 秒内更新过，HTTP `metaAndAssetCtxs`/`l2Book` 兜底不会覆盖订单簿报价。
 - MT5 使用 Python API 高频轮询 `symbol_info_tick()`。
 
 MT5 的 Python API 还提供 Depth of Market 相关函数：`market_book_add()`、`market_book_get()`、`market_book_release()`。这类盘口数据依赖券商是否提供对应品种的 Market Depth；对很多外汇或 CFD 品种，可能只有 tick bid/ask，没有可用深度。

@@ -170,8 +170,8 @@ symbols:
 
 - 默认 `HYPERLIQUID_MARKET_DATA_SOURCE=native` 时，Hyperliquid worker 连接 `HYPERLIQUID_WS_URL` 并订阅每个映射品种的 `l2Book`；`HYPERLIQUID_L2BOOK_FAST_ENABLED=true` 时订阅会携带 `fast: true`，使用浅层高频盘口。
 - 设置 `HYPERLIQUID_MARKET_DATA_SOURCE=nautilus` 后，Hyperliquid 行情改由 NautilusTrader data client 订阅 L2 订单簿；bridge Strategy 会把 Nautilus 维护的顶层报价和深度写入系统 `QuoteCache`，扫描器、价差计算和数据库写入路径不变。
-- `xyz:*` 这类 HIP-3 DEX 品种通过 NautilusTrader `HyperliquidAllDexsAssetCtxs` custom data 接入；当 `HYPERLIQUID_L2BOOK_FAST_ENABLED=true` 时，系统会额外对所有启用扫描的 Hyperliquid 品种订阅原生 `l2Book fast`，用约 0.5s 浅盘口覆盖 15s 批量资产上下文，并为 BTC/ETH 等标准永续提供独立于 Nautilus 生命周期的实时报价。
-- `HYPERLIQUID_MARKET_DATA_FALLBACK=native` 会保留原生 HTTP 轮询兜底；当 Nautilus 报价新鲜时，HTTP 轮询会跳过该品种。
+- `xyz:*` 这类 HIP-3 DEX 品种也会通过 NautilusTrader 订阅 `l2Book`，例如 `xyz:JP225-USD-PERP.HYPERLIQUID`。`HyperliquidAllDexsAssetCtxs` custom data 仍用于 DEX 上下文、impact price 和兜底信息，但不再作为主扫描报价。
+- `HYPERLIQUID_MARKET_DATA_FALLBACK=native` 会保留原生 HTTP 轮询兜底；当 Nautilus/原生订单簿报价在约 10 秒内更新过时，HTTP 轮询会跳过该品种，避免低频 `metaAndAssetCtxs` 覆盖订单簿报价。
 - 如果当前网络无法建立 Hyperliquid WebSocket，系统会用 HTTP `l2Book` 按 `HYPERLIQUID_HTTP_POLL_INTERVAL_MS` 轮询兜底。
 - MT5 worker 初始化本机 MetaTrader5 终端，并对映射品种调用 `symbol_select(symbol, True)` 和 `symbol_info_tick()` 高频轮询。
 - 扫描器只读取同步后的行情缓存，不直接请求报价。

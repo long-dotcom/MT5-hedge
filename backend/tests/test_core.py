@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta
+from dataclasses import replace
 import json
 import time
 from importlib import reload
@@ -26,7 +27,7 @@ from app.execution.reconciler import reconcile_hedge_group, reconcile_orphan_pos
 from app.config.settings import HYPERLIQUID_MAINNET_INFO_URL, HYPERLIQUID_TESTNET_INFO_URL, hyperliquid_execution_info_url
 from app.api import router as api_router
 from app.market.mt5_sessions import MT5SessionState, mt5_action_allowed
-from app.market.nautilus_hyperliquid import market_symbols_from_mappings, write_all_dexs_asset_ctxs_to_quote_cache, write_cached_order_book_to_quote_cache, write_depth_to_quote_cache, write_quote_tick_to_quote_cache
+from app.market.nautilus_hyperliquid import build_nautilus_quote_bridge_strategy, market_symbols_from_mappings, write_all_dexs_asset_ctxs_to_quote_cache, write_cached_order_book_to_quote_cache, write_depth_to_quote_cache, write_quote_tick_to_quote_cache
 from app.market.scan_state import scan_state_store
 from app.risk.engine import pre_trade_check
 from app.market.quotes import QuoteCache, QuoteSynchronizer, quote_cache
@@ -241,6 +242,33 @@ def test_nautilus_all_dexs_does_not_override_fresh_fast_l2book_quote() -> None:
     assert quote.source == "hyperliquid_l2Book_fast"
 
 
+def test_nautilus_all_dexs_does_not_override_fresh_nautilus_order_book_quote() -> None:
+    cache = QuoteCache()
+    cache.put("hyperliquid", "JP225", 72181, 72389, 50.52, "nautilus_order_book_deltas")
+    payload = SimpleNamespace(
+        entries=[
+            SimpleNamespace(
+                instrument_id="xyz:JP225-USD-PERP.HYPERLIQUID",
+                impact_prices=SimpleNamespace(bid=72059.6, ask=72456.3),
+                open_interest=10.0,
+            ),
+        ],
+        ts_event=1_700_000_000_000_000_000,
+    )
+
+    updated = write_all_dexs_asset_ctxs_to_quote_cache(
+        payload,
+        {"xyz:JP225-USD-PERP.HYPERLIQUID": "JP225"},
+        cache,
+    )
+
+    quote = cache.latest("hyperliquid", "JP225")
+    assert updated == 0
+    assert quote is not None
+    assert quote.bid == 72181
+    assert quote.source == "nautilus_order_book_deltas"
+
+
 def test_nautilus_market_symbols_use_hyperliquid_instrument_ids() -> None:
     symbols = market_symbols_from_mappings(
         [
@@ -251,6 +279,24 @@ def test_nautilus_market_symbols_use_hyperliquid_instrument_ids() -> None:
 
     assert symbols[0].instrument_id == "BTC-USD-PERP.HYPERLIQUID"
     assert symbols[1].instrument_id == "xyz:JP225-USD-PERP.HYPERLIQUID"
+
+
+def test_nautilus_quote_bridge_subscribes_hip3_order_books() -> None:
+    strategy = build_nautilus_quote_bridge_strategy(
+        tuple(
+            market_symbols_from_mappings(
+                [
+                    SimpleNamespace(symbol="BTC", hyperliquid_symbol="BTC"),
+                    SimpleNamespace(symbol="JP225", hyperliquid_symbol="xyz:JP225"),
+                ]
+            )
+        ),
+        QuoteCache(),
+    )
+
+    book_ids = {str(instrument_id) for instrument_id in strategy._book_instrument_ids}
+    assert "BTC-USD-PERP.HYPERLIQUID" in book_ids
+    assert "xyz:JP225-USD-PERP.HYPERLIQUID" in book_ids
 
 
 def test_hyperliquid_fast_l2book_subscription_includes_fast_flag() -> None:
@@ -296,6 +342,22 @@ def test_hyperliquid_l2book_message_writes_exchange_timestamp() -> None:
         assert quote.ask == 72499.0
         assert quote.source == "hyperliquid_l2Book_fast"
         assert quote.exchange_ts == _exchange_time_from_hyperliquid_ms(1_782_040_271_224)
+    finally:
+        market_data_module.quote_cache = original_worker_cache
+
+
+def test_hyperliquid_http_fallback_does_not_override_recent_nautilus_order_book() -> None:
+    manager = MarketDataManager()
+    cache = QuoteCache()
+    import app.workers.market_data as market_data_module
+
+    original_worker_cache = market_data_module.quote_cache
+    try:
+        market_data_module.quote_cache = cache
+        quote = cache.put("hyperliquid", "JP225", 72181, 72389, 50.52, "nautilus_order_book_deltas")
+        cache._quotes[("hyperliquid", "JP225")] = [replace(quote, local_recv_ts=quote.local_recv_ts - timedelta(seconds=2))]
+
+        assert manager._has_fresh_hyperliquid_ws_quote("JP225")
     finally:
         market_data_module.quote_cache = original_worker_cache
 

@@ -33,6 +33,19 @@ NAUTILUS_TRADER_ID=MT5-HEDGE-001
 .\start_project.cmd
 ```
 
+`start_project.cmd` 是开发模式，会启动后端 `8000` 和 Vite 前端 `5173`。
+
+如果使用 Nginx 绑定公网域名，推荐使用生产模式：
+
+```powershell
+.\create_env.cmd
+.\install_packages.cmd
+.\build_frontend.cmd
+.\start_backend.cmd
+```
+
+此时前端不再运行 `5173`，而是由 Nginx 直接托管 `frontend/dist`；后端仍只监听本机 `127.0.0.1:8000`。
+
 停止项目：
 
 ```powershell

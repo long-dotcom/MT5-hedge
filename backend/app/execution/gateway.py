@@ -159,7 +159,11 @@ class AdapterExecutionGateway:
 
 def build_execution_gateway(adapter: ExchangeAdapter) -> ExecutionGateway:
     settings = get_settings()
-    if getattr(adapter, "platform", "") == "hyperliquid" and settings.nautilus_hyperliquid_enabled:
+    if getattr(adapter, "platform", "") == "hyperliquid" and getattr(adapter, "simulated", False):
+        from app.execution.nautilus_hyperliquid import NautilusHyperliquidSandboxGateway
+
+        return NautilusHyperliquidSandboxGateway(settings=settings)
+    if getattr(adapter, "platform", "") == "hyperliquid" and getattr(adapter, "live", False) and settings.nautilus_hyperliquid_enabled:
         from app.execution.nautilus_hyperliquid import NautilusHyperliquidGateway
 
         return NautilusHyperliquidGateway(settings=settings)

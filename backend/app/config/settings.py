@@ -89,7 +89,9 @@ class Settings:
     nautilus_hyperliquid_private_key: str = ""
     nautilus_hyperliquid_vault_address: str = ""
     nautilus_trader_id: str = "MT5-HEDGE-001"
+    nautilus_hyperliquid_sim_starting_balances: str = "100000 USD"
     mt5_live_order_enabled: bool = False
+    mt5_demo_order_enabled: bool = False
     mt5_order_deviation_points: int = 20
     mt5_order_magic: int = 260620
     mt5_login: str = ""

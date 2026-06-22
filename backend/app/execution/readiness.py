@@ -32,6 +32,20 @@ def live_execution_readiness(db: Session, settings: Settings | None = None) -> d
     }
 
 
+def paper_execution_readiness(db: Session, settings: Settings | None = None) -> dict:
+    settings = settings or get_settings()
+    checks: list[ReadinessCheck] = []
+    checks.extend(_hyperliquid_sandbox_checks(settings))
+    checks.extend(_mt5_demo_checks(settings))
+    checks.extend(_symbol_mapping_checks(db))
+    overall = _overall_status(checks)
+    return {
+        "status": overall,
+        "ready": overall == "ready",
+        "checks": [check.__dict__ for check in checks],
+    }
+
+
 def _global_live_checks(db: Session) -> list[ReadinessCheck]:
     row = db.query(SystemSetting).filter(SystemSetting.key == "live_trading_enabled").first()
     enabled = bool(row and row.value == "true")
@@ -78,6 +92,32 @@ def _hyperliquid_nautilus_checks(settings: Settings) -> list[ReadinessCheck]:
     return checks
 
 
+def _hyperliquid_sandbox_checks(settings: Settings) -> list[ReadinessCheck]:
+    checks = [
+        ReadinessCheck(
+            "nautilus_hyperliquid_enabled",
+            "ok" if settings.nautilus_hyperliquid_enabled else "block",
+            "NautilusTrader Hyperliquid 数据网关已启用" if settings.nautilus_hyperliquid_enabled else "NAUTILUS_HYPERLIQUID_ENABLED 未开启",
+        )
+    ]
+    try:
+        import_module("nautilus_trader.adapters.hyperliquid")
+        import_module("nautilus_trader.adapters.sandbox.config")
+        import_module("nautilus_trader.adapters.sandbox.factory")
+        checks.append(ReadinessCheck("nautilus_sandbox_import", "ok", "nautilus_trader Hyperliquid + sandbox 可导入"))
+    except Exception as exc:
+        checks.append(ReadinessCheck("nautilus_sandbox_import", "block", f"nautilus_trader sandbox 不可导入: {exc}"))
+    balances = str(getattr(settings, "nautilus_hyperliquid_sim_starting_balances", "") or "").strip()
+    checks.append(
+        ReadinessCheck(
+            "nautilus_sandbox_starting_balances",
+            "ok" if balances else "warn",
+            f"Nautilus sandbox 初始资金: {balances}" if balances else "未配置 NAUTILUS_HYPERLIQUID_SIM_STARTING_BALANCES，将使用默认 100000 USD",
+        )
+    )
+    return checks
+
+
 def _mt5_checks(settings: Settings) -> list[ReadinessCheck]:
     checks = [
         ReadinessCheck(
@@ -94,6 +134,27 @@ def _mt5_checks(settings: Settings) -> list[ReadinessCheck]:
         checks.append(ReadinessCheck("metatrader5_import", "block", f"MetaTrader5 Python 包不可导入: {exc}"))
     if settings.mt5_login and settings.mt5_server:
         checks.append(ReadinessCheck("mt5_login_config", "ok", "MT5 登录参数已配置"))
+    else:
+        checks.append(ReadinessCheck("mt5_login_config", "warn", "MT5 登录参数未完整配置，将依赖本机终端已有登录会话"))
+    return checks
+
+
+def _mt5_demo_checks(settings: Settings) -> list[ReadinessCheck]:
+    checks = [
+        ReadinessCheck(
+            "mt5_demo_order_enabled",
+            "ok" if getattr(settings, "mt5_demo_order_enabled", False) else "block",
+            "MT5 demo 下单开关已开启" if getattr(settings, "mt5_demo_order_enabled", False) else "MT5_DEMO_ORDER_ENABLED 未开启",
+        )
+    ]
+    try:
+        mt5 = import_module("MetaTrader5")
+        checks.append(ReadinessCheck("metatrader5_import", "ok", "MetaTrader5 Python 包可导入"))
+        checks.append(_mt5_demo_probe(mt5, settings))
+    except Exception as exc:
+        checks.append(ReadinessCheck("metatrader5_import", "block", f"MetaTrader5 Python 包不可导入: {exc}"))
+    if settings.mt5_login and settings.mt5_server:
+        checks.append(ReadinessCheck("mt5_login_config", "ok", "MT5 登录参数已配置，并会用于锁定 demo 账户身份"))
     else:
         checks.append(ReadinessCheck("mt5_login_config", "warn", "MT5 登录参数未完整配置，将依赖本机终端已有登录会话"))
     return checks
@@ -235,6 +296,29 @@ def _mt5_read_probe(mt5, settings: Settings) -> ReadinessCheck:
         return ReadinessCheck("mt5_read_probe", "ok", f"MT5 account_info 只读探测成功: {login} {server}".strip())
     except Exception as exc:
         return ReadinessCheck("mt5_read_probe", "block", f"MT5 account_info 只读探测失败: {exc}")
+    finally:
+        if initialized:
+            try:
+                mt5.shutdown()
+            except Exception:
+                pass
+
+
+def _mt5_demo_probe(mt5, settings: Settings) -> ReadinessCheck:
+    initialized = False
+    try:
+        if settings.mt5_login and settings.mt5_password and settings.mt5_server:
+            initialized = mt5.initialize(login=int(settings.mt5_login), password=settings.mt5_password, server=settings.mt5_server)
+        else:
+            initialized = mt5.initialize()
+        if not initialized:
+            return ReadinessCheck("mt5_demo_account", "block", f"MT5 initialize 失败: {mt5.last_error()}")
+        from app.adapters.mt5 import mt5_demo_order_check
+
+        check = mt5_demo_order_check(mt5, settings)
+        return ReadinessCheck("mt5_demo_account", "ok" if check.allowed else "block", check.message)
+    except Exception as exc:
+        return ReadinessCheck("mt5_demo_account", "block", f"MT5 demo 账户检查失败: {exc}")
     finally:
         if initialized:
             try:

@@ -8,7 +8,7 @@ from app.adapters.mt5 import MT5Adapter
 from app.config.settings import get_settings
 from app.db.models import Alert, ArbitrageOpportunity, Fill, HedgeGroup, HedgeGroupEvent, Order, StrategySetting, SymbolMapping, SystemSetting
 from app.execution.gateway import LegOrderIntent, build_execution_gateway
-from app.execution.readiness import live_execution_readiness
+from app.execution.readiness import live_execution_readiness, paper_execution_readiness
 from app.market.mt5_sessions import mt5_action_allowed, mt5_session_state
 from app.market.quotes import quote_synchronizer
 from app.risk.engine import pre_trade_check, record_risk_event
@@ -31,6 +31,9 @@ def open_hedge_group(db: Session, opportunity_id: int, source: str = "system") -
     live = mode == "live" and live_trading_enabled(db)
     if live:
         _ensure_live_execution_ready(db)
+    simulated = mode == "paper"
+    if simulated:
+        _ensure_paper_execution_ready(db)
     synced, sync_reason = quote_synchronizer.synchronized(
         opportunity.symbol,
         mode="strict",
@@ -70,8 +73,7 @@ def open_hedge_group(db: Session, opportunity_id: int, source: str = "system") -
         raise ValueError("品种映射不存在")
     hl_side = "buy" if opportunity.direction == "long_hyperliquid_short_mt5" else "sell"
     mt5_side = "sell" if opportunity.direction == "long_hyperliquid_short_mt5" else "buy"
-    hl = HyperliquidAdapter(live=live)
-    mt5 = MT5Adapter(live=live)
+    hl, mt5 = _execution_adapters(live=live, simulated=simulated)
     hl_quantity = opportunity.hyperliquid_quantity or opportunity.quantity
     mt5_quantity = opportunity.mt5_quantity or opportunity.quantity
     if mapping.execution_style == "hyper_maker_mt5_taker":
@@ -229,12 +231,12 @@ def close_hedge_group(db: Session, group_id: int, reason: str) -> HedgeGroup:
     if group.status not in {"open", "open_partial", "manual_intervention"}:
         raise ValueError("当前状态不允许平仓")
     if group.execution_mode == "paper":
-        return _execute_close_hedge_group(db, group, reason, live=False, estimated_realized_pnl=None, success_event_type="closed", pending_event_type="close_pending", failed_event_type="close_failed")
+        return _execute_close_hedge_group(db, group, reason, live=False, simulated=True, estimated_realized_pnl=None, success_event_type="closed", pending_event_type="close_pending", failed_event_type="close_failed")
     if group.execution_mode == "live":
         if not live_trading_enabled(db):
             raise ValueError("实盘平仓需要先开启 live_trading_enabled")
         _ensure_live_execution_ready(db)
-        return _execute_close_hedge_group(db, group, reason, live=True, estimated_realized_pnl=None, success_event_type="closed", pending_event_type="close_pending", failed_event_type="close_failed")
+        return _execute_close_hedge_group(db, group, reason, live=True, simulated=False, estimated_realized_pnl=None, success_event_type="closed", pending_event_type="close_pending", failed_event_type="close_failed")
 
     group.status = "closed"
     group.closed_at = datetime.utcnow()
@@ -259,6 +261,7 @@ def paper_close_hedge_group(db: Session, group_id: int, reason: str, estimated_r
         group,
         reason,
         live=False,
+        simulated=True,
         estimated_realized_pnl=estimated_realized_pnl,
         success_event_type="auto_closed",
         pending_event_type="auto_close_pending",
@@ -272,6 +275,7 @@ def _execute_close_hedge_group(
     reason: str,
     *,
     live: bool,
+    simulated: bool,
     estimated_realized_pnl: float | None,
     success_event_type: str,
     pending_event_type: str,
@@ -287,8 +291,9 @@ def _execute_close_hedge_group(
 
     strategy = db.query(StrategySetting).first() or StrategySetting()
     hl_side, mt5_side = _close_sides(group.direction)
-    hl = HyperliquidAdapter(live=live)
-    mt5 = MT5Adapter(live=live)
+    if simulated:
+        _ensure_paper_execution_ready(db)
+    hl, mt5 = _execution_adapters(live=live, simulated=simulated)
     legs = [
         ("hyperliquid", hl, hl_side, mapping.hl_close_order_type, _platform_close_quantity(group.hyperliquid_quantity, group.quantity), mapping.hyperliquid_symbol),
         ("mt5", mt5, mt5_side, mapping.mt5_close_order_type, _platform_close_quantity(group.mt5_quantity, group.quantity), mapping.mt5_symbol),
@@ -348,6 +353,21 @@ def _ensure_live_execution_ready(db: Session) -> None:
     if blocked:
         detail = "; ".join(str(item.get("message") or item.get("component")) for item in blocked)
         raise ValueError(f"实盘执行就绪检查未通过: {detail}")
+
+
+def _ensure_paper_execution_ready(db: Session) -> None:
+    readiness = paper_execution_readiness(db)
+    blocked = [item for item in readiness.get("checks", []) if item.get("status") == "block"]
+    if blocked:
+        detail = "; ".join(str(item.get("message") or item.get("component")) for item in blocked)
+        raise ValueError(f"paper 完整模拟执行就绪检查未通过: {detail}")
+
+
+def _execution_adapters(*, live: bool, simulated: bool):
+    hl = HyperliquidAdapter(live=live)
+    setattr(hl, "simulated", bool(simulated))
+    mt5 = MT5Adapter(live=live, demo=simulated)
+    return hl, mt5
 
 
 def _has_position_effect(result) -> bool:

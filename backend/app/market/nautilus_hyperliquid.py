@@ -172,6 +172,9 @@ def build_nautilus_quote_bridge_strategy(symbols: tuple[NautilusMarketSymbol, ..
 
         def on_start(self) -> None:
             for instrument_id in self._book_instrument_ids:
+                if _is_hip3_instrument_id(instrument_id) and not _instrument_available(self.cache, instrument_id):
+                    self.log.warning(f"Nautilus cache 未找到 HIP-3 instrument，跳过直接订单簿订阅: {instrument_id}")
+                    continue
                 # 中文注释：managed=True 让 Nautilus 维护本地订单簿状态，扫描器只消费桥接后的顶层报价。
                 self.subscribe_order_book_deltas(
                     instrument_id,
@@ -217,6 +220,17 @@ def build_nautilus_quote_bridge_strategy(symbols: tuple[NautilusMarketSymbol, ..
             write_quote_tick_to_quote_cache(tick, self._by_instrument_id, self._cache)
 
     return NautilusQuoteBridgeStrategy()
+
+
+def _is_hip3_instrument_id(instrument_id) -> bool:
+    return ":" in str(instrument_id)
+
+
+def _instrument_available(nautilus_cache, instrument_id) -> bool:
+    try:
+        return nautilus_cache.instrument(instrument_id) is not None
+    except Exception:
+        return False
 
 
 def write_depth_to_quote_cache(depth, by_instrument_id: dict[str, str], cache: QuoteCache) -> bool:

@@ -39,7 +39,7 @@ from app.db.models import (
 from app.db.session import SessionLocal, get_db
 from app.diagnostics.pipeline import build_pipeline_diagnostics
 from app.execution.engine import close_hedge_group, open_hedge_group
-from app.execution.readiness import live_execution_readiness
+from app.execution.readiness import live_execution_readiness, paper_execution_readiness
 from app.execution.reconciler import run_execution_reconcile
 from app.market.scanner import run_scan
 from app.market.scan_state import scan_state_store
@@ -736,6 +736,11 @@ def get_live_trading(_: User = Depends(get_current_user), db: Session = Depends(
 @router.get("/settings/live-readiness")
 def get_live_readiness(_: User = Depends(get_current_user), db: Session = Depends(get_db)) -> dict[str, Any]:
     return live_execution_readiness(db)
+
+
+@router.get("/settings/paper-readiness")
+def get_paper_readiness(_: User = Depends(get_current_user), db: Session = Depends(get_db)) -> dict[str, Any]:
+    return paper_execution_readiness(db)
 
 
 @router.put("/settings/live-trading")

@@ -73,6 +73,7 @@
 - 品种映射包含 MT5 会话保护字段：`mt5_pre_close_no_open_minutes`、`mt5_post_open_cooldown_minutes`、`allow_hold_through_mt5_close`。
 - `GET/PUT /api/settings/live-trading`：实盘开关。
 - `GET /api/settings/live-readiness`：实盘执行就绪检查，返回总状态和 Hyperliquid NautilusTrader、MT5、全局实盘开关、只读账户连通性、品种映射、单腿补偿配置等检查项。
+- `GET /api/settings/paper-readiness`：Paper 完整模拟执行就绪检查，返回 NautilusTrader sandbox、MT5 demo 开关、demo 账户状态、`MT5_LOGIN`/`MT5_SERVER` 账户锁定和品种映射检查项。存在 `block` 时，paper 开仓和平仓不会提交模拟订单。
 
 开启实盘时必须传入确认短语 `ENABLE LIVE TRADING`。
 

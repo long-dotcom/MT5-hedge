@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 from datetime import datetime
+from decimal import Decimal
 import json
 from threading import Event
 from threading import Lock
@@ -46,7 +47,7 @@ class NautilusHyperliquidGateway:
         self.submitter = submitter or _shared_submitter(self.settings)
 
     def submit_order(self, intent: LegOrderIntent, *, paper_latency_ms: int = 0) -> GatewayOrderResult:
-        instrument_id = hyperliquid_instrument_id(intent.symbol)
+        instrument_id = hyperliquid_instrument_id(intent.venue_symbol or intent.symbol)
         submitted = self.submitter.submit_order(intent, instrument_id)
         occurred_at = submitted.occurred_at or datetime.utcnow()
         order_event = OrderEvent(
@@ -100,8 +101,18 @@ class NautilusHyperliquidGateway:
         return HedgeGroupState(hedge_group_id=hedge_group_id, status="external_reconcile_required")
 
 
+class NautilusHyperliquidSandboxGateway(NautilusHyperliquidGateway):
+    def __init__(self, settings: Settings | None = None, submitter: NautilusSubmitter | None = None) -> None:
+        self.settings = settings or get_settings()
+        self.submitter = submitter or _shared_sandbox_submitter(self.settings)
+
+    def reconcile(self, hedge_group_id: int) -> HedgeGroupState:
+        return HedgeGroupState(hedge_group_id=hedge_group_id, status="sandbox_reconcile_required")
+
+
 _SUBMITTER_LOCK = Lock()
 _SUBMITTER: "NautilusTradingNodeSubmitter | None" = None
+_SANDBOX_SUBMITTER: "NautilusSandboxTradingNodeSubmitter | None" = None
 
 
 def _shared_submitter(settings: Settings) -> "NautilusTradingNodeSubmitter":
@@ -110,6 +121,14 @@ def _shared_submitter(settings: Settings) -> "NautilusTradingNodeSubmitter":
         if _SUBMITTER is None:
             _SUBMITTER = NautilusTradingNodeSubmitter(settings)
         return _SUBMITTER
+
+
+def _shared_sandbox_submitter(settings: Settings) -> "NautilusSandboxTradingNodeSubmitter":
+    global _SANDBOX_SUBMITTER
+    with _SUBMITTER_LOCK:
+        if _SANDBOX_SUBMITTER is None:
+            _SANDBOX_SUBMITTER = NautilusSandboxTradingNodeSubmitter(settings)
+        return _SANDBOX_SUBMITTER
 
 
 class NautilusTradingNodeSubmitter:
@@ -228,6 +247,94 @@ class NautilusTradingNodeSubmitter:
         node.build()
         if not node.is_running():
             self._node_thread = _start_node(node, "nautilus-hyperliquid-exec-node")
+        return node, strategy
+
+
+class NautilusSandboxTradingNodeSubmitter(NautilusTradingNodeSubmitter):
+    def submit_order(self, intent: LegOrderIntent, instrument_id: str) -> NautilusSubmitResult:
+        if intent.order_type not in {"market", "limit"}:
+            return NautilusSubmitResult(
+                status="failed",
+                external_order_id="",
+                message=f"NautilusTrader sandbox 暂不支持订单类型: {intent.order_type}",
+            )
+        if intent.order_type == "limit" and intent.price is None:
+            return NautilusSubmitResult(
+                status="failed",
+                external_order_id="",
+                message="NautilusTrader sandbox limit 订单缺少价格",
+            )
+        try:
+            self._ensure_node()
+        except Exception as exc:
+            return NautilusSubmitResult(
+                status="failed",
+                external_order_id="",
+                message=f"NautilusTrader sandbox 未就绪: {exc}",
+            )
+        strategy = self._strategy
+        if strategy is None:
+            return NautilusSubmitResult(status="failed", external_order_id="", message="NautilusTrader sandbox bridge strategy 未注册")
+        return strategy.submit_intent(intent, instrument_id, timeout_seconds=self.settings.nautilus_hyperliquid_order_timeout_seconds)
+
+    def query_order(self, external_order_id: str) -> dict:
+        strategy = self._strategy
+        if strategy is None:
+            return {"status": "not_ready", "external_order_id": external_order_id}
+        return strategy.query_external_order(external_order_id)
+
+    def _build_node(self):
+        try:
+            from nautilus_trader.adapters.hyperliquid import HYPERLIQUID
+            from nautilus_trader.adapters.hyperliquid import HyperliquidDataClientConfig
+            from nautilus_trader.adapters.hyperliquid import HyperliquidLiveDataClientFactory
+            from nautilus_trader.adapters.hyperliquid import HyperliquidProductType
+            from nautilus_trader.adapters.sandbox.config import SandboxExecutionClientConfig
+            from nautilus_trader.adapters.sandbox.factory import SandboxLiveExecClientFactory
+            from nautilus_trader.config import InstrumentProviderConfig
+            from nautilus_trader.config import TradingNodeConfig
+            from nautilus_trader.core.nautilus_pyo3 import HyperliquidEnvironment
+            from nautilus_trader.live.node import TradingNode
+            from nautilus_trader.model.enums import AccountType
+            from nautilus_trader.model.enums import BookType
+            from nautilus_trader.model.enums import OmsType
+            from nautilus_trader.model.identifiers import TraderId
+        except Exception as exc:
+            raise RuntimeError("未安装 nautilus_trader 或 sandbox/Hyperliquid adapter 不可导入") from exc
+
+        environment = _nautilus_environment(HyperliquidEnvironment, self.settings.nautilus_hyperliquid_environment)
+        product_types = _nautilus_product_types(HyperliquidProductType, self.settings.nautilus_hyperliquid_product_types)
+        provider = InstrumentProviderConfig(load_all=True)
+        config = TradingNodeConfig(
+            trader_id=TraderId(f"{self.settings.nautilus_trader_id}-SIM"),
+            data_clients={
+                HYPERLIQUID: HyperliquidDataClientConfig(
+                    environment=environment,
+                    instrument_provider=provider,
+                    product_types=product_types,
+                ),
+            },
+            exec_clients={
+                HYPERLIQUID: SandboxExecutionClientConfig(
+                    venue=HYPERLIQUID,
+                    starting_balances=_sandbox_starting_balances(self.settings),
+                    base_currency="USD",
+                    oms_type=OmsType.NETTING.name,
+                    account_type=AccountType.MARGIN.name,
+                    default_leverage=Decimal("1"),
+                    book_type=BookType.L2_MBP.name,
+                    use_reduce_only=True,
+                ),
+            },
+        )
+        node = TradingNode(config=config)
+        node.add_data_client_factory(HYPERLIQUID, HyperliquidLiveDataClientFactory)
+        node.add_exec_client_factory(HYPERLIQUID, SandboxLiveExecClientFactory)
+        strategy = NautilusHedgeBridgeStrategy()
+        node.trader.add_strategy(strategy)
+        node.build()
+        if not node.is_running():
+            self._node_thread = _start_node(node, "nautilus-hyperliquid-sandbox-node")
         return node, strategy
 
 
@@ -485,6 +592,12 @@ def _nautilus_product_types(enum_cls, raw_value: str):
 
 def _nautilus_account_address(settings: Settings) -> str | None:
     return settings.hyperliquid_account_address or None
+
+
+def _sandbox_starting_balances(settings: Settings) -> list[str]:
+    raw_value = str(getattr(settings, "nautilus_hyperliquid_sim_starting_balances", "") or "")
+    balances = [item.strip() for item in raw_value.split(",") if item.strip()]
+    return balances or ["100000 USD"]
 
 
 def _event_client_order_id(event) -> str:

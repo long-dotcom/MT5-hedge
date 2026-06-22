@@ -1,21 +1,34 @@
+from dataclasses import dataclass
+
 from app.adapters.base import AdapterOrder, AdapterOrderResult
 from app.adapters.paper import PaperAdapter
 from app.config.settings import get_settings
 
 
+@dataclass(frozen=True)
+class MT5DemoCheck:
+    allowed: bool
+    message: str
+    login: str = ""
+    server: str = ""
+
+
 class MT5Adapter(PaperAdapter):
-    def __init__(self, live: bool = False) -> None:
+    def __init__(self, live: bool = False, demo: bool = False) -> None:
         super().__init__("mt5", price_bias_bps=20.0)
         self.live = live
+        self.demo = bool(demo and not live)
         self.settings = get_settings()
 
     def place_order(self, order: AdapterOrder) -> AdapterOrderResult:
-        if not self.live:
+        if not self._uses_mt5():
             return super().place_order(order)
-        if not self.settings.mt5_live_order_enabled:
+        if self.live and not self.settings.mt5_live_order_enabled:
             return AdapterOrderResult(False, "", "failed", 0.0, 0.0, 0.0, "MT5 实盘下单开关未开启")
+        if self.demo and not getattr(self.settings, "mt5_demo_order_enabled", False):
+            return AdapterOrderResult(False, "", "failed", 0.0, 0.0, 0.0, "MT5 demo 下单开关未开启")
         if order.order_type != "market":
-            return AdapterOrderResult(False, "", "failed", 0.0, 0.0, 0.0, "MT5 live 首版仅支持 market 订单")
+            return AdapterOrderResult(False, "", "failed", 0.0, 0.0, 0.0, "MT5 首版仅支持 market 订单")
         try:
             import MetaTrader5 as mt5  # type: ignore
         except Exception as exc:
@@ -24,6 +37,10 @@ class MT5Adapter(PaperAdapter):
         initialized = _initialize_mt5(mt5, self.settings)
         if not initialized:
             return AdapterOrderResult(False, "", "failed", 0.0, 0.0, 0.0, f"MT5 initialize 失败: {mt5.last_error()}")
+        if self.demo:
+            demo_check = mt5_demo_order_check(mt5, self.settings)
+            if not demo_check.allowed:
+                return AdapterOrderResult(False, "", "failed", 0.0, 0.0, 0.0, demo_check.message)
 
         symbol = order.venue_symbol or order.symbol
         if not mt5.symbol_select(symbol, True):
@@ -72,7 +89,7 @@ class MT5Adapter(PaperAdapter):
         return AdapterOrderResult(True, external_id, status, filled, avg_price, 0.0)
 
     def get_positions(self) -> list[dict]:
-        if not self.live:
+        if not self._uses_mt5():
             return super().get_positions()
         try:
             import MetaTrader5 as mt5  # type: ignore
@@ -107,7 +124,7 @@ class MT5Adapter(PaperAdapter):
         return rows
 
     def get_order(self, order_id: str) -> dict:
-        if not self.live:
+        if not self._uses_mt5():
             return super().get_order(order_id)
         try:
             import MetaTrader5 as mt5  # type: ignore
@@ -137,7 +154,7 @@ class MT5Adapter(PaperAdapter):
         }
 
     def get_trades(self, order_id: str) -> list[dict]:
-        if not self.live:
+        if not self._uses_mt5():
             return super().get_trades(order_id)
         try:
             import MetaTrader5 as mt5  # type: ignore
@@ -164,11 +181,40 @@ class MT5Adapter(PaperAdapter):
             )
         return trades
 
+    def _uses_mt5(self) -> bool:
+        return bool(self.live or self.demo)
+
 
 def _initialize_mt5(mt5, settings) -> bool:
     if settings.mt5_login and settings.mt5_password and settings.mt5_server:
         return bool(mt5.initialize(login=int(settings.mt5_login), password=settings.mt5_password, server=settings.mt5_server))
     return bool(mt5.initialize())
+
+
+def mt5_demo_order_check(mt5, settings) -> MT5DemoCheck:
+    if not getattr(settings, "mt5_demo_order_enabled", False):
+        return MT5DemoCheck(False, "MT5_DEMO_ORDER_ENABLED 未开启")
+    try:
+        info = mt5.account_info()
+    except Exception as exc:
+        return MT5DemoCheck(False, f"MT5 account_info 读取失败: {exc}")
+    if not info:
+        return MT5DemoCheck(False, f"MT5 account_info 为空: {mt5.last_error()}")
+
+    login = str(getattr(info, "login", "") or "")
+    server = str(getattr(info, "server", "") or "")
+    trade_mode = int(getattr(info, "trade_mode", -1))
+    demo_mode = int(getattr(mt5, "ACCOUNT_TRADE_MODE_DEMO", 0))
+    if trade_mode != demo_mode:
+        return MT5DemoCheck(False, f"当前 MT5 账户不是 DEMO，禁止 paper 模式下单: login={login} server={server} trade_mode={trade_mode}", login, server)
+
+    expected_login = str(getattr(settings, "mt5_login", "") or "").strip()
+    if expected_login and login != expected_login:
+        return MT5DemoCheck(False, f"当前 MT5 demo 登录号与 MT5_LOGIN 不匹配: expected={expected_login}, actual={login}", login, server)
+    expected_server = str(getattr(settings, "mt5_server", "") or "").strip()
+    if expected_server and server.lower() != expected_server.lower():
+        return MT5DemoCheck(False, f"当前 MT5 demo 服务器与 MT5_SERVER 不匹配: expected={expected_server}, actual={server}", login, server)
+    return MT5DemoCheck(True, f"MT5 demo 账户检查通过: {login} {server}".strip(), login, server)
 
 
 def _mt5_filling_mode(mt5, symbol: str) -> int:

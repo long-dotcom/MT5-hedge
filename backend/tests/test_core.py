@@ -20,21 +20,21 @@ from app.execution.auto_closer import evaluate_auto_close, run_auto_close
 from app.execution import gateway as gateway_module
 from app.execution.engine import _has_position_effect, _is_pending_result, close_hedge_group, open_hedge_group
 from app.execution.gateway import AdapterExecutionGateway, FillEvent, GatewayOrderResult, LegOrderIntent, OrderEvent, build_execution_gateway
-from app.execution.nautilus_hyperliquid import NautilusHyperliquidGateway, NautilusSubmitResult, NautilusTradingNodeSubmitter, hyperliquid_instrument_id
+from app.execution.nautilus_hyperliquid import NautilusHyperliquidGateway, NautilusHyperliquidSandboxGateway, NautilusSubmitResult, NautilusTradingNodeSubmitter, hyperliquid_instrument_id
 from app.execution import nautilus_hyperliquid as nautilus_module
-from app.execution.readiness import live_execution_readiness
+from app.execution.readiness import live_execution_readiness, paper_execution_readiness
 from app.execution.reconciler import reconcile_hedge_group, reconcile_orphan_positions, reconcile_residual_positions, sync_live_positions
 from app.config.settings import HYPERLIQUID_MAINNET_INFO_URL, HYPERLIQUID_TESTNET_INFO_URL, hyperliquid_execution_info_url
 from app.api import router as api_router
 from app.market.mt5_sessions import MT5SessionState, mt5_action_allowed
-from app.market.nautilus_hyperliquid import build_nautilus_quote_bridge_strategy, market_symbols_from_mappings, write_all_dexs_asset_ctxs_to_quote_cache, write_cached_order_book_to_quote_cache, write_depth_to_quote_cache, write_quote_tick_to_quote_cache
+from app.market.nautilus_hyperliquid import _instrument_available, _is_hip3_instrument_id, build_nautilus_quote_bridge_strategy, market_symbols_from_mappings, write_all_dexs_asset_ctxs_to_quote_cache, write_cached_order_book_to_quote_cache, write_depth_to_quote_cache, write_quote_tick_to_quote_cache
 from app.market.scan_state import scan_state_store
 from app.risk.engine import pre_trade_check
 from app.market.quotes import QuoteCache, QuoteSynchronizer, quote_cache
 from app.adapters.paper import PaperAdapter
 from app.adapters.base import AdapterOrder, AdapterOrderResult
 from app.adapters.hyperliquid import HyperliquidAdapter
-from app.adapters.mt5 import MT5Adapter
+from app.adapters.mt5 import MT5Adapter, mt5_demo_order_check
 from app.schemas import AdoptPositionIn
 from app.schemas import SymbolMappingIn
 from app.strategy.cost import estimate_cost
@@ -299,6 +299,17 @@ def test_nautilus_quote_bridge_subscribes_hip3_order_books() -> None:
     assert "xyz:JP225-USD-PERP.HYPERLIQUID" in book_ids
 
 
+def test_nautilus_quote_bridge_can_detect_missing_hip3_instrument() -> None:
+    class FakeCache:
+        def instrument(self, instrument_id):
+            return object() if str(instrument_id) == "BTC-USD-PERP.HYPERLIQUID" else None
+
+    assert not _is_hip3_instrument_id("BTC-USD-PERP.HYPERLIQUID")
+    assert _is_hip3_instrument_id("xyz:JP225-USD-PERP.HYPERLIQUID")
+    assert _instrument_available(FakeCache(), "BTC-USD-PERP.HYPERLIQUID")
+    assert not _instrument_available(FakeCache(), "xyz:JP225-USD-PERP.HYPERLIQUID")
+
+
 def test_hyperliquid_fast_l2book_subscription_includes_fast_flag() -> None:
     assert l2book_subscription("xyz:JP225", fast=True) == {"type": "l2Book", "coin": "xyz:JP225", "fast": True}
     assert l2book_subscription("BTC", fast=False) == {"type": "l2Book", "coin": "BTC"}
@@ -456,6 +467,35 @@ def test_mt5_live_order_requires_explicit_switch() -> None:
     result = adapter.place_order(AdapterOrder(platform="mt5", symbol="OIL", side="buy", quantity=0.01, venue_symbol="USOIL"))
     assert not result.success
     assert "开关未开启" in result.error_message
+
+
+def test_mt5_demo_requires_explicit_switch_before_import() -> None:
+    adapter = MT5Adapter(demo=True)
+    adapter.settings = SimpleNamespace(mt5_demo_order_enabled=False)
+    result = adapter.place_order(AdapterOrder(platform="mt5", symbol="OIL", side="buy", quantity=0.01, venue_symbol="USOIL"))
+    assert not result.success
+    assert "demo 下单开关未开启" in result.error_message
+
+
+def test_mt5_demo_order_check_requires_demo_account_and_configured_identity() -> None:
+    class FakeMT5:
+        ACCOUNT_TRADE_MODE_DEMO = 0
+
+        def __init__(self, trade_mode=0, login=123, server="broker-demo") -> None:
+            self.info = SimpleNamespace(trade_mode=trade_mode, login=login, server=server)
+
+        def account_info(self):
+            return self.info
+
+        def last_error(self):
+            return (0, "")
+
+    settings = SimpleNamespace(mt5_demo_order_enabled=True, mt5_login="123", mt5_server="broker-demo")
+    assert mt5_demo_order_check(FakeMT5(), settings).allowed
+    assert not mt5_demo_order_check(FakeMT5(trade_mode=2), settings).allowed
+    assert "不是 DEMO" in mt5_demo_order_check(FakeMT5(trade_mode=2), settings).message
+    assert not mt5_demo_order_check(FakeMT5(login=999), settings).allowed
+    assert not mt5_demo_order_check(FakeMT5(server="broker-real"), settings).allowed
 
 
 def test_mt5_live_market_order_maps_order_send(monkeypatch) -> None:
@@ -862,6 +902,27 @@ def test_nautilus_hyperliquid_gateway_maps_submit_result() -> None:
     assert result.adapter_result.average_price == 65000
 
 
+def test_nautilus_hyperliquid_gateway_uses_venue_symbol_for_hip3() -> None:
+    captured = {}
+
+    class FakeSubmitter:
+        def submit_order(self, intent, instrument_id):
+            captured["instrument_id"] = instrument_id
+            return NautilusSubmitResult(status="accepted", external_order_id="nt-hip3")
+
+        def cancel_order(self, external_order_id):
+            return True
+
+        def query_order(self, external_order_id):
+            return {"status": "accepted"}
+
+    gateway = NautilusHyperliquidGateway(submitter=FakeSubmitter())
+    result = gateway.submit_order(LegOrderIntent(platform="hyperliquid", symbol="JP225", venue_symbol="xyz:JP225", side="buy", quantity=0.01))
+
+    assert result.success
+    assert captured["instrument_id"] == "xyz:JP225-USD-PERP.HYPERLIQUID"
+
+
 def test_nautilus_submitter_requires_live_submit_switch() -> None:
     settings = SimpleNamespace(nautilus_hyperliquid_submit_enabled=False)
     submitter = NautilusTradingNodeSubmitter(settings)
@@ -1223,6 +1284,56 @@ def test_live_open_orders_are_not_reduce_only(monkeypatch) -> None:
     assert group.status == "open"
     assert [intent.reduce_only for intent in submitted] == [False, False]
     assert {order.reduce_only for order in db.query(Order).filter(Order.hedge_group_id == group.id).all()} == {False}
+
+
+def test_paper_open_uses_hyperliquid_sim_and_mt5_demo_adapters(monkeypatch) -> None:
+    engine = create_engine("sqlite:///:memory:", future=True)
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine, future=True)
+    db = Session()
+    db.add(StrategySetting(execution_mode="paper"))
+    db.add(SymbolMapping(symbol="OIL", hyperliquid_symbol="OIL", mt5_symbol="USOIL"))
+    opportunity = ArbitrageOpportunity(
+        symbol="OIL",
+        direction="long_hyperliquid_short_mt5",
+        status="executable",
+        notional=1000,
+        quantity=1.0,
+        hyperliquid_quantity=1.0,
+        mt5_quantity=0.1,
+        gross_spread=10,
+        unit_cost=1,
+        unit_net_profit=9,
+        entry_threshold=8,
+        exit_target=2,
+        total_cost=1,
+        net_profit=9,
+        annualized_return=0.1,
+    )
+    db.add(opportunity)
+    db.commit()
+    seen = []
+
+    class FakeGateway:
+        def __init__(self, adapter) -> None:
+            seen.append((adapter.platform, getattr(adapter, "simulated", False), getattr(adapter, "demo", False), getattr(adapter, "live", False)))
+
+        def submit_order(self, intent, *, paper_latency_ms=0):
+            result = AdapterOrderResult(True, f"{intent.platform}-paper", "filled", intent.quantity, 100.0, 0.1)
+            event = OrderEvent(intent.platform, intent.symbol, intent.side, "filled", result.external_order_id, intent.quantity, intent.quantity, 100.0, 0.1)
+            fill = FillEvent(intent.platform, intent.symbol, intent.side, intent.quantity, 100.0, 0.1, result.external_order_id)
+            return GatewayOrderResult(True, event, (fill,), result)
+
+    monkeypatch.setattr("app.execution.engine.paper_execution_readiness", lambda db: {"checks": []})
+    monkeypatch.setattr("app.execution.engine.build_execution_gateway", lambda adapter: FakeGateway(adapter))
+    monkeypatch.setattr("app.execution.engine.quote_synchronizer.synchronized", lambda *args, **kwargs: (SimpleNamespace(hyperliquid=SimpleNamespace(local_recv_ts=datetime.utcnow()), time_diff_ms=0), ""))
+    monkeypatch.setattr("app.execution.engine.pre_trade_check", lambda *args, **kwargs: SimpleNamespace(allowed=True, reason=""))
+
+    group = open_hedge_group(db, opportunity.id)
+
+    assert group.status == "open"
+    assert ("hyperliquid", True, False, False) in seen
+    assert ("mt5", False, True, False) in seen
 
 
 def test_auto_close_skips_live_group_without_live_switch(monkeypatch) -> None:
@@ -1905,10 +2016,23 @@ def _seed_auto_close_quotes() -> None:
 def test_gateway_factory_uses_nautilus_for_enabled_hyperliquid(monkeypatch) -> None:
     settings = type("Settings", (), {"nautilus_hyperliquid_enabled": True})()
     monkeypatch.setattr(gateway_module, "get_settings", lambda: settings)
-    built = build_execution_gateway(PaperAdapter("hyperliquid"))
+    built = build_execution_gateway(HyperliquidAdapter(live=True))
     assert isinstance(built, NautilusHyperliquidGateway)
+    non_live = build_execution_gateway(PaperAdapter("hyperliquid"))
+    assert isinstance(non_live, AdapterExecutionGateway)
     fallback = build_execution_gateway(PaperAdapter("mt5"))
     assert isinstance(fallback, AdapterExecutionGateway)
+
+
+def test_gateway_factory_uses_nautilus_sandbox_for_simulated_hyperliquid(monkeypatch) -> None:
+    settings = type("Settings", (), {"nautilus_hyperliquid_enabled": True})()
+    monkeypatch.setattr(gateway_module, "get_settings", lambda: settings)
+    adapter = PaperAdapter("hyperliquid")
+    setattr(adapter, "simulated", True)
+
+    built = build_execution_gateway(adapter)
+
+    assert isinstance(built, NautilusHyperliquidSandboxGateway)
 
 
 def test_xyz_growth_mode_uses_effective_fee_multiplier() -> None:
@@ -2361,6 +2485,93 @@ def test_live_execution_readiness_blocks_missing_live_prerequisites(monkeypatch)
     assert result["status"] == "blocked"
     blocked = {item["component"] for item in result["checks"] if item["status"] == "block"}
     assert {"global_live_switch", "nautilus_hyperliquid_enabled", "nautilus_hyperliquid_private_key", "metatrader5_import"} <= blocked
+
+
+def test_paper_execution_readiness_allows_demo_account(monkeypatch) -> None:
+    engine = create_engine("sqlite:///:memory:", future=True)
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine, future=True)
+    db = Session()
+    db.add(SymbolMapping(symbol="OIL", hyperliquid_symbol="OIL", mt5_symbol="USOIL", mt5_volume_step=0.01, mt5_contract_size=100, enabled=True))
+    db.commit()
+
+    settings = SimpleNamespace(
+        nautilus_hyperliquid_enabled=True,
+        nautilus_hyperliquid_sim_starting_balances="100000 USD",
+        mt5_demo_order_enabled=True,
+        mt5_login="123",
+        mt5_password="pwd",
+        mt5_server="broker-demo",
+    )
+
+    class FakeMT5:
+        ACCOUNT_TRADE_MODE_DEMO = 0
+
+        def initialize(self, **kwargs):
+            return True
+
+        def account_info(self):
+            return SimpleNamespace(login=123, server="broker-demo", trade_mode=self.ACCOUNT_TRADE_MODE_DEMO)
+
+        def last_error(self):
+            return (0, "")
+
+        def shutdown(self):
+            return True
+
+    def fake_import(name):
+        return FakeMT5() if name == "MetaTrader5" else object()
+
+    monkeypatch.setattr("app.execution.readiness.import_module", fake_import)
+
+    result = paper_execution_readiness(db, settings)
+
+    assert result["status"] == "ready"
+    assert result["ready"] is True
+
+
+def test_paper_execution_readiness_blocks_real_mt5_account(monkeypatch) -> None:
+    engine = create_engine("sqlite:///:memory:", future=True)
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine, future=True)
+    db = Session()
+    db.add(SymbolMapping(symbol="OIL", hyperliquid_symbol="OIL", mt5_symbol="USOIL", mt5_volume_step=0.01, mt5_contract_size=100, enabled=True))
+    db.commit()
+
+    settings = SimpleNamespace(
+        nautilus_hyperliquid_enabled=True,
+        nautilus_hyperliquid_sim_starting_balances="100000 USD",
+        mt5_demo_order_enabled=True,
+        mt5_login="",
+        mt5_password="",
+        mt5_server="",
+    )
+
+    class FakeMT5:
+        ACCOUNT_TRADE_MODE_DEMO = 0
+
+        def initialize(self, **kwargs):
+            return True
+
+        def account_info(self):
+            return SimpleNamespace(login=123, server="broker-demo", trade_mode=2)
+
+        def last_error(self):
+            return (0, "")
+
+        def shutdown(self):
+            return True
+
+    def fake_import(name):
+        return FakeMT5() if name == "MetaTrader5" else object()
+
+    monkeypatch.setattr("app.execution.readiness.import_module", fake_import)
+
+    result = paper_execution_readiness(db, settings)
+
+    assert result["status"] == "blocked"
+    blocked = {item["component"] for item in result["checks"] if item["status"] == "block"}
+    assert "mt5_demo_account" in blocked
 
 
 def test_live_execution_readiness_allows_ready_with_complete_config(monkeypatch) -> None:

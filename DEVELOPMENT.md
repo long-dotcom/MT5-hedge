@@ -794,12 +794,13 @@ POST /api/alerts/{id}/ack
 - 权限：单管理员账号，默认用户名密码来自 `.env`，未配置时为 `admin/admin123`。
 - 告警：站内告警和系统日志。
 - 执行：支持 `dry_run`、`paper`、`live` 三种模式；真实下单默认关闭。
-- 执行网关：新增 `ExecutionGateway` 抽象、`AdapterExecutionGateway` 桥接层和 `build_execution_gateway()` 工厂入口，当前下单路径先产生统一 `OrderEvent` / `FillEvent`，再写入订单和成交表；NautilusTrader 已接入 Hyperliquid-only gateway，可通过 `NAUTILUS_HYPERLIQUID_ENABLED=true` 替换 Hyperliquid 单腿执行内核，并在 `NAUTILUS_HYPERLIQUID_SUBMIT_ENABLED=true` 时通过 bridge Strategy 提交 market/limit 单；MT5 腿仍保留现有 adapter。
-- 执行回查：`execution_reconciler` 会周期回查 `opening` / `closing` 对冲组的 pending 订单，确认成交后补写 fill 并推进 hedge group 状态；同时刷新 live positions，对已关闭 live 对冲组做残余仓位告警。Hyperliquid 执行侧账户/仓位/订单状态查询会跟随 `NAUTILUS_HYPERLIQUID_ENVIRONMENT` 选择 mainnet/testnet info API。单腿成交且另一腿仍 pending 时，系统会尝试撤销未成交腿并进入人工处理；外部订单状态长时间不可重建时也会升级人工处理。
+- 执行网关：新增 `ExecutionGateway` 抽象、`AdapterExecutionGateway` 桥接层和 `build_execution_gateway()` 工厂入口，当前下单路径先产生统一 `OrderEvent` / `FillEvent`，再写入订单和成交表；Hyperliquid paper 使用本地 `QuoteCache` bid/ask 撮合，MT5 腿仍保留现有 adapter。
+- 执行前主动刷新：`executable` 机会进入下单前，如果缓存严格同步因报价过期或未对齐失败，系统会主动刷新 Hyperliquid HTTP L2 和 MT5 tick，再用最新 bid/ask 复核入场线与净利润；复核仍通过才继续下单。
+- 执行回查：`execution_reconciler` 会周期回查 `opening` / `closing` 对冲组的 pending 订单。当前开仓和平仓都先提交 Hyperliquid 腿；若回查确认 Hyperliquid 后续成交，会按成交比例提交 MT5 开仓或 reduce-only 平仓补腿，双腿确认后再推进 hedge group 状态并补写 fill；同时刷新 live positions，对已关闭 live 对冲组做残余仓位告警。已有双腿时如单腿成交且另一腿仍 pending，系统会尝试撤销未成交腿并进入人工处理；外部订单状态长时间不可重建时也会升级人工处理。
 - 自动平仓：paper 自动平仓默认可用；live 自动平仓需要额外开启 `auto_close_live_enabled` 和系统实盘总开关，随后走同一套反向订单路径。
 - 实盘保护：开启实盘必须在前端输入确认短语 `ENABLE LIVE TRADING`。
 - 行情：新增实时 QuoteCache，扫描和执行只使用时间对齐后的报价对。
-- Hyperliquid：live 行情支持 `native` 和 `nautilus` 两种来源；`native` 使用原生 WebSocket/HTTP `l2Book`，可通过 `HYPERLIQUID_L2BOOK_FAST_ENABLED=true` 使用 `fast: true` 浅盘口；`nautilus` 由 NautilusTrader data client 订阅和维护标准永续 L2 订单簿，并通过 `HyperliquidAllDexsAssetCtxs` custom data 接入 `xyz:*` HIP-3 DEX 行情。由于 `allDexsAssetCtxs` 是低频批量上下文，fast 开关开启时会额外为启用扫描的 `xyz:*` 品种订阅原生 `l2Book fast` 并写入同一个 QuoteCache，扫描和入库逻辑不变。
+- Hyperliquid：live 行情使用原生 WebSocket/HTTP `l2Book`，可通过 `HYPERLIQUID_L2BOOK_FAST_ENABLED=true` 使用 `fast: true` 浅盘口；`xyz:*` HIP-3 DEX 品种也走原生 `l2Book` 订阅和 HTTP 兜底。
 - MT5：live 行情路径使用 `symbol_info_tick()` 高频轮询；Depth of Market 可按券商支持再接 `market_book_*`。
 - 成本：Hyperliquid fee/funding 和 MT5 swap 已优先读取真实数据，MT5 commission 使用配置兜底。
 - 品种映射：前端支持 CRUD，并可从 MT5 `symbol_info()` 同步最小手数、合约大小、价格精度和最小跳动；最终最小量按两边约束折算为基础币数量后取最大值。
@@ -807,4 +808,4 @@ POST /api/alerts/{id}/ack
 - 实时扫描视图：价差扫描页改为每个品种最新快照，候选机会页改为当前候选池；扫描结果和候选池优先从内存扫描状态推送/读取，`spread_current` 与 `arbitrage_opportunities` 保留为执行、审计和重启兜底；历史 `spread_snapshots` 继续供价差研究统计。
 - MT5 会话保护：新增 MT5 交易时段状态和动作级权限检查。扫描器会区分正常交易、只平仓、仅报价、盘尾禁开、开盘冷却和休市状态；不可开仓时不会生成候选机会。
 
-实盘适配器保留真实交易边界和凭证检查。Hyperliquid 通过 NautilusTrader bridge Strategy 受保护提交单腿订单，MT5 通过 `MT5Adapter` 受保护提交 market 订单；默认均关闭。接入真实券商和主网前，需要继续补充具体账户规格、手续费、隔夜费、合约乘数、撤单、成交回报、启动恢复和异常补偿处理。
+实盘适配器保留真实交易边界和凭证检查。Hyperliquid 当前只保留账户/仓位只读查询，真实下单 SDK 未启用；MT5 通过 `MT5Adapter` 受保护提交 market 订单，默认关闭。接入真实券商和主网前，需要继续补充具体账户规格、手续费、隔夜费、合约乘数、撤单、成交回报、启动恢复和异常补偿处理。

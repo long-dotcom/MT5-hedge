@@ -111,7 +111,7 @@ def ensure_schema_columns() -> None:
             "auto_close_enabled": "BOOLEAN DEFAULT 1",
             "auto_close_live_enabled": "BOOLEAN DEFAULT 0",
             "exit_target_percentile": "FLOAT DEFAULT 0.25",
-            "auto_close_unit_profit_buffer": "FLOAT DEFAULT 20.0",
+            "auto_close_unit_profit_buffer": "FLOAT DEFAULT 0.0",
             "auto_close_min_profit": "FLOAT DEFAULT 0.0",
             "paper_use_live_account_risk": "BOOLEAN DEFAULT 0",
             "auto_execute_enabled": "BOOLEAN DEFAULT 0",
@@ -203,6 +203,7 @@ def ensure_schema_columns() -> None:
         group_columns = {
             "mt5_quantity": "FLOAT DEFAULT 1.0",
             "hyperliquid_quantity": "FLOAT DEFAULT 1.0",
+            "trigger_spread": "FLOAT DEFAULT 0.0",
             "entry_spread": "FLOAT DEFAULT 0.0",
             "entry_threshold": "FLOAT DEFAULT 0.0",
             "exit_target": "FLOAT DEFAULT 0.0",

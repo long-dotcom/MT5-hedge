@@ -1,5 +1,4 @@
 from datetime import datetime, timedelta
-from dataclasses import replace
 import json
 import time
 from importlib import reload
@@ -17,17 +16,17 @@ from app.market import scanner as scanner_module
 from app.market import symbols as symbol_module
 from app.db.models import Alert, ArbitrageOpportunity, AuditLog, Base, Fill, HedgeGroup, HedgeGroupEvent, Order, Position, RiskSetting, SpreadCurrent, StrategySetting, SymbolMapping, SystemSetting, User
 from app.execution.auto_closer import evaluate_auto_close, run_auto_close
+from app.execution.carry_costs import _mt5_swap_cost, _paper_hyperliquid_funding_cost
 from app.execution import gateway as gateway_module
-from app.execution.engine import _has_position_effect, _is_pending_result, close_hedge_group, open_hedge_group
+from app.execution.engine import _has_position_effect, _is_pending_result, _maker_price, close_hedge_group, open_hedge_group
 from app.execution.gateway import AdapterExecutionGateway, FillEvent, GatewayOrderResult, LegOrderIntent, OrderEvent, build_execution_gateway
-from app.execution.nautilus_hyperliquid import NautilusHyperliquidGateway, NautilusHyperliquidSandboxGateway, NautilusSubmitResult, NautilusTradingNodeSubmitter, hyperliquid_instrument_id
-from app.execution import nautilus_hyperliquid as nautilus_module
 from app.execution.readiness import live_execution_readiness, paper_execution_readiness
 from app.execution.reconciler import reconcile_hedge_group, reconcile_orphan_positions, reconcile_residual_positions, sync_live_positions
 from app.config.settings import HYPERLIQUID_MAINNET_INFO_URL, HYPERLIQUID_TESTNET_INFO_URL, hyperliquid_execution_info_url
 from app.api import router as api_router
+from app.diagnostics.pipeline import _pool_payload
 from app.market.mt5_sessions import MT5SessionState, mt5_action_allowed
-from app.market.nautilus_hyperliquid import _instrument_available, _is_hip3_instrument_id, build_nautilus_quote_bridge_strategy, market_symbols_from_mappings, write_all_dexs_asset_ctxs_to_quote_cache, write_cached_order_book_to_quote_cache, write_depth_to_quote_cache, write_quote_tick_to_quote_cache
+from app.market.orderbook import order_book_cache, simulate_market_fill
 from app.market.scan_state import scan_state_store
 from app.risk.engine import pre_trade_check
 from app.market.quotes import QuoteCache, QuoteSynchronizer, quote_cache
@@ -39,7 +38,7 @@ from app.schemas import AdoptPositionIn
 from app.schemas import SymbolMappingIn
 from app.strategy.cost import estimate_cost
 from app.strategy.live_costs import _estimate_mt5_swap_cost, _hyperliquid_effective_fee_rates
-from app.strategy.statistical_signal import evaluate_entry_signal
+from app.strategy.statistical_signal import evaluate_entry_signal, refresh_signal_stats_cache
 from app.strategy.signals import evaluate_signal
 from app.workers.market_data import MarketDataManager, _exchange_time_from_hyperliquid_ms, hyperliquid_symbol_map, l2book_subscription
 
@@ -116,200 +115,6 @@ def test_quote_synchronizer_accepts_aligned_quotes() -> None:
     assert reason == ""
 
 
-def test_nautilus_depth_bridge_writes_hyperliquid_quote_cache() -> None:
-    cache = QuoteCache()
-    depth = SimpleNamespace(
-        instrument_id="BTC-USD-PERP.HYPERLIQUID",
-        bids=[SimpleNamespace(price=100.0, size=2.0)],
-        asks=[SimpleNamespace(price=101.0, size=3.0)],
-        ts_event=1_700_000_000_000_000_000,
-    )
-
-    ok = write_depth_to_quote_cache(depth, {"BTC-USD-PERP.HYPERLIQUID": "BTC"}, cache)
-
-    quote = cache.latest("hyperliquid", "BTC")
-    assert ok
-    assert quote is not None
-    assert quote.bid == 100
-    assert quote.ask == 101
-    assert quote.depth_notional == 200
-    assert quote.source == "nautilus_order_book_depth"
-
-
-def test_nautilus_quote_tick_bridge_writes_hyperliquid_quote_cache() -> None:
-    cache = QuoteCache()
-    tick = SimpleNamespace(
-        instrument_id="ETH-USD-PERP.HYPERLIQUID",
-        bid_price=2000.0,
-        ask_price=2001.0,
-        bid_size=0.5,
-        ask_size=0.25,
-    )
-
-    ok = write_quote_tick_to_quote_cache(tick, {"ETH-USD-PERP.HYPERLIQUID": "ETH"}, cache)
-
-    quote = cache.latest("hyperliquid", "ETH")
-    assert ok
-    assert quote is not None
-    assert quote.bid == 2000
-    assert quote.ask == 2001
-    assert quote.depth_notional == 500.25
-    assert quote.source == "nautilus_quote_tick"
-
-
-def test_nautilus_managed_book_bridge_writes_hyperliquid_quote_cache() -> None:
-    cache = QuoteCache()
-    event = SimpleNamespace(instrument_id="BTC-USD-PERP.HYPERLIQUID", ts_event=1_700_000_000_000_000_000)
-
-    class FakeNautilusCache:
-        def order_book(self, instrument_id):
-            assert str(instrument_id) == "BTC-USD-PERP.HYPERLIQUID"
-            return SimpleNamespace(
-                best_bid_price=lambda: 100.0,
-                best_ask_price=lambda: 101.0,
-                best_bid_size=lambda: 4.0,
-                best_ask_size=lambda: 2.0,
-            )
-
-    ok = write_cached_order_book_to_quote_cache(event, {"BTC-USD-PERP.HYPERLIQUID": "BTC"}, FakeNautilusCache(), cache)
-
-    quote = cache.latest("hyperliquid", "BTC")
-    assert ok
-    assert quote is not None
-    assert quote.bid == 100
-    assert quote.ask == 101
-    assert quote.depth_notional == 202
-    assert quote.source == "nautilus_order_book_deltas"
-
-
-def test_nautilus_all_dexs_asset_ctxs_bridge_writes_hyperliquid_quote_cache() -> None:
-    cache = QuoteCache()
-    payload = SimpleNamespace(
-        entries=[
-            SimpleNamespace(
-                instrument_id="xyz:JP225-USD-PERP.HYPERLIQUID",
-                impact_prices=SimpleNamespace(bid=39000.0, ask=39002.0),
-                open_interest=10.0,
-            ),
-            SimpleNamespace(
-                instrument_id="xyz:SP500-USD-PERP.HYPERLIQUID",
-                impact_prices=SimpleNamespace(bid=5500.0, ask=5501.0),
-                open_interest=1.0,
-            ),
-        ],
-        ts_event=1_700_000_000_000_000_000,
-    )
-
-    updated = write_all_dexs_asset_ctxs_to_quote_cache(
-        payload,
-        {"xyz:JP225-USD-PERP.HYPERLIQUID": "JP225"},
-        cache,
-    )
-
-    quote = cache.latest("hyperliquid", "JP225")
-    assert updated == 1
-    assert quote is not None
-    assert quote.bid == 39000
-    assert quote.ask == 39002
-    assert quote.depth_notional == 390010
-    assert quote.source == "nautilus_all_dexs_asset_ctxs"
-
-
-def test_nautilus_all_dexs_does_not_override_fresh_fast_l2book_quote() -> None:
-    cache = QuoteCache()
-    cache.put("hyperliquid", "JP225", 72301, 72499, 36.97, "hyperliquid_l2Book_fast")
-    payload = SimpleNamespace(
-        entries=[
-            SimpleNamespace(
-                instrument_id="xyz:JP225-USD-PERP.HYPERLIQUID",
-                impact_prices=SimpleNamespace(bid=39000.0, ask=39002.0),
-                open_interest=10.0,
-            ),
-        ],
-        ts_event=1_700_000_000_000_000_000,
-    )
-
-    updated = write_all_dexs_asset_ctxs_to_quote_cache(
-        payload,
-        {"xyz:JP225-USD-PERP.HYPERLIQUID": "JP225"},
-        cache,
-    )
-
-    quote = cache.latest("hyperliquid", "JP225")
-    assert updated == 0
-    assert quote is not None
-    assert quote.bid == 72301
-    assert quote.source == "hyperliquid_l2Book_fast"
-
-
-def test_nautilus_all_dexs_does_not_override_fresh_nautilus_order_book_quote() -> None:
-    cache = QuoteCache()
-    cache.put("hyperliquid", "JP225", 72181, 72389, 50.52, "nautilus_order_book_deltas")
-    payload = SimpleNamespace(
-        entries=[
-            SimpleNamespace(
-                instrument_id="xyz:JP225-USD-PERP.HYPERLIQUID",
-                impact_prices=SimpleNamespace(bid=72059.6, ask=72456.3),
-                open_interest=10.0,
-            ),
-        ],
-        ts_event=1_700_000_000_000_000_000,
-    )
-
-    updated = write_all_dexs_asset_ctxs_to_quote_cache(
-        payload,
-        {"xyz:JP225-USD-PERP.HYPERLIQUID": "JP225"},
-        cache,
-    )
-
-    quote = cache.latest("hyperliquid", "JP225")
-    assert updated == 0
-    assert quote is not None
-    assert quote.bid == 72181
-    assert quote.source == "nautilus_order_book_deltas"
-
-
-def test_nautilus_market_symbols_use_hyperliquid_instrument_ids() -> None:
-    symbols = market_symbols_from_mappings(
-        [
-            SimpleNamespace(symbol="BTC", hyperliquid_symbol="BTC"),
-            SimpleNamespace(symbol="JP225", hyperliquid_symbol="xyz:JP225"),
-        ]
-    )
-
-    assert symbols[0].instrument_id == "BTC-USD-PERP.HYPERLIQUID"
-    assert symbols[1].instrument_id == "xyz:JP225-USD-PERP.HYPERLIQUID"
-
-
-def test_nautilus_quote_bridge_subscribes_hip3_order_books() -> None:
-    strategy = build_nautilus_quote_bridge_strategy(
-        tuple(
-            market_symbols_from_mappings(
-                [
-                    SimpleNamespace(symbol="BTC", hyperliquid_symbol="BTC"),
-                    SimpleNamespace(symbol="JP225", hyperliquid_symbol="xyz:JP225"),
-                ]
-            )
-        ),
-        QuoteCache(),
-    )
-
-    book_ids = {str(instrument_id) for instrument_id in strategy._book_instrument_ids}
-    assert "BTC-USD-PERP.HYPERLIQUID" in book_ids
-    assert "xyz:JP225-USD-PERP.HYPERLIQUID" in book_ids
-
-
-def test_nautilus_quote_bridge_can_detect_missing_hip3_instrument() -> None:
-    class FakeCache:
-        def instrument(self, instrument_id):
-            return object() if str(instrument_id) == "BTC-USD-PERP.HYPERLIQUID" else None
-
-    assert not _is_hip3_instrument_id("BTC-USD-PERP.HYPERLIQUID")
-    assert _is_hip3_instrument_id("xyz:JP225-USD-PERP.HYPERLIQUID")
-    assert _instrument_available(FakeCache(), "BTC-USD-PERP.HYPERLIQUID")
-    assert not _instrument_available(FakeCache(), "xyz:JP225-USD-PERP.HYPERLIQUID")
-
-
 def test_hyperliquid_fast_l2book_subscription_includes_fast_flag() -> None:
     assert l2book_subscription("xyz:JP225", fast=True) == {"type": "l2Book", "coin": "xyz:JP225", "fast": True}
     assert l2book_subscription("BTC", fast=False) == {"type": "l2Book", "coin": "BTC"}
@@ -357,20 +162,53 @@ def test_hyperliquid_l2book_message_writes_exchange_timestamp() -> None:
         market_data_module.quote_cache = original_worker_cache
 
 
-def test_hyperliquid_http_fallback_does_not_override_recent_nautilus_order_book() -> None:
+def test_l2_market_fill_walks_multiple_levels() -> None:
+    book = order_book_cache.put(
+        "hyperliquid",
+        "L2TEST",
+        bids=[(100.0, 1.0), (99.0, 2.0)],
+        asks=[(101.0, 1.0), (102.0, 2.0)],
+        source="test",
+    )
+
+    fill = simulate_market_fill(book, "buy", 2.0)
+
+    assert fill.enough_liquidity
+    assert fill.filled_quantity == 2.0
+    assert fill.average_price == 101.5
+    assert fill.worst_price == 102.0
+
+
+def test_scanner_liquidity_uses_l2_before_top_depth() -> None:
+    order_book_cache.put(
+        "hyperliquid",
+        "OIL-L2",
+        bids=[(73.70, 1.0), (73.69, 100.0)],
+        asks=[(73.72, 1.0), (73.73, 100.0)],
+        source="test",
+    )
+
+    enough = scanner_module._hyperliquid_liquidity_reason("OIL-L2", "sell", 70.0, 5000.0, 100.0)
+    not_enough = scanner_module._hyperliquid_liquidity_reason("OIL-L2", "sell", 200.0, 5000.0, 100.0)
+
+    assert enough == ""
+    assert "L2 深度不足" in not_enough
+
+
+def test_live_market_data_starts_hyperliquid_ws_without_http_polling(monkeypatch) -> None:
     manager = MarketDataManager()
-    cache = QuoteCache()
-    import app.workers.market_data as market_data_module
+    started = []
 
-    original_worker_cache = market_data_module.quote_cache
+    monkeypatch.setattr(
+        "app.workers.market_data.get_settings",
+        lambda: SimpleNamespace(quote_source_mode="live"),
+    )
+    monkeypatch.setattr(manager, "_start_thread", lambda name, target: started.append(name))
     try:
-        market_data_module.quote_cache = cache
-        quote = cache.put("hyperliquid", "JP225", 72181, 72389, 50.52, "nautilus_order_book_deltas")
-        cache._quotes[("hyperliquid", "JP225")] = [replace(quote, local_recv_ts=quote.local_recv_ts - timedelta(seconds=2))]
-
-        assert manager._has_fresh_hyperliquid_ws_quote("JP225")
+        manager.start()
+        assert started == ["hyperliquid-ws", "mt5-polling"]
     finally:
-        market_data_module.quote_cache = original_worker_cache
+        manager.stop()
 
 
 def test_mt5_points_swap_cost() -> None:
@@ -446,6 +284,54 @@ def test_execution_gateway_maps_adapter_fill_event() -> None:
     assert result.order_event.filled_quantity == 2
     assert len(result.fill_events) == 1
     assert result.fill_events[0].price == 101
+
+
+def test_hyperliquid_paper_market_order_uses_l2_average_price() -> None:
+    adapter = PaperAdapter("hyperliquid")
+    gateway = AdapterExecutionGateway(adapter)
+    quote_cache.put("hyperliquid", "L2-PAPER", 100, 101, 10000, "test")
+    order_book_cache.put(
+        "hyperliquid",
+        "L2-PAPER",
+        bids=[(100.0, 10.0)],
+        asks=[(101.0, 1.0), (103.0, 1.0)],
+        source="test",
+    )
+
+    result = gateway.submit_order(LegOrderIntent(platform="hyperliquid", symbol="L2-PAPER", side="buy", quantity=2))
+
+    assert result.success
+    assert result.order_event.average_price == 102.0
+    assert result.fill_events[0].price == 102.0
+
+
+def test_hyperliquid_paper_fee_uses_venue_symbol_effective_taker_rate() -> None:
+    provider_calls = []
+
+    def fee_provider(symbol: str):
+        provider_calls.append(symbol)
+        return SimpleNamespace(taker_fee_rate=0.00009, maker_fee_rate=0.00003)
+
+    adapter = PaperAdapter("hyperliquid", fee_rate_provider=fee_provider)
+    gateway = AdapterExecutionGateway(adapter)
+    quote_cache.put("hyperliquid", "JPY-FEE", 100, 101, 10000, "test")
+
+    result = gateway.submit_order(LegOrderIntent(platform="hyperliquid", symbol="JPY-FEE", venue_symbol="xyz:JPY", side="buy", quantity=10))
+
+    assert result.success
+    assert provider_calls == ["xyz:JPY"]
+    assert result.order_event.fee == pytest.approx(10 * 101 * 0.00009)
+
+
+def test_mt5_paper_fee_is_zero() -> None:
+    adapter = PaperAdapter("mt5")
+    gateway = AdapterExecutionGateway(adapter)
+    quote_cache.put("mt5", "JPY-MT5-FEE", 100, 101, 10000, "test")
+
+    result = gateway.submit_order(LegOrderIntent(platform="mt5", symbol="JPY-MT5-FEE", side="buy", quantity=10))
+
+    assert result.success
+    assert result.order_event.fee == 0.0
 
 
 def test_execution_gateway_preserves_adapter_rejection() -> None:
@@ -737,7 +623,6 @@ def test_hyperliquid_live_positions_read_clearinghouse_state(monkeypatch) -> Non
     adapter = HyperliquidAdapter(live=True)
     adapter.settings = SimpleNamespace(
         hyperliquid_account_address="0xabc",
-        nautilus_hyperliquid_vault_address="",
         hyperliquid_info_url="https://example.test/info",
     )
 
@@ -804,7 +689,6 @@ def test_hyperliquid_live_positions_read_hip3_dex_positions(monkeypatch) -> None
     adapter = HyperliquidAdapter(live=True)
     adapter.settings = SimpleNamespace(
         hyperliquid_account_address="0xabc",
-        nautilus_hyperliquid_vault_address="",
         hyperliquid_info_url="https://example.test/info",
     )
 
@@ -831,13 +715,10 @@ def test_hyperliquid_live_positions_read_hip3_dex_positions(monkeypatch) -> None
     ]
 
 
-def test_hyperliquid_execution_info_url_follows_nautilus_environment() -> None:
-    settings = SimpleNamespace(
-        hyperliquid_info_url=HYPERLIQUID_MAINNET_INFO_URL,
-        nautilus_hyperliquid_environment="testnet",
-    )
+def test_hyperliquid_execution_info_url_uses_configured_url() -> None:
+    settings = SimpleNamespace(hyperliquid_info_url=HYPERLIQUID_MAINNET_INFO_URL)
 
-    assert hyperliquid_execution_info_url(settings) == HYPERLIQUID_TESTNET_INFO_URL
+    assert hyperliquid_execution_info_url(settings) == HYPERLIQUID_MAINNET_INFO_URL
 
 
 def test_hyperliquid_live_positions_use_execution_info_url(monkeypatch) -> None:
@@ -861,274 +742,16 @@ def test_hyperliquid_live_positions_use_execution_info_url(monkeypatch) -> None:
     adapter = HyperliquidAdapter(live=True)
     adapter.settings = SimpleNamespace(
         hyperliquid_account_address="0xabc",
-        nautilus_hyperliquid_vault_address="",
         hyperliquid_info_url=HYPERLIQUID_MAINNET_INFO_URL,
-        nautilus_hyperliquid_environment="testnet",
     )
 
     assert adapter.get_positions() == []
-    assert urls == [HYPERLIQUID_TESTNET_INFO_URL, HYPERLIQUID_TESTNET_INFO_URL]
-
-
-def test_nautilus_hyperliquid_symbol_mapping() -> None:
-    assert hyperliquid_instrument_id("BTC") == "BTC-USD-PERP.HYPERLIQUID"
-    assert hyperliquid_instrument_id("xyz:JP225") == "xyz:JP225-USD-PERP.HYPERLIQUID"
-    assert hyperliquid_instrument_id("HYPE-USDC-SPOT") == "HYPE-USDC-SPOT.HYPERLIQUID"
-    assert hyperliquid_instrument_id("ETH-USD-PERP.HYPERLIQUID") == "ETH-USD-PERP.HYPERLIQUID"
+    assert urls == [HYPERLIQUID_MAINNET_INFO_URL, HYPERLIQUID_MAINNET_INFO_URL]
 
 
 def test_symbol_mapping_rejects_mt5_style_hyperliquid_symbol() -> None:
     with pytest.raises(ValueError, match="Hyperliquid 标准永续"):
         SymbolMappingIn(symbol="BTC", hyperliquid_symbol="BTCUSD", mt5_symbol="BTCUSD")
-
-
-def test_nautilus_hyperliquid_gateway_maps_submit_result() -> None:
-    class FakeSubmitter:
-        def submit_order(self, intent, instrument_id):
-            assert instrument_id == "BTC-USD-PERP.HYPERLIQUID"
-            return NautilusSubmitResult(status="filled", external_order_id="nt-1", filled_quantity=0.01, average_price=65000, fee=0.1)
-
-        def cancel_order(self, external_order_id):
-            return True
-
-        def query_order(self, external_order_id):
-            return {"status": "filled"}
-
-    gateway = NautilusHyperliquidGateway(submitter=FakeSubmitter())
-    result = gateway.submit_order(LegOrderIntent(platform="hyperliquid", symbol="BTC", side="buy", quantity=0.01))
-    assert result.success
-    assert result.order_event.external_order_id == "nt-1"
-    assert len(result.fill_events) == 1
-    assert result.adapter_result.average_price == 65000
-
-
-def test_nautilus_hyperliquid_gateway_uses_venue_symbol_for_hip3() -> None:
-    captured = {}
-
-    class FakeSubmitter:
-        def submit_order(self, intent, instrument_id):
-            captured["instrument_id"] = instrument_id
-            return NautilusSubmitResult(status="accepted", external_order_id="nt-hip3")
-
-        def cancel_order(self, external_order_id):
-            return True
-
-        def query_order(self, external_order_id):
-            return {"status": "accepted"}
-
-    gateway = NautilusHyperliquidGateway(submitter=FakeSubmitter())
-    result = gateway.submit_order(LegOrderIntent(platform="hyperliquid", symbol="JP225", venue_symbol="xyz:JP225", side="buy", quantity=0.01))
-
-    assert result.success
-    assert captured["instrument_id"] == "xyz:JP225-USD-PERP.HYPERLIQUID"
-
-
-def test_nautilus_submitter_requires_live_submit_switch() -> None:
-    settings = SimpleNamespace(nautilus_hyperliquid_submit_enabled=False)
-    submitter = NautilusTradingNodeSubmitter(settings)
-    result = submitter.submit_order(LegOrderIntent(platform="hyperliquid", symbol="BTC", side="buy", quantity=0.01), "BTC-USD-PERP.HYPERLIQUID")
-    assert not result.success
-    assert "开关未开启" in result.message
-
-
-def test_nautilus_reduce_only_type_error_is_detected() -> None:
-    assert nautilus_module._type_error_mentions_keyword(TypeError("market() got an unexpected keyword argument 'reduce_only'"), "reduce_only")
-    assert not nautilus_module._type_error_mentions_keyword(TypeError("market() got an unexpected keyword argument 'client_order_id'"), "reduce_only")
-
-
-def test_nautilus_submitter_delegates_to_bridge_strategy(monkeypatch) -> None:
-    class FakeNode:
-        pass
-
-    class FakeStrategy:
-        def __init__(self) -> None:
-            self.calls = []
-
-        def submit_intent(self, intent, instrument_id, timeout_seconds):
-            self.calls.append((intent, instrument_id, timeout_seconds))
-            return NautilusSubmitResult(status="accepted", external_order_id="nt-live-1")
-
-        def cancel_external_order(self, external_order_id):
-            return external_order_id == "nt-live-1"
-
-        def query_external_order(self, external_order_id):
-            return {"status": "accepted", "external_order_id": external_order_id}
-
-    fake_strategy = FakeStrategy()
-    settings = SimpleNamespace(nautilus_hyperliquid_submit_enabled=True, nautilus_hyperliquid_order_timeout_seconds=3.0)
-    submitter = NautilusTradingNodeSubmitter(settings)
-    monkeypatch.setattr(submitter, "_build_node", lambda: (FakeNode(), fake_strategy))
-
-    intent = LegOrderIntent(platform="hyperliquid", symbol="BTC", side="sell", quantity=0.02, order_type="market")
-    result = submitter.submit_order(intent, "BTC-USD-PERP.HYPERLIQUID")
-
-    assert result.success
-    assert result.external_order_id == "nt-live-1"
-    assert fake_strategy.calls == [(intent, "BTC-USD-PERP.HYPERLIQUID", 3.0)]
-    assert submitter.cancel_order("nt-live-1")
-    assert submitter.query_order("nt-live-1")["status"] == "accepted"
-
-
-def test_nautilus_build_node_passes_account_address(monkeypatch) -> None:
-    captured = {}
-
-    class FakeConfig:
-        def __init__(self, **kwargs):
-            self.kwargs = kwargs
-
-    class FakeExecConfig(FakeConfig):
-        def __init__(self, **kwargs):
-            super().__init__(**kwargs)
-            captured["exec_config"] = kwargs
-
-    class FakeEnum:
-        MAINNET = "mainnet"
-        TESTNET = "testnet"
-        PERP = "perp"
-        PERP_HIP3 = "perp_hip3"
-
-    class FakeTrader:
-        def add_strategy(self, strategy):
-            captured["strategy"] = strategy
-
-    class FakeNode:
-        def __init__(self, config):
-            captured["node_config"] = config
-            self.trader = FakeTrader()
-
-        def add_data_client_factory(self, venue, factory):
-            captured["data_factory"] = (venue, factory)
-
-        def add_exec_client_factory(self, venue, factory):
-            captured["exec_factory"] = (venue, factory)
-
-        def build(self):
-            captured["built"] = True
-
-        def is_running(self):
-            return False
-
-        def run_async(self):
-            captured["running"] = True
-
-    import nautilus_trader.adapters.hyperliquid as hyperliquid_mod
-    import nautilus_trader.config as config_mod
-    import nautilus_trader.core.nautilus_pyo3 as pyo3_mod
-    import nautilus_trader.live.node as node_mod
-    import nautilus_trader.model.identifiers as identifiers_mod
-
-    monkeypatch.setattr(hyperliquid_mod, "HYPERLIQUID", "HYPERLIQUID")
-    monkeypatch.setattr(hyperliquid_mod, "HyperliquidDataClientConfig", FakeConfig)
-    monkeypatch.setattr(hyperliquid_mod, "HyperliquidExecClientConfig", FakeExecConfig)
-    monkeypatch.setattr(hyperliquid_mod, "HyperliquidLiveDataClientFactory", "data_factory")
-    monkeypatch.setattr(hyperliquid_mod, "HyperliquidLiveExecClientFactory", "exec_factory")
-    monkeypatch.setattr(hyperliquid_mod, "HyperliquidProductType", FakeEnum)
-    monkeypatch.setattr(config_mod, "InstrumentProviderConfig", FakeConfig)
-    monkeypatch.setattr(config_mod, "TradingNodeConfig", FakeConfig)
-    monkeypatch.setattr(pyo3_mod, "HyperliquidEnvironment", FakeEnum)
-    monkeypatch.setattr(node_mod, "TradingNode", FakeNode)
-    monkeypatch.setattr(identifiers_mod, "TraderId", lambda value: f"trader:{value}")
-
-    settings = SimpleNamespace(
-        nautilus_trader_id="MT5-HEDGE-TEST",
-        nautilus_hyperliquid_environment="testnet",
-        nautilus_hyperliquid_product_types="PERP,PERP_HIP3",
-        nautilus_hyperliquid_private_key="agent-secret",
-        nautilus_hyperliquid_vault_address="",
-        hyperliquid_account_address="0xmain",
-    )
-    submitter = NautilusTradingNodeSubmitter(settings)
-
-    node, strategy = submitter._build_node()
-
-    assert isinstance(node, FakeNode)
-    assert strategy is captured["strategy"]
-    assert captured["exec_config"]["private_key"] == "agent-secret"
-    assert captured["exec_config"]["account_address"] == "0xmain"
-    assert captured["exec_config"]["product_types"] == ("perp", "perp_hip3")
-    assert captured["built"] is True
-    assert captured["running"] is True
-
-
-def test_nautilus_submitter_queries_hyperliquid_when_local_cache_missing(monkeypatch) -> None:
-    class FakeStrategy:
-        def query_external_order(self, external_order_id):
-            return {"status": "not_found", "external_order_id": external_order_id}
-
-    class FakeResponse:
-        def __init__(self, payload):
-            self.payload = payload
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, exc_type, exc, tb):
-            return False
-
-        def read(self):
-            return json.dumps(self.payload).encode("utf-8")
-
-    calls = []
-
-    def fake_urlopen(req, timeout):
-        calls.append(json.loads(req.data.decode("utf-8")))
-        payload = {"order": {"status": "open", "order": {"oid": 12345}}}
-        return FakeResponse(payload)
-
-    settings = SimpleNamespace(
-        hyperliquid_account_address="0xabc",
-        nautilus_hyperliquid_vault_address="",
-        hyperliquid_info_url="https://example.test/info",
-    )
-    submitter = NautilusTradingNodeSubmitter(settings)
-    submitter._strategy = FakeStrategy()
-    monkeypatch.setattr(nautilus_module.request, "urlopen", fake_urlopen)
-
-    result = submitter.query_order("12345")
-
-    assert result["status"] == "accepted"
-    assert calls == [{"type": "orderStatus", "user": "0xabc", "oid": 12345}]
-
-
-def test_hyperliquid_order_status_backfills_fill_details(monkeypatch) -> None:
-    class FakeResponse:
-        def __init__(self, payload):
-            self.payload = payload
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, exc_type, exc, tb):
-            return False
-
-        def read(self):
-            return json.dumps(self.payload).encode("utf-8")
-
-    def fake_urlopen(req, timeout):
-        payload = json.loads(req.data.decode("utf-8"))
-        if payload["type"] == "orderStatus":
-            return FakeResponse({"order": {"status": "filled", "order": {"oid": 12345}}})
-        return FakeResponse(
-            [
-                {"oid": 12345, "sz": "0.01", "px": "65000", "fee": "0.1"},
-                {"oid": 12345, "sz": "0.02", "px": "65100", "fee": "0.2"},
-                {"oid": 99999, "sz": "1", "px": "1", "fee": "1"},
-            ]
-        )
-
-    settings = SimpleNamespace(
-        hyperliquid_account_address="0xabc",
-        nautilus_hyperliquid_vault_address="",
-        hyperliquid_info_url="https://example.test/info",
-    )
-    monkeypatch.setattr(nautilus_module.request, "urlopen", fake_urlopen)
-
-    result = nautilus_module._query_hyperliquid_order_status(settings, "12345")
-
-    assert result["status"] == "filled"
-    assert result["filled_quantity"] == pytest.approx(0.03)
-    assert result["average_price"] == pytest.approx((0.01 * 65000 + 0.02 * 65100) / 0.03)
-    assert result["fee"] == pytest.approx(0.3)
 
 
 def test_accepted_order_without_fill_is_pending_not_position_effect() -> None:
@@ -1170,9 +793,11 @@ def test_live_close_hedge_group_places_reverse_orders(monkeypatch) -> None:
 
 def test_live_close_hedge_group_keeps_pending_orders_closing(monkeypatch) -> None:
     db, group_id = _live_close_test_db()
+    submitted = []
 
     class FakeGateway:
         def submit_order(self, intent, *, paper_latency_ms=0):
+            submitted.append(intent)
             result = AdapterOrderResult(True, f"{intent.platform}-accepted", "accepted", 0.0, 0.0, 0.0)
             event = OrderEvent(intent.platform, intent.symbol, intent.side, "accepted", result.external_order_id, intent.quantity, 0.0, 0.0, 0.0)
             return GatewayOrderResult(True, event, (), result)
@@ -1184,7 +809,8 @@ def test_live_close_hedge_group_keeps_pending_orders_closing(monkeypatch) -> Non
 
     assert group.status == "closing"
     assert "待成交" in group.close_reason
-    assert db.query(Order).filter(Order.hedge_group_id == group_id, Order.status == "accepted").count() == 2
+    assert db.query(Order).filter(Order.hedge_group_id == group_id, Order.status == "accepted").count() == 1
+    assert [intent.platform for intent in submitted] == ["hyperliquid"]
     assert db.query(Fill).count() == 0
 
 
@@ -1228,7 +854,7 @@ def test_live_open_blocks_when_readiness_has_blockers(monkeypatch) -> None:
     db.commit()
     monkeypatch.setattr(
         "app.execution.engine.live_execution_readiness",
-        lambda db: {"checks": [{"component": "nautilus_hyperliquid_submit_enabled", "status": "block", "message": "submit 未开启"}]},
+        lambda db: {"checks": [{"component": "hyperliquid_live_order_submit", "status": "block", "message": "Hyperliquid 实盘下单未启用"}]},
     )
 
     with pytest.raises(ValueError, match="实盘执行就绪检查未通过"):
@@ -1286,6 +912,17 @@ def test_live_open_orders_are_not_reduce_only(monkeypatch) -> None:
     assert {order.reduce_only for order in db.query(Order).filter(Order.hedge_group_id == group.id).all()} == {False}
 
 
+def test_hyper_maker_price_is_normalized_to_tick_and_precision() -> None:
+    mapping = SymbolMapping(symbol="EUR", hyperliquid_symbol="xyz:EUR", mt5_symbol="EURUSD", price_precision=5, min_tick=0.00001)
+
+    sell_price = _maker_price("sell", bid=1.1459, ask=1.1459, offset_bps=1.0, mapping=mapping)
+    buy_price = _maker_price("buy", bid=1.1459, ask=1.1460, offset_bps=1.0, mapping=mapping)
+
+    assert sell_price == 1.14602
+    assert buy_price == 1.14578
+    assert len(str(sell_price).split(".")[1]) <= 5
+
+
 def test_paper_open_uses_hyperliquid_sim_and_mt5_demo_adapters(monkeypatch) -> None:
     engine = create_engine("sqlite:///:memory:", future=True)
     Base.metadata.create_all(engine)
@@ -1334,6 +971,205 @@ def test_paper_open_uses_hyperliquid_sim_and_mt5_demo_adapters(monkeypatch) -> N
     assert group.status == "open"
     assert ("hyperliquid", True, False, False) in seen
     assert ("mt5", False, True, False) in seen
+
+
+def test_paper_open_records_actual_entry_spread_from_fills(monkeypatch) -> None:
+    engine = create_engine("sqlite:///:memory:", future=True)
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine, future=True)
+    db = Session()
+    db.add(StrategySetting(execution_mode="paper"))
+    db.add(SymbolMapping(symbol="OIL", hyperliquid_symbol="OIL", mt5_symbol="USOIL"))
+    opportunity = ArbitrageOpportunity(
+        symbol="OIL",
+        direction="long_hyperliquid_short_mt5",
+        status="executable",
+        notional=1000,
+        quantity=1.0,
+        hyperliquid_quantity=1.0,
+        mt5_quantity=0.1,
+        gross_spread=10,
+        unit_cost=1,
+        unit_net_profit=9,
+        entry_threshold=8,
+        exit_target=2,
+        total_cost=1,
+        net_profit=9,
+        annualized_return=0.1,
+    )
+    db.add(opportunity)
+    db.commit()
+
+    class FakeGateway:
+        def __init__(self, adapter) -> None:
+            self.platform = adapter.platform
+
+        def submit_order(self, intent, *, paper_latency_ms=0):
+            price = 101.0 if intent.platform == "hyperliquid" else 103.0
+            result = AdapterOrderResult(True, f"{intent.platform}-paper", "filled", intent.quantity, price, 0.1)
+            event = OrderEvent(intent.platform, intent.symbol, intent.side, "filled", result.external_order_id, intent.quantity, intent.quantity, price, 0.1)
+            fill = FillEvent(intent.platform, intent.symbol, intent.side, intent.quantity, price, 0.1, result.external_order_id)
+            return GatewayOrderResult(True, event, (fill,), result)
+
+    monkeypatch.setattr("app.execution.engine.paper_execution_readiness", lambda db: {"checks": []})
+    monkeypatch.setattr("app.execution.engine.refresh_execution_quotes", lambda *args, **kwargs: ["hyperliquid"])
+    monkeypatch.setattr("app.execution.engine.build_execution_gateway", lambda adapter: FakeGateway(adapter))
+    monkeypatch.setattr("app.execution.engine.quote_synchronizer.synchronized", lambda *args, **kwargs: (SimpleNamespace(hyperliquid=SimpleNamespace(local_recv_ts=datetime.utcnow()), time_diff_ms=0), ""))
+    monkeypatch.setattr("app.execution.engine.pre_trade_check", lambda *args, **kwargs: SimpleNamespace(allowed=True, reason=""))
+
+    group = open_hedge_group(db, opportunity.id)
+
+    assert group.status == "open"
+    assert group.trigger_spread == 10
+    assert group.entry_spread == 2.0
+    assert group.fees == 0.2
+
+
+def test_paper_open_waits_for_hyperliquid_fill_before_mt5(monkeypatch) -> None:
+    engine = create_engine("sqlite:///:memory:", future=True)
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine, future=True)
+    db = Session()
+    db.add(StrategySetting(execution_mode="paper"))
+    db.add(SymbolMapping(symbol="JP225", hyperliquid_symbol="xyz:JP225", mt5_symbol="JP225z"))
+    opportunity = ArbitrageOpportunity(
+        symbol="JP225",
+        direction="long_hyperliquid_short_mt5",
+        status="executable",
+        notional=450,
+        quantity=1.0,
+        hyperliquid_quantity=0.00625,
+        mt5_quantity=1.0,
+        gross_spread=10,
+        unit_cost=1,
+        unit_net_profit=9,
+        entry_threshold=8,
+        exit_target=2,
+        total_cost=1,
+        net_profit=9,
+        annualized_return=0.1,
+    )
+    db.add(opportunity)
+    db.commit()
+    submitted = []
+
+    class FakeGateway:
+        def __init__(self, adapter) -> None:
+            self.platform = adapter.platform
+
+        def submit_order(self, intent, *, paper_latency_ms=0):
+            submitted.append(intent)
+            result = AdapterOrderResult(True, f"{intent.platform}-pending", "accepted", 0.0, 0.0, 0.0, "timeout")
+            event = OrderEvent(intent.platform, intent.symbol, intent.side, "accepted", result.external_order_id, intent.quantity, 0.0, 0.0, 0.0)
+            return GatewayOrderResult(True, event, (), result)
+
+    monkeypatch.setattr("app.execution.engine.paper_execution_readiness", lambda db: {"checks": []})
+    monkeypatch.setattr("app.execution.engine.build_execution_gateway", lambda adapter: FakeGateway(adapter))
+    monkeypatch.setattr("app.execution.engine.quote_synchronizer.synchronized", lambda *args, **kwargs: (SimpleNamespace(hyperliquid=SimpleNamespace(local_recv_ts=datetime.utcnow()), time_diff_ms=0), ""))
+    monkeypatch.setattr("app.execution.engine.pre_trade_check", lambda *args, **kwargs: SimpleNamespace(allowed=True, reason=""))
+
+    group = open_hedge_group(db, opportunity.id)
+
+    assert group.status == "opening"
+    assert opportunity.status == "executing"
+    assert [intent.platform for intent in submitted] == ["hyperliquid"]
+    orders = db.query(Order).filter(Order.hedge_group_id == group.id).all()
+    assert [(order.platform, order.status) for order in orders] == [("hyperliquid", "accepted")]
+    assert db.query(Fill).count() == 0
+
+
+def test_open_refreshes_execution_quotes_after_strict_sync_failure(monkeypatch) -> None:
+    engine = create_engine("sqlite:///:memory:", future=True)
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine, future=True)
+    db = Session()
+    db.add(StrategySetting(execution_mode="paper", paper_hyperliquid_latency_ms_min=0, paper_hyperliquid_latency_ms_max=0, paper_mt5_latency_ms_min=0, paper_mt5_latency_ms_max=0))
+    db.add(SymbolMapping(symbol="JP225", hyperliquid_symbol="xyz:JP225", mt5_symbol="JP225z"))
+    opportunity = ArbitrageOpportunity(
+        symbol="JP225",
+        direction="long_hyperliquid_short_mt5",
+        status="executable",
+        notional=450,
+        quantity=1.0,
+        hyperliquid_quantity=1.0,
+        mt5_quantity=1.0,
+        gross_spread=20,
+        unit_cost=1,
+        unit_net_profit=19,
+        entry_threshold=10,
+        exit_target=2,
+        total_cost=1,
+        net_profit=19,
+        annualized_return=0.1,
+    )
+    db.add(opportunity)
+    db.commit()
+    synced = SimpleNamespace(
+        hyperliquid=SimpleNamespace(ask=100.0, bid=99.0, local_recv_ts=datetime.utcnow()),
+        mt5=SimpleNamespace(ask=121.0, bid=120.0),
+        time_diff_ms=300,
+    )
+    sync_results = [(None, "行情过期，最大延迟 3000ms"), (synced, "")]
+    refreshed = []
+
+    class FakeGateway:
+        def submit_order(self, intent, *, paper_latency_ms=0):
+            result = AdapterOrderResult(True, f"{intent.platform}-open", "filled", intent.quantity, 100.0, 0.1)
+            event = OrderEvent(intent.platform, intent.symbol, intent.side, "filled", result.external_order_id, intent.quantity, intent.quantity, 100.0, 0.1)
+            fill = FillEvent(intent.platform, intent.symbol, intent.side, intent.quantity, 100.0, 0.1, result.external_order_id)
+            return GatewayOrderResult(True, event, (fill,), result)
+
+    monkeypatch.setattr("app.execution.engine.paper_execution_readiness", lambda db: {"checks": []})
+    monkeypatch.setattr("app.execution.engine.refresh_execution_quotes", lambda mapping, **kwargs: refreshed.append((mapping.symbol, kwargs.get("refresh_mt5"))) or ["hyperliquid", "mt5"])
+    monkeypatch.setattr("app.execution.engine.quote_synchronizer.synchronized", lambda *args, **kwargs: sync_results.pop(0))
+    monkeypatch.setattr("app.execution.engine.build_execution_gateway", lambda adapter: FakeGateway())
+
+    group = open_hedge_group(db, opportunity.id)
+
+    assert refreshed == [("JP225", None), ("JP225", False)]
+    assert group.status == "open"
+    assert db.query(Order).filter(Order.hedge_group_id == group.id).count() == 2
+
+
+def test_open_rejects_when_refreshed_quotes_no_longer_meet_entry(monkeypatch) -> None:
+    engine = create_engine("sqlite:///:memory:", future=True)
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine, future=True)
+    db = Session()
+    db.add(StrategySetting(execution_mode="paper"))
+    db.add(SymbolMapping(symbol="JP225", hyperliquid_symbol="xyz:JP225", mt5_symbol="JP225z"))
+    opportunity = ArbitrageOpportunity(
+        symbol="JP225",
+        direction="long_hyperliquid_short_mt5",
+        status="executable",
+        notional=450,
+        quantity=1.0,
+        hyperliquid_quantity=1.0,
+        mt5_quantity=1.0,
+        gross_spread=20,
+        unit_cost=1,
+        unit_net_profit=19,
+        entry_threshold=10,
+        exit_target=2,
+        total_cost=1,
+        net_profit=19,
+        annualized_return=0.1,
+    )
+    db.add(opportunity)
+    db.commit()
+    synced = SimpleNamespace(
+        hyperliquid=SimpleNamespace(ask=100.0, bid=99.0, local_recv_ts=datetime.utcnow()),
+        mt5=SimpleNamespace(ask=106.0, bid=105.0),
+        time_diff_ms=10,
+    )
+    sync_results = [(None, "行情未对齐，时间差 900ms"), (synced, "")]
+
+    monkeypatch.setattr("app.execution.engine.paper_execution_readiness", lambda db: {"checks": []})
+    monkeypatch.setattr("app.execution.engine.refresh_execution_quotes", lambda mapping: ["hyperliquid", "mt5"])
+    monkeypatch.setattr("app.execution.engine.quote_synchronizer.synchronized", lambda *args, **kwargs: sync_results.pop(0))
+
+    with pytest.raises(ValueError, match="主动刷新后价差不再满足入场线"):
+        open_hedge_group(db, opportunity.id)
 
 
 def test_auto_close_skips_live_group_without_live_switch(monkeypatch) -> None:
@@ -1493,6 +1329,192 @@ def test_reconcile_recovers_missing_hyperliquid_external_id_from_unique_account_
     assert db.query(Fill).filter(Fill.order_id == hl_order.id).count() == 1
 
 
+def test_reconcile_hyper_maker_fill_submits_mt5_taker(monkeypatch) -> None:
+    engine = create_engine("sqlite:///:memory:", future=True)
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine, future=True)
+    db = Session()
+    db.add(SymbolMapping(symbol="EUR", hyperliquid_symbol="xyz:EUR", mt5_symbol="EURUSD", execution_style="hyper_maker_mt5_taker"))
+    group = HedgeGroup(
+        symbol="EUR",
+        direction="long_mt5_short_hyperliquid",
+        status="opening",
+        execution_mode="paper",
+        notional=1145.0,
+        quantity=0.01,
+        hyperliquid_quantity=1000.0,
+        mt5_quantity=0.01,
+        open_cost=0.2,
+    )
+    db.add(group)
+    db.flush()
+    hl_order = Order(
+        hedge_group_id=group.id,
+        platform="hyperliquid",
+        symbol="EUR",
+        side="sell",
+        quantity=1000.0,
+        order_type="limit",
+        status="filled",
+        external_order_id="hl-maker-1",
+    )
+    db.add(hl_order)
+    db.flush()
+    db.add(Fill(order_id=hl_order.id, platform="hyperliquid", symbol="EUR", side="sell", quantity=500.0, price=1.146, fee=0.1))
+    db.commit()
+    db.refresh(group)
+    submitted = []
+
+    class FakeGateway:
+        def submit_order(self, intent, *, paper_latency_ms=0):
+            submitted.append(intent)
+            result = AdapterOrderResult(True, "mt5-taker-1", "filled", intent.quantity, 1.1458, 0.01)
+            event = OrderEvent(intent.platform, intent.symbol, intent.side, "filled", result.external_order_id, intent.quantity, intent.quantity, 1.1458, 0.01)
+            fill = FillEvent(intent.platform, intent.symbol, intent.side, intent.quantity, 1.1458, 0.01, result.external_order_id)
+            return GatewayOrderResult(True, event, (fill,), result)
+
+    monkeypatch.setattr("app.execution.reconciler.build_execution_gateway", lambda adapter: FakeGateway())
+
+    changed = reconcile_hedge_group(db, group)
+    db.commit()
+    db.refresh(group)
+
+    mt5_order = db.query(Order).filter(Order.hedge_group_id == group.id, Order.platform == "mt5").one()
+    assert changed
+    assert group.status == "open"
+    assert mt5_order.quantity == pytest.approx(0.005)
+    assert submitted[0].venue_symbol == "EURUSD"
+    assert submitted[0].side == "buy"
+    assert db.query(Fill).count() == 2
+
+
+def test_reconcile_taker_open_hyper_fill_submits_mt5_leg(monkeypatch) -> None:
+    engine = create_engine("sqlite:///:memory:", future=True)
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine, future=True)
+    db = Session()
+    db.add(SymbolMapping(symbol="JP225", hyperliquid_symbol="xyz:JP225", mt5_symbol="JP225z"))
+    group = HedgeGroup(
+        symbol="JP225",
+        direction="long_hyperliquid_short_mt5",
+        status="opening",
+        execution_mode="paper",
+        notional=450.0,
+        quantity=1.0,
+        hyperliquid_quantity=0.00625,
+        mt5_quantity=1.0,
+        open_cost=0.2,
+    )
+    db.add(group)
+    db.flush()
+    db.add(
+        Order(
+            hedge_group_id=group.id,
+            platform="hyperliquid",
+            symbol="JP225",
+            side="buy",
+            quantity=0.00625,
+            status="accepted",
+            external_order_id="hl-open-1",
+        )
+    )
+    db.commit()
+    db.refresh(group)
+    submitted = []
+
+    class FakeGateway:
+        def query_order(self, platform, external_order_id):
+            return {"status": "filled", "external_order_id": external_order_id, "filled_quantity": 0.003125, "average_price": 72000.0, "fee": 0.1}
+
+        def submit_order(self, intent, *, paper_latency_ms=0):
+            submitted.append(intent)
+            result = AdapterOrderResult(True, "mt5-open-1", "filled", intent.quantity, 72010.0, 0.01)
+            event = OrderEvent(intent.platform, intent.symbol, intent.side, "filled", result.external_order_id, intent.quantity, intent.quantity, 72010.0, 0.01)
+            fill = FillEvent(intent.platform, intent.symbol, intent.side, intent.quantity, 72010.0, 0.01, result.external_order_id)
+            return GatewayOrderResult(True, event, (fill,), result)
+
+    monkeypatch.setattr("app.execution.reconciler.build_execution_gateway", lambda adapter: FakeGateway())
+
+    changed = reconcile_hedge_group(db, group)
+    db.commit()
+    db.refresh(group)
+
+    mt5_order = db.query(Order).filter(Order.hedge_group_id == group.id, Order.platform == "mt5").one()
+    assert changed
+    assert group.status == "open"
+    assert mt5_order.side == "sell"
+    assert mt5_order.quantity == pytest.approx(0.5)
+    assert mt5_order.reduce_only is False
+    assert submitted[0].venue_symbol == "JP225z"
+    assert db.query(Fill).count() == 2
+
+
+def test_reconcile_taker_close_hyper_fill_submits_mt5_reduce_only_leg(monkeypatch) -> None:
+    engine = create_engine("sqlite:///:memory:", future=True)
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine, future=True)
+    db = Session()
+    db.add(SymbolMapping(symbol="OIL", hyperliquid_symbol="OIL", mt5_symbol="USOIL"))
+    group = HedgeGroup(
+        symbol="OIL",
+        direction="long_hyperliquid_short_mt5",
+        status="closing",
+        execution_mode="paper",
+        notional=1000.0,
+        quantity=1.0,
+        hyperliquid_quantity=1.0,
+        mt5_quantity=0.1,
+        open_cost=0.2,
+        unrealized_pnl=2.0,
+        opened_at=datetime.utcnow(),
+    )
+    db.add(group)
+    db.flush()
+    db.add(
+        Order(
+            hedge_group_id=group.id,
+            platform="hyperliquid",
+            symbol="OIL",
+            side="sell",
+            quantity=1.0,
+            reduce_only=True,
+            status="accepted",
+            external_order_id="hl-close-1",
+        )
+    )
+    db.commit()
+    db.refresh(group)
+    submitted = []
+
+    class FakeGateway:
+        def query_order(self, platform, external_order_id):
+            return {"status": "filled", "external_order_id": external_order_id, "filled_quantity": 1.0, "average_price": 75.0, "fee": 0.1}
+
+        def submit_order(self, intent, *, paper_latency_ms=0):
+            submitted.append(intent)
+            result = AdapterOrderResult(True, "mt5-close-1", "filled", intent.quantity, 75.1, 0.01)
+            event = OrderEvent(intent.platform, intent.symbol, intent.side, "filled", result.external_order_id, intent.quantity, intent.quantity, 75.1, 0.01)
+            fill = FillEvent(intent.platform, intent.symbol, intent.side, intent.quantity, 75.1, 0.01, result.external_order_id)
+            return GatewayOrderResult(True, event, (fill,), result)
+
+    monkeypatch.setattr("app.execution.reconciler.build_execution_gateway", lambda adapter: FakeGateway())
+
+    changed = reconcile_hedge_group(db, group)
+    db.commit()
+    db.refresh(group)
+
+    mt5_order = db.query(Order).filter(Order.hedge_group_id == group.id, Order.platform == "mt5").one()
+    assert changed
+    assert group.status == "closed"
+    assert group.closed_at is not None
+    assert group.unrealized_pnl == 0.0
+    assert mt5_order.side == "buy"
+    assert mt5_order.quantity == pytest.approx(0.1)
+    assert mt5_order.reduce_only is True
+    assert submitted[0].venue_symbol == "USOIL"
+    assert submitted[0].reduce_only is True
+
+
 def test_reconcile_opening_single_fill_cancels_pending_leg(monkeypatch) -> None:
     db, group = _pending_reconcile_test_db("opening")
 
@@ -1628,7 +1650,7 @@ def test_reconcile_unreconstructable_pending_order_escalates_manual(monkeypatch)
 
     class FakeGateway:
         def query_order(self, platform, external_order_id):
-            return {"status": "not_ready", "external_order_id": external_order_id, "message": "Nautilus cache 不包含该订单"}
+            return {"status": "not_ready", "external_order_id": external_order_id, "message": "本地 cache 不包含该订单"}
 
         def cancel_order(self, platform, external_order_id):
             return True
@@ -1749,7 +1771,6 @@ def test_hyperliquid_live_position_sync_triggers_residual_reconcile(monkeypatch)
     monkeypatch.setattr("app.adapters.hyperliquid.request.urlopen", lambda req, timeout: FakeResponse())
     monkeypatch.setattr("app.adapters.hyperliquid.get_settings", lambda: SimpleNamespace(
         hyperliquid_account_address="0xabc",
-        nautilus_hyperliquid_vault_address="",
         hyperliquid_info_url="https://example.test/info",
     ))
     monkeypatch.setattr("app.execution.reconciler.MT5Adapter", FakeMT5Adapter)
@@ -1930,6 +1951,54 @@ def test_close_adopted_single_leg_group_only_closes_existing_leg(monkeypatch) ->
     assert db.query(Order).filter(Order.hedge_group_id == group.id).count() == 1
 
 
+def test_paper_close_realized_pnl_uses_actual_close_fills(monkeypatch) -> None:
+    engine = create_engine("sqlite:///:memory:", future=True)
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine, future=True)
+    db = Session()
+    db.add(StrategySetting(execution_mode="paper"))
+    db.add(SymbolMapping(symbol="OIL", hyperliquid_symbol="OIL", mt5_symbol="USOIL"))
+    group = HedgeGroup(
+        symbol="OIL",
+        direction="long_hyperliquid_short_mt5",
+        status="open",
+        execution_mode="paper",
+        notional=1000,
+        quantity=1.0,
+        hyperliquid_quantity=1.0,
+        mt5_quantity=0.1,
+        entry_spread=5.0,
+        open_cost=999.0,
+        fees=0.2,
+        unrealized_pnl=999.0,
+        opened_at=datetime.utcnow(),
+    )
+    db.add(group)
+    db.commit()
+
+    class FakeGateway:
+        def __init__(self, adapter) -> None:
+            self.platform = adapter.platform
+
+        def submit_order(self, intent, *, paper_latency_ms=0):
+            price = 101.0 if intent.platform == "hyperliquid" else 103.0
+            result = AdapterOrderResult(True, f"{intent.platform}-close", "filled", intent.quantity, price, 0.1)
+            event = OrderEvent(intent.platform, intent.symbol, intent.side, "filled", result.external_order_id, intent.quantity, intent.quantity, price, 0.1)
+            fill = FillEvent(intent.platform, intent.symbol, intent.side, intent.quantity, price, 0.1, result.external_order_id)
+            return GatewayOrderResult(True, event, (fill,), result)
+
+    monkeypatch.setattr("app.execution.engine.paper_execution_readiness", lambda db: {"checks": []})
+    monkeypatch.setattr("app.execution.engine.mt5_session_state", lambda mapping: MT5SessionState(mapping.symbol, "normal_trade", "", True, True, True, True, True))
+    monkeypatch.setattr("app.execution.engine.refresh_execution_quotes", lambda *args, **kwargs: ["hyperliquid"])
+    monkeypatch.setattr("app.execution.engine.build_execution_gateway", lambda adapter: FakeGateway(adapter))
+
+    closed = close_hedge_group(db, group.id, "manual close")
+
+    assert closed.status == "closed"
+    assert closed.unrealized_pnl == 0.0
+    assert round(closed.realized_pnl, 6) == 2.6
+
+
 def _pending_reconcile_test_db(status: str):
     engine = create_engine("sqlite:///:memory:", future=True)
     Base.metadata.create_all(engine)
@@ -2013,26 +2082,76 @@ def _seed_auto_close_quotes() -> None:
     quote_cache.put("mt5", "OIL", bid=100.5, ask=101.0, depth_notional=10000, source="test")
 
 
-def test_gateway_factory_uses_nautilus_for_enabled_hyperliquid(monkeypatch) -> None:
-    settings = type("Settings", (), {"nautilus_hyperliquid_enabled": True})()
-    monkeypatch.setattr(gateway_module, "get_settings", lambda: settings)
+def test_gateway_factory_uses_adapter_gateway_for_live_hyperliquid() -> None:
     built = build_execution_gateway(HyperliquidAdapter(live=True))
-    assert isinstance(built, NautilusHyperliquidGateway)
+    assert isinstance(built, AdapterExecutionGateway)
     non_live = build_execution_gateway(PaperAdapter("hyperliquid"))
     assert isinstance(non_live, AdapterExecutionGateway)
     fallback = build_execution_gateway(PaperAdapter("mt5"))
     assert isinstance(fallback, AdapterExecutionGateway)
 
 
-def test_gateway_factory_uses_nautilus_sandbox_for_simulated_hyperliquid(monkeypatch) -> None:
-    settings = type("Settings", (), {"nautilus_hyperliquid_enabled": True})()
-    monkeypatch.setattr(gateway_module, "get_settings", lambda: settings)
+def test_gateway_factory_uses_adapter_gateway_for_simulated_hyperliquid() -> None:
     adapter = PaperAdapter("hyperliquid")
     setattr(adapter, "simulated", True)
 
     built = build_execution_gateway(adapter)
 
-    assert isinstance(built, NautilusHyperliquidSandboxGateway)
+    assert isinstance(built, AdapterExecutionGateway)
+
+
+def test_hedge_groups_api_returns_realtime_spreads() -> None:
+    engine = create_engine("sqlite:///:memory:", future=True)
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine, future=True)
+    db = Session()
+    user = User(username="admin", password_hash="x", role="admin")
+    db.add(user)
+    db.add(
+        HedgeGroup(
+            symbol="OIL",
+            direction="long_hyperliquid_short_mt5",
+            status="open",
+            execution_mode="paper",
+            notional=1000,
+            quantity=1,
+            entry_spread=12,
+            exit_target=2,
+        )
+    )
+    db.commit()
+    quote_cache.put("hyperliquid", "OIL", bid=99, ask=101, depth_notional=1000, source="test")
+    quote_cache.put("mt5", "OIL", bid=110, ask=111, depth_notional=1000, source="test")
+
+    result = api_router.hedge_groups(user, db, page=1, page_size=20)
+
+    item = result["items"][0]
+    assert item["entry_spread"] == 12
+    assert item["current_entry_spread"] == 9
+    assert item["current_close_spread"] == 12
+    assert item["quote_time_diff_ms"] >= 0
+    assert item["quote_age_ms"] >= 0
+
+
+def test_pipeline_pool_payload_uses_stable_stage_symbol_id_order() -> None:
+    now = datetime.utcnow()
+    groups = [
+        HedgeGroup(id=5, symbol="ZINC", direction="long_mt5_short_hyperliquid", status="manual_intervention", execution_mode="paper", notional=1, quantity=1),
+        HedgeGroup(id=3, symbol="OIL", direction="long_mt5_short_hyperliquid", status="open", execution_mode="paper", notional=1, quantity=1),
+        HedgeGroup(id=2, symbol="EUR", direction="long_mt5_short_hyperliquid", status="opening", execution_mode="paper", notional=1, quantity=1),
+        HedgeGroup(id=1, symbol="BTC", direction="long_mt5_short_hyperliquid", status="pending_open", execution_mode="paper", notional=1, quantity=1),
+        HedgeGroup(id=4, symbol="BTC", direction="long_mt5_short_hyperliquid", status="closing", execution_mode="paper", notional=1, quantity=1),
+    ]
+
+    items = _pool_payload(groups, now)["items"]
+
+    assert [(item["stage"], item["symbol"], item["id"]) for item in items] == [
+        ("pending", "BTC", 1),
+        ("opening", "EUR", 2),
+        ("open", "OIL", 3),
+        ("closing", "BTC", 4),
+        ("manual", "ZINC", 5),
+    ]
 
 
 def test_xyz_growth_mode_uses_effective_fee_multiplier() -> None:
@@ -2042,6 +2161,13 @@ def test_xyz_growth_mode_uses_effective_fee_multiplier() -> None:
         0.00015,
         {"xyz:JP225": {"growthMode": "enabled"}},
     )
+    assert taker == pytest.approx(0.00009)
+    assert maker == pytest.approx(0.00003)
+    assert "xyz_growth" in source
+
+
+def test_xyz_missing_meta_falls_back_to_growth_fee_multiplier() -> None:
+    taker, maker, source = _hyperliquid_effective_fee_rates("xyz:JPY", 0.00045, 0.00015, {})
     assert taker == pytest.approx(0.00009)
     assert maker == pytest.approx(0.00003)
     assert "xyz_growth" in source
@@ -2309,6 +2435,119 @@ def test_statistical_signal_uses_reachable_entry() -> None:
         assert signal.reachable_entry > 0
 
 
+def test_statistical_signal_blocks_entry_when_samples_are_insufficient() -> None:
+    engine = create_engine("sqlite:///:memory:", future=True)
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine, future=True)
+    now = datetime.utcnow()
+    with Session() as db:
+        strategy = StrategySetting(
+            signal_mode="statistical",
+            statistical_lookback_range="1h",
+            statistical_min_samples=20,
+            min_total_profit=0.1,
+        )
+        db.add(strategy)
+        from app.db.models import SpreadBucket
+
+        for index in range(5):
+            db.add(
+                SpreadBucket(
+                    symbol="OIL",
+                    direction="long_hyperliquid_short_mt5",
+                    bucket_start=now + timedelta(seconds=index),
+                    bucket_seconds=5,
+                    open_spread=0.8,
+                    high_spread=0.8,
+                    low_spread=0.8,
+                    close_spread=0.8,
+                    avg_spread=0.8,
+                    avg_unit_cost=0.02,
+                    avg_unit_net_profit=0.78,
+                    sample_count=1,
+                )
+            )
+        db.commit()
+
+        signal = evaluate_entry_signal(db, strategy, "OIL", "long_hyperliquid_short_mt5", 0.8, 0.02, 0.78, 50, 1)
+
+        assert signal.result.status == "candidate"
+        assert "统计样本不足" in signal.result.reason
+        assert signal.reachable_entry == 0.0
+
+
+def test_statistical_signal_reuses_stats_cache(monkeypatch) -> None:
+    from app.strategy import statistical_signal as statistical_signal_module
+
+    engine = create_engine("sqlite:///:memory:", future=True)
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine, future=True)
+    db = Session()
+    strategy = StrategySetting(
+        signal_mode="statistical",
+        statistical_lookback_range="1h",
+        statistical_min_samples=20,
+        min_total_profit=0,
+    )
+    points = [SpreadPoint(datetime.utcnow() + timedelta(seconds=index), 100 + index, 20, 80 + index) for index in range(30)]
+    calls = {"count": 0}
+
+    def fake_load_points(db, symbol, direction, range_value):
+        calls["count"] += 1
+        return points
+
+    statistical_signal_module.clear_signal_stats_cache()
+    monkeypatch.setattr(statistical_signal_module, "load_spread_points", fake_load_points)
+    try:
+        first = evaluate_entry_signal(db, strategy, "JP225", "long_hyperliquid_short_mt5", 126, 20, 106, 1, 1)
+        second = evaluate_entry_signal(db, strategy, "JP225", "long_hyperliquid_short_mt5", 127, 20, 107, 1, 1)
+    finally:
+        statistical_signal_module.clear_signal_stats_cache()
+
+    assert calls["count"] == 1
+    assert first.reachable_entry == second.reachable_entry
+
+
+def test_statistical_signal_reads_background_refreshed_stats(monkeypatch) -> None:
+    from app.strategy import statistical_signal as statistical_signal_module
+
+    engine = create_engine("sqlite:///:memory:", future=True)
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine, future=True)
+    db = Session()
+    strategy = StrategySetting(
+        signal_mode="statistical",
+        statistical_lookback_range="1h",
+        statistical_min_samples=20,
+        min_total_profit=0,
+    )
+    db.add(strategy)
+    db.add(SymbolMapping(symbol="JP225", hyperliquid_symbol="xyz:JP225", mt5_symbol="JP225", enabled=True))
+    db.commit()
+    points = [SpreadPoint(datetime.utcnow() + timedelta(seconds=index), 100 + index, 20, 80 + index) for index in range(30)]
+    calls = {"count": 0}
+
+    def fake_load_points(db, symbol, direction, range_value):
+        calls["count"] += 1
+        return points
+
+    statistical_signal_module.clear_signal_stats_cache()
+    monkeypatch.setattr(statistical_signal_module, "load_spread_points", fake_load_points)
+    try:
+        assert refresh_signal_stats_cache(db) == 2
+        monkeypatch.setattr(
+            statistical_signal_module,
+            "load_spread_points",
+            lambda *args, **kwargs: pytest.fail("扫描热路径不应重新读取历史样本"),
+        )
+        signal = evaluate_entry_signal(db, strategy, "JP225", "long_hyperliquid_short_mt5", 126, 20, 106, 1, 1)
+    finally:
+        statistical_signal_module.clear_signal_stats_cache()
+
+    assert calls["count"] == 2
+    assert signal.reachable_entry > 0
+
+
 def test_statistical_exit_target_uses_low_percentile_and_profit_buffer() -> None:
     engine = create_engine("sqlite:///:memory:", future=True)
     Base.metadata.create_all(engine)
@@ -2421,7 +2660,130 @@ def test_auto_close_uses_saved_exit_target() -> None:
         evaluation = evaluate_auto_close(db, strategy, group)
         assert evaluation.should_close
         assert evaluation.close_spread == 165
-        assert evaluation.estimated_profit == 75
+        assert evaluation.estimated_profit == 85
+
+
+def test_auto_close_allows_zero_axis_close_without_exit_target() -> None:
+    engine = create_engine("sqlite:///:memory:", future=True)
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine, future=True)
+    with Session() as db:
+        strategy = StrategySetting(auto_close_enabled=True, auto_close_min_profit=0.0, statistical_min_samples=200)
+        db.add(strategy)
+        group = HedgeGroup(
+            symbol="OIL-ZERO",
+            direction="long_hyperliquid_short_mt5",
+            status="open",
+            execution_mode="paper",
+            notional=5000,
+            quantity=0.07,
+            mt5_quantity=0.07,
+            hyperliquid_quantity=70,
+            entry_spread=0.847,
+            exit_target=0.0,
+            fees=0.45,
+            opened_at=datetime.utcnow(),
+        )
+        db.add(group)
+        db.commit()
+        quote_cache.put("hyperliquid", "OIL-ZERO", 72.69, 72.70, 10000, "test")
+        quote_cache.put("mt5", "OIL-ZERO", 72.55, 72.55, 10000, "test")
+
+        evaluation = evaluate_auto_close(db, strategy, group)
+
+        assert evaluation.should_close
+        assert evaluation.close_spread == pytest.approx(-0.14)
+        assert "零轴" in evaluation.reason
+
+
+def test_auto_close_zero_axis_still_requires_min_profit() -> None:
+    engine = create_engine("sqlite:///:memory:", future=True)
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine, future=True)
+    with Session() as db:
+        strategy = StrategySetting(auto_close_enabled=True, auto_close_min_profit=100.0, statistical_min_samples=200)
+        db.add(strategy)
+        group = HedgeGroup(
+            symbol="OIL-ZERO-MIN",
+            direction="long_hyperliquid_short_mt5",
+            status="open",
+            execution_mode="paper",
+            notional=5000,
+            quantity=0.07,
+            mt5_quantity=0.07,
+            hyperliquid_quantity=70,
+            entry_spread=0.847,
+            exit_target=0.0,
+            fees=0.45,
+            opened_at=datetime.utcnow(),
+        )
+        db.add(group)
+        db.commit()
+        quote_cache.put("hyperliquid", "OIL-ZERO-MIN", 72.69, 72.70, 10000, "test")
+        quote_cache.put("mt5", "OIL-ZERO-MIN", 72.55, 72.55, 10000, "test")
+
+        evaluation = evaluate_auto_close(db, strategy, group)
+
+        assert not evaluation.should_close
+        assert "利润不足" in evaluation.reason
+
+
+def test_paper_hyperliquid_funding_cost_uses_actual_rates(monkeypatch) -> None:
+    group = HedgeGroup(
+        symbol="JP225",
+        direction="long_hyperliquid_short_mt5",
+        status="open",
+        execution_mode="paper",
+        notional=1000,
+        quantity=1,
+        mt5_quantity=1,
+        hyperliquid_quantity=1,
+        opened_at=datetime.utcnow() - timedelta(hours=2),
+    )
+    mapping = SymbolMapping(symbol="JP225", hyperliquid_symbol="xyz:JP225", mt5_symbol="JP225")
+
+    monkeypatch.setattr(
+        "app.execution.carry_costs._post_hyperliquid_info",
+        lambda payload: [{"time": payload["startTime"] + 1, "fundingRate": "0.0001"}, {"time": payload["startTime"] + 2, "fundingRate": "-0.00005"}],
+    )
+
+    assert round(_paper_hyperliquid_funding_cost(group, mapping), 8) == 0.05
+    group.direction = "long_mt5_short_hyperliquid"
+    assert round(_paper_hyperliquid_funding_cost(group, mapping), 8) == -0.05
+
+
+def test_mt5_swap_cost_uses_position_swap_sign(monkeypatch) -> None:
+    engine = create_engine("sqlite:///:memory:", future=True)
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine, future=True)
+    db = Session()
+    group = HedgeGroup(
+        symbol="OIL",
+        direction="long_hyperliquid_short_mt5",
+        status="open",
+        execution_mode="paper",
+        notional=1000,
+        quantity=1,
+        mt5_quantity=0.5,
+        hyperliquid_quantity=1,
+        opened_at=datetime.utcnow() - timedelta(days=1),
+    )
+    db.add(group)
+    db.commit()
+    mapping = SymbolMapping(symbol="OIL", hyperliquid_symbol="OIL", mt5_symbol="USOIL")
+
+    class FakeMT5:
+        POSITION_TYPE_SELL = 1
+        POSITION_TYPE_BUY = 0
+
+        @staticmethod
+        def positions_get(symbol=None):
+            return [SimpleNamespace(symbol="USOIL", type=1, volume=0.5, swap=-1.25)]
+
+    monkeypatch.setattr("app.execution.carry_costs._initialize_mt5", lambda mt5, settings: True)
+    monkeypatch.setitem(sys.modules, "MetaTrader5", FakeMT5)
+
+    assert _mt5_swap_cost(db, group, mapping) == 1.25
 
 
 def test_lead_lag_detects_following_move() -> None:
@@ -2469,11 +2831,7 @@ def test_live_execution_readiness_blocks_missing_live_prerequisites(monkeypatch)
         raise ImportError(name)
 
     settings = SimpleNamespace(
-        nautilus_hyperliquid_enabled=False,
-        nautilus_hyperliquid_submit_enabled=False,
-        nautilus_hyperliquid_private_key="",
         hyperliquid_account_address="",
-        nautilus_hyperliquid_vault_address="",
         mt5_live_order_enabled=False,
         mt5_login="",
         mt5_server="",
@@ -2484,7 +2842,7 @@ def test_live_execution_readiness_blocks_missing_live_prerequisites(monkeypatch)
 
     assert result["status"] == "blocked"
     blocked = {item["component"] for item in result["checks"] if item["status"] == "block"}
-    assert {"global_live_switch", "nautilus_hyperliquid_enabled", "nautilus_hyperliquid_private_key", "metatrader5_import"} <= blocked
+    assert {"global_live_switch", "hyperliquid_account_address", "hyperliquid_live_order_submit", "metatrader5_import"} <= blocked
 
 
 def test_paper_execution_readiness_allows_demo_account(monkeypatch) -> None:
@@ -2496,8 +2854,6 @@ def test_paper_execution_readiness_allows_demo_account(monkeypatch) -> None:
     db.commit()
 
     settings = SimpleNamespace(
-        nautilus_hyperliquid_enabled=True,
-        nautilus_hyperliquid_sim_starting_balances="100000 USD",
         mt5_demo_order_enabled=True,
         mt5_login="123",
         mt5_password="pwd",
@@ -2520,7 +2876,9 @@ def test_paper_execution_readiness_allows_demo_account(monkeypatch) -> None:
             return True
 
     def fake_import(name):
-        return FakeMT5() if name == "MetaTrader5" else object()
+        if name == "MetaTrader5":
+            return FakeMT5()
+        return object()
 
     monkeypatch.setattr("app.execution.readiness.import_module", fake_import)
 
@@ -2539,8 +2897,6 @@ def test_paper_execution_readiness_blocks_real_mt5_account(monkeypatch) -> None:
     db.commit()
 
     settings = SimpleNamespace(
-        nautilus_hyperliquid_enabled=True,
-        nautilus_hyperliquid_sim_starting_balances="100000 USD",
         mt5_demo_order_enabled=True,
         mt5_login="",
         mt5_password="",
@@ -2563,7 +2919,9 @@ def test_paper_execution_readiness_blocks_real_mt5_account(monkeypatch) -> None:
             return True
 
     def fake_import(name):
-        return FakeMT5() if name == "MetaTrader5" else object()
+        if name == "MetaTrader5":
+            return FakeMT5()
+        return object()
 
     monkeypatch.setattr("app.execution.readiness.import_module", fake_import)
 
@@ -2574,7 +2932,7 @@ def test_paper_execution_readiness_blocks_real_mt5_account(monkeypatch) -> None:
     assert "mt5_demo_account" in blocked
 
 
-def test_live_execution_readiness_allows_ready_with_complete_config(monkeypatch) -> None:
+def test_live_execution_readiness_blocks_hyperliquid_live_submit_after_sdk_removal(monkeypatch) -> None:
     engine = create_engine("sqlite:///:memory:", future=True)
     Base.metadata.create_all(engine)
     Session = sessionmaker(bind=engine, future=True)
@@ -2594,11 +2952,7 @@ def test_live_execution_readiness_allows_ready_with_complete_config(monkeypatch)
     db.commit()
 
     settings = SimpleNamespace(
-        nautilus_hyperliquid_enabled=True,
-        nautilus_hyperliquid_submit_enabled=True,
-        nautilus_hyperliquid_private_key="secret",
         hyperliquid_account_address="0xabc",
-        nautilus_hyperliquid_vault_address="",
         hyperliquid_info_url="https://example.test/info",
         mt5_live_order_enabled=True,
         mt5_login="123",
@@ -2637,8 +2991,10 @@ def test_live_execution_readiness_allows_ready_with_complete_config(monkeypatch)
 
     result = live_execution_readiness(db, settings)
 
-    assert result["status"] == "ready"
-    assert result["ready"] is True
+    assert result["status"] == "blocked"
+    assert result["ready"] is False
+    blocked = {item["component"] for item in result["checks"] if item["status"] == "block"}
+    assert "hyperliquid_live_order_submit" in blocked
 
 
 def test_live_execution_readiness_blocks_failed_read_probes(monkeypatch) -> None:
@@ -2670,11 +3026,7 @@ def test_live_execution_readiness_blocks_failed_read_probes(monkeypatch) -> None
         raise TimeoutError("timeout")
 
     settings = SimpleNamespace(
-        nautilus_hyperliquid_enabled=True,
-        nautilus_hyperliquid_submit_enabled=True,
-        nautilus_hyperliquid_private_key="secret",
         hyperliquid_account_address="0xabc",
-        nautilus_hyperliquid_vault_address="",
         hyperliquid_info_url="https://example.test/info",
         mt5_live_order_enabled=True,
         mt5_login="123",
@@ -2725,11 +3077,7 @@ def test_live_execution_readiness_blocks_unmanaged_live_positions(monkeypatch) -
             return json.dumps({"marginSummary": {}, "assetPositions": []}).encode("utf-8")
 
     settings = SimpleNamespace(
-        nautilus_hyperliquid_enabled=True,
-        nautilus_hyperliquid_submit_enabled=True,
-        nautilus_hyperliquid_private_key="secret",
         hyperliquid_account_address="0xabc",
-        nautilus_hyperliquid_vault_address="",
         hyperliquid_info_url="https://example.test/info",
         mt5_live_order_enabled=True,
         mt5_login="123",
@@ -2793,11 +3141,7 @@ def test_live_execution_readiness_requires_managed_position_side_and_quantity(mo
             return json.dumps({"marginSummary": {}, "assetPositions": []}).encode("utf-8")
 
     settings = SimpleNamespace(
-        nautilus_hyperliquid_enabled=True,
-        nautilus_hyperliquid_submit_enabled=True,
-        nautilus_hyperliquid_private_key="secret",
         hyperliquid_account_address="0xabc",
-        nautilus_hyperliquid_vault_address="",
         hyperliquid_info_url="https://example.test/info",
         mt5_live_order_enabled=True,
         mt5_login="123",
@@ -2859,11 +3203,7 @@ def test_live_execution_readiness_blocks_residual_closed_group_position(monkeypa
             return json.dumps({"marginSummary": {}, "assetPositions": []}).encode("utf-8")
 
     settings = SimpleNamespace(
-        nautilus_hyperliquid_enabled=True,
-        nautilus_hyperliquid_submit_enabled=True,
-        nautilus_hyperliquid_private_key="secret",
         hyperliquid_account_address="0xabc",
-        nautilus_hyperliquid_vault_address="",
         hyperliquid_info_url="https://example.test/info",
         mt5_live_order_enabled=True,
         mt5_login="123",
@@ -2893,7 +3233,7 @@ def test_execution_reconcile_api_runs_reconciler_and_audits(monkeypatch) -> None
 
     result = api_router.execution_reconcile(user=user, db=db)
 
-    assert result == {"status": "ok", "changed": 3}
+    assert result == {"status": "ok", "changed": 3, "cost_changed": 0}
     assert db.query(AuditLog).filter(AuditLog.action == "run_execution_reconcile", AuditLog.detail == "3").count() == 1
 
 

@@ -9,6 +9,7 @@ from app.db.models import ArbitrageOpportunity, MarketSnapshot, SpreadBucket, Sp
 from app.db.retention import prune_table_by_id
 from app.market.symbols import enabled_mappings
 from app.market.fx import fx_to_usd
+from app.market.orderbook import order_book_cache, simulate_market_fill
 from app.market.quotes import quote_synchronizer
 from app.market.scan_state import scan_state_store
 from app.market.mt5_sessions import mt5_action_allowed, mt5_session_state
@@ -213,9 +214,11 @@ def run_scan(db: Session) -> int:
                     annualized_return,
                 )
                 signal = statistical_signal.result
-                if signal.status in {"candidate", "executable"} and hl.depth_notional > 0 and notional > hl.depth_notional:
-                    signal.status = "candidate"
-                    signal.reason = f"Hyperliquid 顶层深度不足: 目标 {notional:.2f} USD > 深度 {hl.depth_notional:.2f} USD"
+                if signal.status in {"candidate", "executable"}:
+                    liquidity_reason = _hyperliquid_liquidity_reason(mapping.symbol, hyperliquid_side, sizing.hyperliquid_quantity, notional, hl.depth_notional)
+                    if liquidity_reason:
+                        signal.status = "candidate"
+                        signal.reason = liquidity_reason
                 mt5_open_allowed, mt5_open_reason = mt5_action_allowed(session_state, direction, "open")
                 if not mt5_open_allowed:
                     signal.status = "rejected"
@@ -358,6 +361,18 @@ def _decimal_places(value: float) -> int:
 
 def _hl_fee_rate(order_type: str, hl_costs) -> float:
     return hl_costs.maker_fee_rate if order_type == "limit" else hl_costs.taker_fee_rate
+
+
+def _hyperliquid_liquidity_reason(symbol: str, side: str, quantity: float, notional: float, top_depth_notional: float) -> str:
+    book = order_book_cache.latest("hyperliquid", symbol)
+    if book:
+        fill = simulate_market_fill(book, side, quantity)
+        if not fill.enough_liquidity:
+            return f"Hyperliquid L2 深度不足: 目标 {quantity:.8f}，可成交 {fill.filled_quantity:.8f}"
+        return ""
+    if top_depth_notional > 0 and notional > top_depth_notional:
+        return f"Hyperliquid 顶层深度不足: 目标 {notional:.2f} USD > 深度 {top_depth_notional:.2f} USD"
+    return ""
 
 
 def _elapsed_ms(started: float) -> float:

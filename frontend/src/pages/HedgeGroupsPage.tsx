@@ -3,7 +3,7 @@ import { Button, Card, Descriptions, Space, Table, Tag, Typography, message } fr
 import type { ColumnsType } from 'antd/es/table';
 import { useState } from 'react';
 import { api } from '../api/client';
-import { fmtMoney, fmtNum } from '../utils/format';
+import { fmtMoney, fmtNum, fmtSpread } from '../utils/format';
 
 function statusTag(status: string) {
   const map: Record<string, { label: string; color: string }> = {
@@ -43,9 +43,14 @@ function detailItems(row: any) {
   return [
     { key: 'mt5_quantity', label: 'MT5 数量', children: fmtNum(row.mt5_quantity, 4) },
     { key: 'hyperliquid_quantity', label: 'HL 数量', children: fmtNum(row.hyperliquid_quantity, 6) },
-    { key: 'entry_spread', label: '开仓价差', children: fmtMoney(row.entry_spread) },
-    { key: 'entry_threshold', label: '入场线', children: fmtMoney(row.entry_threshold) },
-    { key: 'exit_target', label: '退出线', children: fmtMoney(row.exit_target) },
+    { key: 'trigger_spread', label: '触发价差', children: fmtSpread(row.trigger_spread) },
+    { key: 'entry_spread', label: '真实开仓价差', children: fmtSpread(row.entry_spread) },
+    { key: 'current_entry_spread', label: '当前入场价差', children: row.current_entry_spread == null ? '-' : fmtSpread(row.current_entry_spread) },
+    { key: 'current_close_spread', label: '当前平仓价差', children: row.current_close_spread == null ? '-' : fmtSpread(row.current_close_spread) },
+    { key: 'quote_time_diff_ms', label: '报价时间差', children: row.quote_time_diff_ms == null ? '-' : `${Math.round(row.quote_time_diff_ms)}ms` },
+    { key: 'quote_age_ms', label: '报价年龄', children: row.quote_age_ms == null ? '-' : `${Math.round(row.quote_age_ms)}ms` },
+    { key: 'entry_threshold', label: '入场线', children: fmtSpread(row.entry_threshold) },
+    { key: 'exit_target', label: '退出线', children: fmtSpread(row.exit_target) },
     { key: 'open_cost', label: '开仓成本', children: fmtMoney(row.open_cost) },
     { key: 'realized_pnl', label: '已实现', children: fmtMoney(row.realized_pnl) },
     { key: 'unrealized_pnl', label: '未实现', children: fmtMoney(row.unrealized_pnl) },
@@ -87,6 +92,9 @@ export function HedgeGroupsPage() {
     { title: '模式', dataIndex: 'execution_mode', width: 86 },
     { title: '名义价值', dataIndex: 'notional', width: 112, align: 'right', render: fmtMoney },
     { title: '数量', dataIndex: 'quantity', width: 92, align: 'right', render: (v) => fmtNum(v, 4) },
+    { title: '触发价差', dataIndex: 'trigger_spread', width: 112, align: 'right', render: fmtSpread },
+    { title: '真实开仓价差', dataIndex: 'entry_spread', width: 132, align: 'right', render: fmtSpread },
+    { title: '当前平仓价差', dataIndex: 'current_close_spread', width: 132, align: 'right', render: (v) => (v == null ? '-' : fmtSpread(v)) },
     { title: 'PnL', width: 112, align: 'right', render: (_, row) => fmtMoney((row.realized_pnl || 0) + (row.unrealized_pnl || 0)) },
     { title: '操作', fixed: 'right', width: 100, render: (_, row) => <Button size="small" disabled={!['open', 'open_partial', 'manual_intervention'].includes(row.status)} onClick={() => close.mutate(row.id)}>平仓</Button> }
   ];
@@ -103,7 +111,7 @@ export function HedgeGroupsPage() {
           columns={columns}
           dataSource={query.data?.items || []}
           loading={query.isLoading}
-          scroll={{ x: 940 }}
+          scroll={{ x: 1320 }}
           pagination={{ current: page, pageSize: 20, total: query.data?.total || 0, onChange: setPage }}
           expandable={{
             expandedRowRender: (row) => <Descriptions size="small" column={{ xs: 1, sm: 2, lg: 4 }} items={detailItems(row)} />,

@@ -36,7 +36,9 @@ export type V2HedgeGroup = {
   id: number;
   symbol: string;
   status: V2HedgeStatus;
+  sortStage: string;
   pnl?: number;
+  triggerSpread?: number;
   entrySpread?: number;
   currentSpread?: number;
 };

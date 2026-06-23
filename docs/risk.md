@@ -27,7 +27,7 @@
 - `quote_stale_ms`：任一平台报价距离当前时间允许的最大年龄。
 - `loose_quote_sync_ms`：宽松扫描使用的时间窗口，只用于候选发现。
 
-如果 Hyperliquid 已更新而 MT5 未更新，或 MT5 tick 先到而 Hyperliquid 旧价未刷新，严格检查会拒绝交易，避免假价差触发。
+如果 Hyperliquid 已更新而 MT5 未更新，或 MT5 tick 先到而 Hyperliquid 旧价未刷新，执行引擎不会直接用旧缓存下单。进入执行前会先主动刷新一次 Hyperliquid HTTP L2 和 MT5 tick；刷新后仍未对齐或过期才拒绝交易，避免假价差触发。
 
 自动纸面执行不会绕过这些检查。自动执行器只负责在后端发现持续满足条件的 `executable` 机会，并在确认次数、持续时间、冷却和未平对冲组上限都满足后调用同一套开仓接口；开仓前仍会重新执行严格行情同步和资金风控。
 
@@ -62,6 +62,8 @@
 
 Paper 模式默认不使用真实账户资金快照做保证金阻断，便于模拟自动执行和延迟成交；仍会检查系统模式、单笔名义价值、滑点、行情同步和行情过期。需要让 paper 也按真实账户可用保证金约束时，可在策略设置中开启 `paper_use_live_account_risk`。Live 模式始终强制使用真实账户资金风控。
 
+执行前主动刷新成功且刷新后价差仍满足入场线和最低净利润时，滑点检查不再用两次本地接收时间差粗略折算，而使用配置的 `DEFAULT_SLIPPAGE_BPS`。这是为了避免 HTTP 和 MT5 tick 顺序刷新本身产生的毫秒差被误判为市场滑点。
+
 ## Maker 执行风险
 
 Hyperliquid maker 能降低手续费，但会带来成交不确定性：
@@ -82,7 +84,7 @@ Hyperliquid maker 能降低手续费，但会带来成交不确定性：
 
 任一边下单失败时，默认把对冲组标记为 `manual_intervention` 并产生告警。只有品种映射显式设置 `single_leg_action=auto_close` 或 `reverse_filled_leg` 时，reconciler 才会对已成交腿提交反向市价冲销单；补偿单未确认成交时仍保持人工介入。
 
-live 平仓和单腿补偿都会使用 reduce-only 语义。MT5Adapter 会把 MT5 hedging 持仓 ticket 写入 `order_send.position`；若找不到对应可减仓持仓，则拒绝发单而不是开反向新仓。NautilusTrader Hyperliquid order factory 如果不支持 `reduce_only` 参数，系统会直接把订单标为失败，不会退化成普通反向单。
+live 平仓和单腿补偿都会使用 reduce-only 语义。MT5Adapter 会把 MT5 hedging 持仓 ticket 写入 `order_send.position`；若找不到对应可减仓持仓，则拒绝发单而不是开反向新仓。Hyperliquid live 下单 SDK 当前未启用，readiness 会阻止真实提交。
 
 实盘就绪检查会读取当前已同步的 Hyperliquid/MT5 live 仓位管理状态。外部仓位必须同时匹配 live 对冲组的平台、映射品种、方向和该平台预期数量；同品种但方向或数量不一致也会视为未归属。若发现外部仓位无法匹配任何 live 对冲组，或已关闭 live 对冲组仍有残余仓位，系统会把 readiness 标为 `blocked`，live 开仓和平仓入口不会继续提交真实订单。
 

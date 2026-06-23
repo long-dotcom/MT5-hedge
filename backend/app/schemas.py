@@ -29,7 +29,7 @@ class StrategySettingsIn(BaseModel):
     auto_close_enabled: bool = True
     auto_close_live_enabled: bool = False
     exit_target_percentile: float = 0.25
-    auto_close_unit_profit_buffer: float = 20.0
+    auto_close_unit_profit_buffer: float = 0.0
     auto_close_min_profit: float = 0.0
     default_notional: float
     max_holding_minutes: int

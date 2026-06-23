@@ -30,6 +30,10 @@ export function fmtAdaptive(value?: number, minDigits = 2, maxDigits = 6) {
   return numeric.toLocaleString(undefined, { minimumFractionDigits: 0, maximumFractionDigits: digits });
 }
 
+export function fmtSpread(value?: number) {
+  return fmtAdaptive(value, 2, 8);
+}
+
 export function fmtCompact(value?: number, maxDigits = 6) {
   if (value === undefined || value === null || Number.isNaN(value)) return '-';
   return Number(value).toLocaleString(undefined, { minimumFractionDigits: 0, maximumFractionDigits: maxDigits });

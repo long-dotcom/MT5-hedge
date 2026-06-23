@@ -47,7 +47,7 @@ def ensure_initial_account_snapshots(db: Session) -> None:
 
 def _hyperliquid_account_snapshot() -> AccountSnapshot:
     settings = get_settings()
-    account_address = settings.hyperliquid_account_address or settings.nautilus_hyperliquid_vault_address
+    account_address = settings.hyperliquid_account_address
     if account_address:
         try:
             data = _post_hyperliquid_info({"type": "clearinghouseState", "user": account_address})

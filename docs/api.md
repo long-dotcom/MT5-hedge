@@ -39,7 +39,7 @@
 - `GET /api/hedge-groups/{id}`：查看对冲组详情、事件和订单。
 - `POST /api/hedge-groups/{id}/close`：手动平仓。
 - `POST /api/hedge-groups/{id}/mark-manual`：标记为需要人工处理。
-- Paper 自动平仓由后台调度器执行，不需要前端点击；对冲组会返回 `entry_spread`、`entry_threshold`、`exit_target`、`overheat_threshold` 和 `close_reason`。
+- Paper 自动平仓由后台调度器执行，不需要前端点击；对冲组会返回 `trigger_spread`、`entry_spread`、`entry_threshold`、`exit_target`、`overheat_threshold` 和 `close_reason`。其中 `trigger_spread` 是机会触发时的价差，`entry_spread` 是双边成交后按 fill 均价回写的真实开仓价差。
 
 ## 账户、仓位、订单
 
@@ -51,7 +51,7 @@
 - `GET /api/orders`：订单分页，包含 `post_only`、`reduce_only` 和 `ttl_seconds` 等执行语义字段，便于复核 live 平仓/补偿单是否按 reduce-only 提交。
 - `GET /api/fills`：成交分页。
 
-前端“执行记录”页面会同时展示订单与成交，订单表重点展示 `reduce_only`、`post_only`、外部单号和错误信息，用于排查 NautilusTrader Hyperliquid 与 MT5 live 执行回报。
+前端“执行记录”页面会同时展示订单与成交，订单表重点展示 `reduce_only`、`post_only`、外部单号和错误信息，用于排查 Hyperliquid paper、本地回查和 MT5 live 执行回报。
 
 ## 风控
 
@@ -62,7 +62,7 @@
 
 ## 设置
 
-- `GET/PUT /api/settings/strategy`：策略参数，包含统计入场线、Paper 自动执行和自动平仓参数；`auto_close_live_enabled=false` 时自动平仓只处理 paper 对冲组，开启后才允许 live 自动平仓继续进入实盘反向订单路径。自动平仓退出线按 `min(低分位价差, 开仓价差 - 单位成本 - 每份利润缓冲)` 计算，利润保护上限无效时返回 `0`。
+- `GET/PUT /api/settings/strategy`：策略参数，包含统计入场线、Paper 自动执行和自动平仓参数；`auto_close_live_enabled=false` 时自动平仓只处理 paper 对冲组，开启后才允许 live 自动平仓继续进入实盘反向订单路径。自动平仓退出线按 `min(低分位价差, 开仓价差 - 单位成本 - 每份利润缓冲)` 计算，利润保护上限无效时返回 `0`。每份利润缓冲默认 `0`，跨品种利润保护建议使用 USD 口径的 `auto_close_min_profit`。
 - `GET/PUT /api/settings/risk`：风控参数。
 - `GET/PUT /api/settings/symbol-mappings`：品种映射。
 - `POST /api/settings/symbol-mappings`：新增单条品种映射。
@@ -72,8 +72,8 @@
 - 品种映射包含执行策略字段：`execution_style`、`hl_open_order_type`、`hl_close_order_type`、`hl_post_only`、`hl_maker_offset_bps`、`hl_order_ttl_seconds`、`hl_unfilled_action`、`single_leg_action`。
 - 品种映射包含 MT5 会话保护字段：`mt5_pre_close_no_open_minutes`、`mt5_post_open_cooldown_minutes`、`allow_hold_through_mt5_close`。
 - `GET/PUT /api/settings/live-trading`：实盘开关。
-- `GET /api/settings/live-readiness`：实盘执行就绪检查，返回总状态和 Hyperliquid NautilusTrader、MT5、全局实盘开关、只读账户连通性、品种映射、单腿补偿配置等检查项。
-- `GET /api/settings/paper-readiness`：Paper 完整模拟执行就绪检查，返回 NautilusTrader sandbox、MT5 demo 开关、demo 账户状态、`MT5_LOGIN`/`MT5_SERVER` 账户锁定和品种映射检查项。存在 `block` 时，paper 开仓和平仓不会提交模拟订单。
+- `GET /api/settings/live-readiness`：实盘执行就绪检查，返回总状态、Hyperliquid 只读账户连通性、MT5、全局实盘开关、品种映射、单腿补偿配置等检查项；当前 Hyperliquid live 下单项固定为 block。
+- `GET /api/settings/paper-readiness`：Paper 完整模拟执行就绪检查，返回本地 Hyperliquid paper 撮合、MT5 demo 开关、demo 账户状态、`MT5_LOGIN`/`MT5_SERVER` 账户锁定和品种映射检查项。存在 `block` 时，paper 开仓和平仓不会提交模拟订单。
 
 开启实盘时必须传入确认短语 `ENABLE LIVE TRADING`。
 

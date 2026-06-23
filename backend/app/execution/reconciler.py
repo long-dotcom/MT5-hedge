@@ -9,6 +9,7 @@ from app.config.settings import get_settings
 from app.db.models import Alert, Fill, HedgeGroup, HedgeGroupEvent, Order, Position, SymbolMapping, SystemLog, WorkerRun
 from app.db.retention import prune_table_by_id
 from app.execution.gateway import LegOrderIntent, build_execution_gateway
+from app.execution.pnl import actual_entry_spread_from_fills, realized_pnl_from_fills
 
 
 PENDING_ORDER_STATUSES = {"accepted", "submitted", "pending", "open", "new"}
@@ -134,7 +135,7 @@ def reconcile_orphan_positions(db: Session) -> int:
 
 
 def _refresh_order(db: Session, group: HedgeGroup, order: Order) -> bool:
-    adapter = _adapter_for_order(order.platform, group.execution_mode == "live")
+    adapter = _adapter_for_order(order.platform, group)
     gateway = build_execution_gateway(adapter)
     snapshot = gateway.query_order(order.platform, order.external_order_id)
     status = str(snapshot.get("status") or order.status)
@@ -275,6 +276,10 @@ def _advance_group_state(db: Session, group: HedgeGroup, orders: list[Order]) ->
     if not orders:
         return False
     platform_orders = _latest_platform_orders(orders)
+    if group.status == "opening" and _complete_hyper_maker_with_mt5_taker(db, group, platform_orders):
+        return True
+    if group.status in {"opening", "closing"} and _complete_hyper_then_mt5_after_fill(db, group, platform_orders):
+        return True
     if len(platform_orders) < 2:
         return False
 
@@ -287,6 +292,9 @@ def _advance_group_state(db: Session, group: HedgeGroup, orders: list[Order]) ->
             group.status = "open"
             group.opened_at = group.opened_at or datetime.utcnow()
             group.fees += _orders_fee(db, platform_orders.values())
+            actual_entry_spread = actual_entry_spread_from_fills(db, group)
+            if actual_entry_spread is not None:
+                group.entry_spread = actual_entry_spread
             db.add(HedgeGroupEvent(hedge_group_id=group.id, event_type="opened_reconciled", detail="订单回查确认双边开仓成交"))
             db.add(SystemLog(level="info", category="execution_reconcile", message=f"开仓回查完成: {group.symbol} #{group.id}"))
             return True
@@ -310,7 +318,9 @@ def _advance_group_state(db: Session, group: HedgeGroup, orders: list[Order]) ->
             group.status = "closed"
             group.closed_at = group.closed_at or datetime.utcnow()
             group.fees += _orders_fee(db, platform_orders.values())
-            group.realized_pnl = group.unrealized_pnl - group.fees - group.funding - group.swap
+            group.realized_pnl = realized_pnl_from_fills(db, group)
+            if group.realized_pnl is None:
+                group.realized_pnl = group.unrealized_pnl - group.fees - group.funding - group.swap
             group.unrealized_pnl = 0.0
             db.add(HedgeGroupEvent(hedge_group_id=group.id, event_type="closed_reconciled", detail="订单回查确认双边平仓成交"))
             db.add(SystemLog(level="info", category="execution_reconcile", message=f"平仓回查完成: {group.symbol} #{group.id}"))
@@ -367,44 +377,176 @@ def _auto_compensate_single_leg(db: Session, group: HedgeGroup, orders, phase: s
     return True
 
 
-def _submit_compensation_order(db: Session, group: HedgeGroup, filled_order: Order, mapping: SymbolMapping | None) -> Order:
-    side = "sell" if filled_order.side == "buy" else "buy"
-    quantity = _order_fill_quantity(db, filled_order.id) or filled_order.quantity
-    venue_symbol = _venue_symbol_for_order(group, filled_order, mapping)
-    compensation = Order(
+def _complete_hyper_maker_with_mt5_taker(db: Session, group: HedgeGroup, platform_orders: dict[str, Order]) -> bool:
+    if set(platform_orders) != {"hyperliquid"}:
+        return False
+    mapping = db.query(SymbolMapping).filter(SymbolMapping.symbol == group.symbol).first()
+    if not mapping or mapping.execution_style != "hyper_maker_mt5_taker":
+        return False
+    hyper_order = platform_orders["hyperliquid"]
+    if not _order_has_position_effect(db, hyper_order):
+        return False
+    if _has_group_event(db, group.id, "maker_fill_mt5_taker_submitted"):
+        return False
+
+    hyper_fill_quantity = _order_fill_quantity(db, hyper_order.id)
+    hyper_target_quantity = float(group.hyperliquid_quantity or group.quantity or hyper_order.quantity)
+    fill_ratio = min(max(hyper_fill_quantity / hyper_target_quantity, 0.0), 1.0) if hyper_target_quantity > 0 else 0.0
+    mt5_quantity = float(group.mt5_quantity or group.quantity or 0.0) * fill_ratio
+    if mt5_quantity <= 0:
+        return False
+    mt5_side = "sell" if group.direction == "long_hyperliquid_short_mt5" else "buy"
+    mt5_order = _submit_order_for_group(
+        db,
+        group,
+        platform="mt5",
+        side=mt5_side,
+        quantity=mt5_quantity,
+        order_type="market",
+        venue_symbol=mapping.mt5_symbol,
+    )
+    detail = f"Hyperliquid maker 后续成交 {hyper_fill_quantity}/{hyper_target_quantity}，已按比例提交 MT5 taker: {mt5_order.status}"
+    db.add(HedgeGroupEvent(hedge_group_id=group.id, event_type="maker_fill_mt5_taker_submitted", detail=detail))
+    if _order_has_position_effect(db, mt5_order):
+        group.status = "open"
+        group.opened_at = group.opened_at or datetime.utcnow()
+        group.fees += _orders_fee(db, [hyper_order, mt5_order])
+        actual_entry_spread = actual_entry_spread_from_fills(db, group)
+        if actual_entry_spread is not None:
+            group.entry_spread = actual_entry_spread
+        db.add(HedgeGroupEvent(hedge_group_id=group.id, event_type="opened_reconciled", detail="Hyper maker 后续成交后 MT5 taker 补单完成"))
+    elif mt5_order.status in PENDING_ORDER_STATUSES:
+        group.status = "opening"
+        db.add(HedgeGroupEvent(hedge_group_id=group.id, event_type="orders_pending", detail=detail))
+    else:
+        group.status = "manual_intervention"
+        db.add(Alert(level="critical", title="MT5 taker 补单失败", message=f"{group.symbol} 对冲组 #{group.id} {detail}; {mt5_order.error_message or ''}"))
+        db.add(HedgeGroupEvent(hedge_group_id=group.id, event_type="manual_intervention", detail=detail))
+    return True
+
+
+def _complete_hyper_then_mt5_after_fill(db: Session, group: HedgeGroup, platform_orders: dict[str, Order]) -> bool:
+    if set(platform_orders) != {"hyperliquid"}:
+        return False
+    mapping = db.query(SymbolMapping).filter(SymbolMapping.symbol == group.symbol).first()
+    if not mapping or mapping.execution_style == "hyper_maker_mt5_taker":
+        return False
+    hyper_order = platform_orders["hyperliquid"]
+    if not _order_has_position_effect(db, hyper_order):
+        return False
+    event_type = f"{group.status}_hyper_fill_mt5_submitted"
+    if _has_group_event(db, group.id, event_type):
+        return False
+
+    hyper_fill_quantity = _order_fill_quantity(db, hyper_order.id)
+    hyper_target_quantity = float(group.hyperliquid_quantity or group.quantity or hyper_order.quantity)
+    fill_ratio = min(max(hyper_fill_quantity / hyper_target_quantity, 0.0), 1.0) if hyper_target_quantity > 0 else 0.0
+    mt5_quantity = float(group.mt5_quantity or group.quantity or 0.0) * fill_ratio
+    if mt5_quantity <= 0:
+        return False
+
+    if group.status == "opening":
+        mt5_side = "sell" if group.direction == "long_hyperliquid_short_mt5" else "buy"
+        order_type = mapping.mt5_open_order_type
+        reduce_only = False
+        success_status = "open"
+        success_event = "opened_reconciled"
+        pending_event = "orders_pending"
+        failure_title = "MT5 开仓补单失败"
+        success_detail = "Hyperliquid 成交后 MT5 开仓补单完成"
+    else:
+        mt5_side = "buy" if group.direction == "long_hyperliquid_short_mt5" else "sell"
+        order_type = mapping.mt5_close_order_type
+        reduce_only = True
+        success_status = "closed"
+        success_event = "closed_reconciled"
+        pending_event = "close_pending"
+        failure_title = "MT5 平仓补单失败"
+        success_detail = "Hyperliquid 平仓成交后 MT5 平仓补单完成"
+
+    mt5_order = _submit_order_for_group(
+        db,
+        group,
+        platform="mt5",
+        side=mt5_side,
+        quantity=mt5_quantity,
+        order_type=order_type,
+        venue_symbol=mapping.mt5_symbol,
+        reduce_only=reduce_only,
+    )
+    detail = f"Hyperliquid 后续成交 {hyper_fill_quantity}/{hyper_target_quantity}，已按比例提交 MT5 {'平仓' if reduce_only else '开仓'}补单: {mt5_order.status}"
+    db.add(HedgeGroupEvent(hedge_group_id=group.id, event_type=event_type, detail=detail))
+    if _order_has_position_effect(db, mt5_order):
+        group.status = success_status
+        group.fees += _orders_fee(db, [hyper_order, mt5_order])
+        if success_status == "open":
+            group.opened_at = group.opened_at or datetime.utcnow()
+            actual_entry_spread = actual_entry_spread_from_fills(db, group)
+            if actual_entry_spread is not None:
+                group.entry_spread = actual_entry_spread
+        else:
+            group.closed_at = group.closed_at or datetime.utcnow()
+            group.realized_pnl = realized_pnl_from_fills(db, group)
+            if group.realized_pnl is None:
+                group.realized_pnl = group.unrealized_pnl - group.fees - group.funding - group.swap
+            group.unrealized_pnl = 0.0
+        db.add(HedgeGroupEvent(hedge_group_id=group.id, event_type=success_event, detail=success_detail))
+    elif mt5_order.status in PENDING_ORDER_STATUSES:
+        db.add(HedgeGroupEvent(hedge_group_id=group.id, event_type=pending_event, detail=detail))
+    else:
+        group.status = "manual_intervention"
+        if reduce_only:
+            group.close_reason = f"平仓 MT5 补单失败: {group.close_reason}; {mt5_order.error_message or ''}"
+        db.add(Alert(level="critical", title=failure_title, message=f"{group.symbol} 对冲组 #{group.id} {detail}; {mt5_order.error_message or ''}"))
+        db.add(HedgeGroupEvent(hedge_group_id=group.id, event_type="manual_intervention", detail=detail))
+    return True
+
+
+def _submit_order_for_group(
+    db: Session,
+    group: HedgeGroup,
+    *,
+    platform: str,
+    side: str,
+    quantity: float,
+    order_type: str,
+    venue_symbol: str,
+    reduce_only: bool = False,
+) -> Order:
+    order = Order(
         hedge_group_id=group.id,
-        platform=filled_order.platform,
-        symbol=filled_order.symbol,
+        platform=platform,
+        symbol=group.symbol,
         side=side,
         quantity=quantity,
-        order_type="market",
-        reduce_only=True,
+        order_type=order_type,
+        reduce_only=reduce_only,
         status="new",
     )
-    db.add(compensation)
+    db.add(order)
     db.flush()
-    adapter = _adapter_for_order(filled_order.platform, group.execution_mode == "live")
+    adapter = _adapter_for_order(platform, group)
     gateway = build_execution_gateway(adapter)
     result = gateway.submit_order(
         LegOrderIntent(
-            platform=filled_order.platform,
-            symbol=filled_order.symbol,
+            platform=platform,
+            symbol=group.symbol,
             side=side,
             quantity=quantity,
             venue_symbol=venue_symbol,
-            order_type="market",
-            reduce_only=True,
+            order_type=order_type,
+            reduce_only=reduce_only,
             hedge_group_id=group.id,
         )
     )
-    compensation.status = result.adapter_result.status
-    compensation.external_order_id = result.adapter_result.external_order_id
-    compensation.price = result.adapter_result.average_price or None
-    compensation.error_message = result.adapter_result.error_message
+    order.status = result.adapter_result.status
+    order.external_order_id = result.adapter_result.external_order_id
+    order.price = result.adapter_result.average_price or None
+    order.error_message = result.adapter_result.error_message
     for fill_event in result.fill_events:
         db.add(
             Fill(
-                order_id=compensation.id,
+                order_id=order.id,
                 platform=fill_event.platform,
                 symbol=fill_event.symbol,
                 side=fill_event.side,
@@ -413,7 +555,14 @@ def _submit_compensation_order(db: Session, group: HedgeGroup, filled_order: Ord
                 fee=fill_event.fee,
             )
         )
-    return compensation
+    return order
+
+
+def _submit_compensation_order(db: Session, group: HedgeGroup, filled_order: Order, mapping: SymbolMapping | None) -> Order:
+    side = "sell" if filled_order.side == "buy" else "buy"
+    quantity = _order_fill_quantity(db, filled_order.id) or filled_order.quantity
+    venue_symbol = _venue_symbol_for_order(group, filled_order, mapping)
+    return _submit_order_for_group(db, group, platform=filled_order.platform, side=side, quantity=quantity, order_type="market", venue_symbol=venue_symbol, reduce_only=True)
 
 
 def _venue_symbol_for_order(group: HedgeGroup, order: Order, mapping: SymbolMapping | None) -> str:
@@ -455,10 +604,14 @@ def _escalate_stale_unreconstructable_group(db: Session, group: HedgeGroup, orde
     return True
 
 
-def _adapter_for_order(platform: str, live: bool):
+def _adapter_for_order(platform: str, group: HedgeGroup):
+    live = group.execution_mode == "live"
+    simulated = group.execution_mode == "paper"
     if platform == "mt5":
-        return MT5Adapter(live=live)
-    return HyperliquidAdapter(live=live)
+        return MT5Adapter(live=live, demo=simulated)
+    adapter = HyperliquidAdapter(live=live)
+    setattr(adapter, "simulated", simulated)
+    return adapter
 
 
 def _cancel_pending_orders(group: HedgeGroup, orders) -> list[str]:
@@ -466,7 +619,7 @@ def _cancel_pending_orders(group: HedgeGroup, orders) -> list[str]:
     for order in orders:
         if order.status not in PENDING_ORDER_STATUSES or not order.external_order_id:
             continue
-        adapter = _adapter_for_order(order.platform, group.execution_mode == "live")
+        adapter = _adapter_for_order(order.platform, group)
         gateway = build_execution_gateway(adapter)
         if gateway.cancel_order(order.platform, order.external_order_id):
             order.status = "canceled"

@@ -67,10 +67,29 @@ function toHedgeGroup(item: HedgePoolItem): V2HedgeGroup {
     id: item.id,
     symbol: item.symbol,
     status: toHedgeStatus(item),
+    sortStage: item.stage,
     pnl: Number(item.unrealized_pnl || 0),
+    triggerSpread: item.trigger_spread == null ? undefined : Number(item.trigger_spread),
     entrySpread: Number(item.entry_spread || 0),
-    currentSpread: Number(item.exit_target || 0),
+    currentSpread: item.current_close_spread == null ? undefined : Number(item.current_close_spread),
   };
+}
+
+const hedgeStageOrder: Record<string, number> = {
+  pending: 0,
+  opening: 1,
+  open: 2,
+  ready_to_close: 3,
+  closing: 4,
+  manual: 5,
+};
+
+function sortHedgeGroups(a: V2HedgeGroup, b: V2HedgeGroup): number {
+  const stageDiff = (hedgeStageOrder[a.sortStage] ?? 99) - (hedgeStageOrder[b.sortStage] ?? 99);
+  if (stageDiff !== 0) return stageDiff;
+  const symbolDiff = a.symbol.localeCompare(b.symbol);
+  if (symbolDiff !== 0) return symbolDiff;
+  return a.id - b.id;
 }
 
 function laneCount(data: PipelineDiagnostics, key: string): number {
@@ -78,7 +97,7 @@ function laneCount(data: PipelineDiagnostics, key: string): number {
 }
 
 export function toV2DashboardData(data: PipelineDiagnostics): V2DashboardData {
-  const hedgeGroups = data.pool.items.map(toHedgeGroup);
+  const hedgeGroups = data.pool.items.map(toHedgeGroup).sort(sortHedgeGroups);
   const floatingPnl = hedgeGroups.reduce((sum, item) => sum + Number(item.pnl || 0), 0);
   const usedMargin = data.pool.items.reduce((sum, item) => sum + Number(item.notional || 0), 0);
   return {

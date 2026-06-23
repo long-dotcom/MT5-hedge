@@ -59,7 +59,12 @@ export type HedgePoolItem = {
   execution_mode: string;
   notional: number;
   quantity: number;
+  trigger_spread?: number | null;
   entry_spread: number;
+  current_entry_spread?: number | null;
+  current_close_spread?: number | null;
+  quote_time_diff_ms?: number | null;
+  quote_age_ms?: number | null;
   exit_target: number;
   realized_pnl: number;
   unrealized_pnl: number;

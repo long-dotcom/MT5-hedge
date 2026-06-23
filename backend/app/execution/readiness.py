@@ -20,7 +20,7 @@ def live_execution_readiness(db: Session, settings: Settings | None = None) -> d
     settings = settings or get_settings()
     checks: list[ReadinessCheck] = []
     checks.extend(_global_live_checks(db))
-    checks.extend(_hyperliquid_nautilus_checks(settings))
+    checks.extend(_hyperliquid_live_checks(settings))
     checks.extend(_mt5_checks(settings))
     checks.extend(_symbol_mapping_checks(db))
     checks.extend(_position_safety_checks(db))
@@ -35,7 +35,7 @@ def live_execution_readiness(db: Session, settings: Settings | None = None) -> d
 def paper_execution_readiness(db: Session, settings: Settings | None = None) -> dict:
     settings = settings or get_settings()
     checks: list[ReadinessCheck] = []
-    checks.extend(_hyperliquid_sandbox_checks(settings))
+    checks.extend(_hyperliquid_paper_checks(db))
     checks.extend(_mt5_demo_checks(settings))
     checks.extend(_symbol_mapping_checks(db))
     overall = _overall_status(checks)
@@ -58,64 +58,32 @@ def _global_live_checks(db: Session) -> list[ReadinessCheck]:
     ]
 
 
-def _hyperliquid_nautilus_checks(settings: Settings) -> list[ReadinessCheck]:
+def _hyperliquid_live_checks(settings: Settings) -> list[ReadinessCheck]:
     user = _hyperliquid_user_address(settings)
     checks = [
         ReadinessCheck(
-            "nautilus_hyperliquid_enabled",
-            "ok" if settings.nautilus_hyperliquid_enabled else "block",
-            "NautilusTrader Hyperliquid gateway 已启用" if settings.nautilus_hyperliquid_enabled else "NAUTILUS_HYPERLIQUID_ENABLED 未开启",
-        ),
-        ReadinessCheck(
-            "nautilus_hyperliquid_submit_enabled",
-            "ok" if settings.nautilus_hyperliquid_submit_enabled else "block",
-            "NautilusTrader Hyperliquid 实盘提交已开启" if settings.nautilus_hyperliquid_submit_enabled else "NAUTILUS_HYPERLIQUID_SUBMIT_ENABLED 未开启",
-        ),
-        ReadinessCheck(
-            "nautilus_hyperliquid_private_key",
-            "ok" if settings.nautilus_hyperliquid_private_key else "block",
-            "NautilusTrader Hyperliquid private key 已配置" if settings.nautilus_hyperliquid_private_key else "NAUTILUS_HYPERLIQUID_PRIVATE_KEY 未配置",
-        ),
-        ReadinessCheck(
             "hyperliquid_account_address",
             "ok" if user else "block",
-            "Hyperliquid 账户地址已配置" if user else "HYPERLIQUID_ACCOUNT_ADDRESS 或 NAUTILUS_HYPERLIQUID_VAULT_ADDRESS 未配置，无法做账户级回查",
+            "Hyperliquid 账户地址已配置" if user else "HYPERLIQUID_ACCOUNT_ADDRESS 未配置，无法做账户级回查",
         ),
+        ReadinessCheck("hyperliquid_live_order_submit", "block", "Hyperliquid 实盘下单 SDK 已移除，当前只允许只读账户/仓位检查"),
     ]
-    try:
-        import_module("nautilus_trader.adapters.hyperliquid")
-        checks.append(ReadinessCheck("nautilus_trader_import", "ok", "nautilus_trader Hyperliquid adapter 可导入"))
-    except Exception as exc:
-        checks.append(ReadinessCheck("nautilus_trader_import", "block", f"nautilus_trader Hyperliquid adapter 不可导入: {exc}"))
     if user:
         checks.append(_hyperliquid_read_probe(settings, user))
     return checks
 
 
-def _hyperliquid_sandbox_checks(settings: Settings) -> list[ReadinessCheck]:
-    checks = [
+def _hyperliquid_paper_checks(db: Session) -> list[ReadinessCheck]:
+    mappings = db.query(SymbolMapping).filter(SymbolMapping.enabled.is_(True)).all()
+    if not mappings:
+        return [ReadinessCheck("hyperliquid_paper_matching", "block", "没有启用的品种映射，无法进行 Hyperliquid paper 撮合")]
+    return [
         ReadinessCheck(
-            "nautilus_hyperliquid_enabled",
-            "ok" if settings.nautilus_hyperliquid_enabled else "block",
-            "NautilusTrader Hyperliquid 数据网关已启用" if settings.nautilus_hyperliquid_enabled else "NAUTILUS_HYPERLIQUID_ENABLED 未开启",
+            "hyperliquid_paper_matching",
+            "ok",
+            f"Hyperliquid paper 使用本地 QuoteCache 撮合，已启用 {len(mappings)} 个品种",
         )
     ]
-    try:
-        import_module("nautilus_trader.adapters.hyperliquid")
-        import_module("nautilus_trader.adapters.sandbox.config")
-        import_module("nautilus_trader.adapters.sandbox.factory")
-        checks.append(ReadinessCheck("nautilus_sandbox_import", "ok", "nautilus_trader Hyperliquid + sandbox 可导入"))
-    except Exception as exc:
-        checks.append(ReadinessCheck("nautilus_sandbox_import", "block", f"nautilus_trader sandbox 不可导入: {exc}"))
-    balances = str(getattr(settings, "nautilus_hyperliquid_sim_starting_balances", "") or "").strip()
-    checks.append(
-        ReadinessCheck(
-            "nautilus_sandbox_starting_balances",
-            "ok" if balances else "warn",
-            f"Nautilus sandbox 初始资金: {balances}" if balances else "未配置 NAUTILUS_HYPERLIQUID_SIM_STARTING_BALANCES，将使用默认 100000 USD",
-        )
-    )
-    return checks
 
 
 def _mt5_checks(settings: Settings) -> list[ReadinessCheck]:
@@ -263,7 +231,7 @@ def _position_label(position: Position) -> str:
 
 
 def _hyperliquid_user_address(settings: Settings) -> str:
-    return settings.hyperliquid_account_address or settings.nautilus_hyperliquid_vault_address
+    return settings.hyperliquid_account_address
 
 
 def _hyperliquid_read_probe(settings: Settings, user: str) -> ReadinessCheck:

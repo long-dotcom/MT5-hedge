@@ -8,12 +8,21 @@ from sqlalchemy.orm import Session
 
 from app.config.settings import get_settings
 from app.db.models import ArbitrageOpportunity, HedgeGroup, SpreadCurrent, SymbolMapping
+from app.market.hedge_spreads import hedge_group_spreads
 from app.market.mt5_sessions import mt5_session_state
 from app.market.quotes import quote_cache
 from app.market.scan_state import scan_state_store
 
 
 ACTIVE_GROUP_STATUSES = {"pending_open", "opening", "open", "open_partial", "closing", "manual_intervention"}
+POOL_STAGE_ORDER = {
+    "pending": 0,
+    "opening": 1,
+    "open": 2,
+    "ready_to_close": 3,
+    "closing": 4,
+    "manual": 5,
+}
 ACTIVE_OPPORTUNITY_STATUSES = {"candidate", "executable", "executing"}
 
 
@@ -87,7 +96,7 @@ def _active_groups(db: Session) -> list[HedgeGroup]:
     return (
         db.query(HedgeGroup)
         .filter(HedgeGroup.status.in_(ACTIVE_GROUP_STATUSES))
-        .order_by(desc(HedgeGroup.updated_at))
+        .order_by(HedgeGroup.symbol.asc(), HedgeGroup.id.asc())
         .limit(30)
         .all()
     )
@@ -331,7 +340,7 @@ def _best_opportunity(rows: list[dict[str, Any]]) -> dict[str, Any] | None:
 
 
 def _pool_payload(groups: list[HedgeGroup], now: datetime) -> dict[str, Any]:
-    items = [_group_payload(group, now) for group in groups]
+    items = sorted((_group_payload(group, now) for group in groups), key=_pool_item_sort_key)
     lanes = [
         {"key": "pending", "label": "待执行", "count": _lane_count(items, "pending")},
         {"key": "opening", "label": "建仓中", "count": _lane_count(items, "opening")},
@@ -343,8 +352,17 @@ def _pool_payload(groups: list[HedgeGroup], now: datetime) -> dict[str, Any]:
     return {"items": items, "lanes": lanes, "active_total": len(items)}
 
 
+def _pool_item_sort_key(item: dict[str, Any]) -> tuple[int, str, int]:
+    return (
+        POOL_STAGE_ORDER.get(str(item.get("stage") or ""), 99),
+        str(item.get("symbol") or ""),
+        int(item.get("id") or 0),
+    )
+
+
 def _group_payload(group: HedgeGroup, now: datetime) -> dict[str, Any]:
     stage = _group_stage(group)
+    spreads = hedge_group_spreads(group)
     return {
         "id": group.id,
         "symbol": group.symbol,
@@ -355,7 +373,12 @@ def _group_payload(group: HedgeGroup, now: datetime) -> dict[str, Any]:
         "execution_mode": group.execution_mode,
         "notional": group.notional,
         "quantity": group.quantity,
+        "trigger_spread": group.trigger_spread,
         "entry_spread": group.entry_spread,
+        "current_entry_spread": spreads["current_entry_spread"],
+        "current_close_spread": spreads["current_close_spread"],
+        "quote_time_diff_ms": spreads["quote_time_diff_ms"],
+        "quote_age_ms": spreads["quote_age_ms"],
         "exit_target": group.exit_target,
         "realized_pnl": group.realized_pnl,
         "unrealized_pnl": group.unrealized_pnl,

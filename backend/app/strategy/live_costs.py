@@ -101,7 +101,7 @@ def _hyperliquid_user_fee_rates() -> tuple[float, float]:
     cached_at, cached = _hl_user_fee_cache
     if cached and now - cached_at < settings.cost_cache_ttl_seconds:
         return cached
-    account_address = settings.hyperliquid_account_address or settings.nautilus_hyperliquid_vault_address
+    account_address = settings.hyperliquid_account_address
     if not account_address:
         return settings.hyperliquid_default_taker_fee_rate, settings.hyperliquid_default_maker_fee_rate
     try:
@@ -151,6 +151,8 @@ def _hyperliquid_effective_fee_rates(symbol: str, taker: float, maker: float, as
     growth_mode = str(meta.get("growthMode", "")).lower() == "enabled"
 
     if dex == "xyz":
+        if not meta:
+            return taker * 0.2, maker * 0.2, "hyperliquid_userFees+xyz_growth_fee_multiplier_fallback"
         multiplier = 0.2 if growth_mode else 2.0
         mode = "growth" if growth_mode else "standard"
         return taker * multiplier, maker * multiplier, f"hyperliquid_userFees+xyz_{mode}_fee_multiplier"

@@ -2,15 +2,20 @@ import hashlib
 import random
 import time
 from datetime import datetime
+from typing import Callable
 
 from app.adapters.base import Account, AdapterOrder, AdapterOrderResult, Ticker
+from app.config.settings import get_settings
+from app.market.orderbook import order_book_cache, simulate_market_fill
 from app.market.quotes import quote_cache
+from app.strategy.live_costs import HyperliquidCostInputs, hyperliquid_cost_inputs
 
 
 class PaperAdapter:
-    def __init__(self, platform: str, price_bias_bps: float = 0.0) -> None:
+    def __init__(self, platform: str, price_bias_bps: float = 0.0, fee_rate_provider: Callable[[str], HyperliquidCostInputs] | None = None) -> None:
         self.platform = platform
         self.price_bias_bps = price_bias_bps
+        self._fee_rate_provider = fee_rate_provider or hyperliquid_cost_inputs
         self._orders: dict[str, AdapterOrderResult] = {}
 
     def get_symbols(self) -> list[str]:
@@ -65,8 +70,18 @@ class PaperAdapter:
                 return AdapterOrderResult(False, "", "unfilled", 0.0, 0.0, 0.0, "maker 挂单超时未成交")
             price = order.price or (ticker.bid if order.side.lower() == "buy" else ticker.ask)
         else:
-            price = ticker.ask if order.side.lower() == "buy" else ticker.bid
-        fee = abs(order.quantity * price) * 0.00035
+            if self.platform == "hyperliquid":
+                book = order_book_cache.latest(self.platform, order.symbol)
+                if book:
+                    fill = simulate_market_fill(book, order.side, order.quantity)
+                    if not fill.enough_liquidity:
+                        return AdapterOrderResult(False, "", "unfilled", fill.filled_quantity, fill.average_price, 0.0, f"L2 深度不足: 目标 {order.quantity:.8f}，可成交 {fill.filled_quantity:.8f}")
+                    price = fill.average_price
+                else:
+                    price = ticker.ask if order.side.lower() == "buy" else ticker.bid
+            else:
+                price = ticker.ask if order.side.lower() == "buy" else ticker.bid
+        fee = abs(order.quantity * price) * self._fee_rate(order)
         external_id = f"paper-{self.platform}-{len(self._orders) + 1}"
         result = AdapterOrderResult(
             success=True,
@@ -85,6 +100,21 @@ class PaperAdapter:
             return Ticker(symbol=symbol, bid=quote.bid, ask=quote.ask, depth_notional=quote.depth_notional, timestamp=quote.local_recv_ts)
         return self.get_ticker(symbol)
 
+    def _fee_rate(self, order: AdapterOrder) -> float:
+        if self.platform != "hyperliquid":
+            return 0.0
+        symbol = order.venue_symbol or order.symbol
+        if ":" not in symbol:
+            settings = get_settings()
+            return settings.hyperliquid_default_maker_fee_rate if _is_maker_order(order) else settings.hyperliquid_default_taker_fee_rate
+        try:
+            costs = self._fee_rate_provider(symbol)
+            return costs.maker_fee_rate if _is_maker_order(order) else costs.taker_fee_rate
+        except Exception:
+            settings = get_settings()
+            fallback = settings.hyperliquid_default_maker_fee_rate if _is_maker_order(order) else settings.hyperliquid_default_taker_fee_rate
+            return fallback * 0.2 if symbol.startswith("xyz:") else fallback
+
     def cancel_order(self, order_id: str) -> bool:
         return order_id in self._orders
 
@@ -97,3 +127,7 @@ class PaperAdapter:
         if not result:
             return []
         return [{"order_id": order_id, "quantity": result.filled_quantity, "price": result.average_price, "fee": result.fee}]
+
+
+def _is_maker_order(order: AdapterOrder) -> bool:
+    return order.order_type == "limit" and bool(order.post_only)

@@ -1,5 +1,6 @@
 import { ReloadOutlined } from '@ant-design/icons';
 import { Button, Select, Switch, Typography } from 'antd';
+import { fmtAdaptive, fmtSpread } from '../../utils/format';
 import type { V2DashboardData, V2HedgeGroup, V2LifecycleCounts, V2NodeStatus, V2PipelineSymbol } from './v2Types';
 
 function delayClass(ms: number) {
@@ -62,7 +63,7 @@ function PipelineRow({ data }: { data: V2PipelineSymbol }) {
           <strong>{data.symbol}</strong>
           <span>{directionText(data.direction)}</span>
         </div>
-        <div className={`v2-spread ${data.spread >= 0 ? 'positive' : 'negative'}`}>价差 {data.spread >= 0 ? '+' : ''}{data.spread.toFixed(2)}</div>
+        <div className={`v2-spread ${data.spread >= 0 ? 'positive' : 'negative'}`}>价差 {data.spread >= 0 ? '+' : ''}{fmtSpread(data.spread)}</div>
       </div>
       <div className="v2-row-flow">
         <div className="v2-sources">
@@ -97,7 +98,7 @@ function PipelineRow({ data }: { data: V2PipelineSymbol }) {
       {isBlocked && data.blockReason && <div className="v2-block-reason">{data.blockReason}</div>}
       {data.netPnl !== undefined && data.annualized !== undefined && data.pipelineStatus === 'normal' && (
         <div className="v2-row-profit">
-          <span>净利 <strong>{data.netPnl >= 0 ? '+' : ''}{data.netPnl.toFixed(2)}</strong></span>
+          <span>净利 <strong>{data.netPnl >= 0 ? '+' : ''}{fmtAdaptive(data.netPnl)}</strong></span>
           <span>年化 <strong>{data.annualized.toFixed(2)}%</strong></span>
         </div>
       )}
@@ -140,8 +141,8 @@ function HedgeCard({ group }: { group: V2HedgeGroup }) {
       <div className="v2-hedge-status"><i />{meta.label}</div>
       <div className="v2-hedge-pnl">PnL <strong className={(group.pnl || 0) >= 0 ? 'positive' : 'negative'}>{(group.pnl || 0) >= 0 ? '+' : ''}{(group.pnl || 0).toFixed(2)}</strong></div>
       {group.status === 'building' && <div className="v2-progress"><span style={{ width: '65%' }} /></div>}
-      {group.status === 'closable' && <div className="v2-hedge-note">✓ 达退出线 · 价差 {group.currentSpread?.toFixed(1)}</div>}
-      {(group.status === 'holding' || group.status === 'manual') && <div className="v2-hedge-note">入场 {group.entrySpread?.toFixed(1)} → 当前 {group.currentSpread?.toFixed(1)}</div>}
+      {group.status === 'closable' && <div className="v2-hedge-note">✓ 达退出线 · 价差 {fmtSpread(group.currentSpread)}</div>}
+      {(group.status === 'holding' || group.status === 'manual') && <div className="v2-hedge-note">触发 {fmtSpread(group.triggerSpread)} · 开仓 {fmtSpread(group.entrySpread)} → 当前 {fmtSpread(group.currentSpread)}</div>}
     </div>
   );
 }

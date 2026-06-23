@@ -6,9 +6,11 @@ from sqlalchemy.orm import Session
 
 from app.analytics.spreads import load_spread_points
 from app.config.settings import get_settings
-from app.db.models import HedgeGroup, StrategySetting, SystemLog, SystemSetting, WorkerRun
+from app.db.models import HedgeGroup, StrategySetting, SymbolMapping, SystemLog, SystemSetting, WorkerRun
 from app.db.retention import prune_table_by_id
 from app.execution.engine import close_hedge_group, paper_close_hedge_group
+from app.execution.pnl import pnl_from_close_spread
+from app.market.active_refresh import refresh_execution_quotes
 from app.market.quotes import quote_synchronizer
 from app.strategy.statistical_signal import _exit_target_with_profit_buffer, _percentile
 
@@ -76,20 +78,33 @@ def evaluate_auto_close(db: Session, strategy: StrategySetting, group: HedgeGrou
         max_age_ms=settings.quote_stale_ms,
     )
     if not synced:
-        return CloseEvaluation(False, sync_reason, 0.0, group.exit_target or 0.0, group.unrealized_pnl)
+        mapping = db.query(SymbolMapping).filter(SymbolMapping.symbol == group.symbol).first()
+        refreshed = refresh_execution_quotes(mapping) if mapping else []
+        if refreshed:
+            synced, sync_reason = quote_synchronizer.synchronized(
+                group.symbol,
+                mode="strict",
+                max_time_diff_ms=settings.strict_quote_sync_ms,
+                max_age_ms=settings.quote_stale_ms,
+            )
+        if not synced:
+            suffix = f"；执行前主动刷新: {','.join(refreshed)}" if refreshed else ""
+            return CloseEvaluation(False, f"{sync_reason}{suffix}", 0.0, group.exit_target or 0.0, group.unrealized_pnl)
 
     close_spread = _close_spread(group.direction, synced.hyperliquid.bid, synced.hyperliquid.ask, synced.mt5.bid, synced.mt5.ask)
     exit_target = group.exit_target or _fallback_exit_target(db, strategy, group)
-    entry_spread = group.entry_spread or group.entry_threshold
-    quantity = group.hyperliquid_quantity or group.quantity or 1.0
-    estimated_profit = (entry_spread - close_spread) * quantity - group.open_cost
+    estimated_profit = pnl_from_close_spread(group, close_spread)
     min_profit = strategy.auto_close_min_profit
     hold_expired = _hold_expired(group, strategy)
 
-    if exit_target <= 0:
-        return CloseEvaluation(False, "缺少退出线，等待更多统计样本", close_spread, exit_target, estimated_profit)
     if estimated_profit < min_profit:
         return CloseEvaluation(False, f"估算平仓利润不足: {estimated_profit:.2f} < {min_profit:.2f}", close_spread, exit_target, estimated_profit)
+    if exit_target <= 0:
+        if close_spread <= 0:
+            return CloseEvaluation(True, f"无统计退出线但价差已回到零轴: {close_spread:.2f} <= 0.00", close_spread, exit_target, estimated_profit)
+        if hold_expired:
+            return CloseEvaluation(True, f"缺少退出线但超过最大持仓时间且利润达标: {estimated_profit:.2f}", close_spread, exit_target, estimated_profit)
+        return CloseEvaluation(False, "缺少退出线，等待更多统计样本", close_spread, exit_target, estimated_profit)
     if close_spread <= exit_target:
         return CloseEvaluation(True, f"价差回归至退出线: {close_spread:.2f} <= {exit_target:.2f}", close_spread, exit_target, estimated_profit)
     if hold_expired:

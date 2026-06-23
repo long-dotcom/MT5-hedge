@@ -7,7 +7,6 @@ import time
 from datetime import datetime
 from datetime import timezone
 from typing import Any
-from urllib import request
 
 from loguru import logger
 
@@ -15,7 +14,7 @@ from app.adapters.hyperliquid import HyperliquidAdapter
 from app.adapters.mt5 import MT5Adapter
 from app.config.settings import get_settings
 from app.db.session import SessionLocal
-from app.market.nautilus_hyperliquid import ORDER_BOOK_OVERRIDE_MS, ORDER_BOOK_SOURCES, NautilusHyperliquidMarketDataBridge, market_symbols_from_mappings
+from app.market.orderbook import order_book_cache, parse_hyperliquid_levels
 from app.market.quotes import quote_cache
 from app.market.symbols import enabled_mappings
 
@@ -32,17 +31,7 @@ class MarketDataManager:
         self._running = True
         settings = get_settings()
         if settings.quote_source_mode == "live":
-            hyperliquid_source = settings.hyperliquid_market_data_source.strip().lower()
-            hyperliquid_fallback = settings.hyperliquid_market_data_fallback.strip().lower()
-            if hyperliquid_source == "nautilus":
-                self._start_thread("hyperliquid-nautilus", self._hyperliquid_nautilus_loop)
-                if settings.hyperliquid_l2book_fast_enabled:
-                    self._start_thread("hyperliquid-fast-l2book", self._hyperliquid_fast_l2book_loop)
-                if hyperliquid_fallback == "native":
-                    self._start_thread("hyperliquid-http-polling", self._hyperliquid_http_polling_loop)
-            else:
-                self._start_thread("hyperliquid-ws", self._hyperliquid_ws_loop)
-                self._start_thread("hyperliquid-http-polling", self._hyperliquid_http_polling_loop)
+            self._start_thread("hyperliquid-ws", self._hyperliquid_ws_loop)
             self._start_thread("mt5-polling", self._mt5_polling_loop)
         else:
             self._start_thread("paper-quotes", self._paper_loop)
@@ -82,6 +71,7 @@ class MarketDataManager:
             for mapping in mappings:
                 hl = hyperliquid.get_ticker(mapping.hyperliquid_symbol)
                 mt = mt5.get_ticker(mapping.mt5_symbol)
+                _put_synthetic_l2(mapping.symbol, hl.bid, hl.ask, hl.depth_notional, "paper")
                 quote_cache.put("hyperliquid", mapping.symbol, hl.bid, hl.ask, hl.depth_notional, "paper", hl.timestamp)
                 quote_cache.put("mt5", mapping.symbol, mt.bid, mt.ask, mt.depth_notional, "paper", mt.timestamp)
             time.sleep(interval)
@@ -132,79 +122,6 @@ class MarketDataManager:
                 source="hyperliquid_l2Book_fast",
             )
         )
-
-    def _hyperliquid_nautilus_loop(self) -> None:
-        bridge: NautilusHyperliquidMarketDataBridge | None = None
-        signature: tuple[tuple[str, str], ...] = ()
-        while not self._stop.is_set():
-            db = SessionLocal()
-            try:
-                mappings = enabled_mappings(db)
-                next_signature = tuple(sorted((item.symbol, item.hyperliquid_symbol) for item in mappings))
-                symbols = market_symbols_from_mappings(mappings)
-            finally:
-                db.close()
-            if next_signature != signature or (bridge is not None and not bridge.is_active()):
-                if bridge:
-                    bridge.stop()
-                signature = next_signature
-                bridge = NautilusHyperliquidMarketDataBridge(
-                    symbols,
-                    on_error=lambda exc: logger.error(f"Nautilus Hyperliquid 行情桥启动失败: {exc}"),
-                )
-                bridge.start()
-            time.sleep(5)
-        if bridge:
-            bridge.stop()
-
-    def _hyperliquid_http_polling_loop(self) -> None:
-        settings = get_settings()
-        interval = max(settings.hyperliquid_http_poll_interval_ms, 300) / 1000
-        while not self._stop.is_set():
-            db = SessionLocal()
-            try:
-                mappings = enabled_mappings(db)
-            finally:
-                db.close()
-            for mapping in mappings:
-                try:
-                    if self._has_fresh_hyperliquid_ws_quote(mapping.symbol):
-                        continue
-                    if ":" in mapping.hyperliquid_symbol:
-                        self._write_hyperliquid_dex_quote(mapping.symbol, mapping.hyperliquid_symbol)
-                    else:
-                        payload = json.dumps({"type": "l2Book", "coin": mapping.hyperliquid_symbol}).encode("utf-8")
-                        req = request.Request(
-                            settings.hyperliquid_info_url,
-                            data=payload,
-                            headers={"Content-Type": "application/json"},
-                            method="POST",
-                        )
-                        with request.urlopen(req, timeout=5) as resp:
-                            data = json.loads(resp.read().decode("utf-8"))
-                        levels = data.get("levels") if isinstance(data, dict) else data
-                        self._write_hyperliquid_levels(mapping.symbol, levels, "hyperliquid_http_l2Book")
-                except Exception as exc:
-                    logger.error(f"Hyperliquid HTTP 行情失败 {mapping.hyperliquid_symbol}: {exc}")
-            time.sleep(interval)
-
-    def _has_fresh_hyperliquid_ws_quote(self, symbol: str) -> bool:
-        quote = quote_cache.latest("hyperliquid", symbol)
-        if not quote or quote.source not in {
-            "hyperliquid_l2Book",
-            "hyperliquid_l2Book_fast",
-            "nautilus_all_dexs_asset_ctxs",
-            "nautilus_order_book",
-            "nautilus_order_book_depth",
-            "nautilus_order_book_deltas",
-            "nautilus_quote_tick",
-        }:
-            return False
-        age_ms = (datetime.utcnow() - quote.local_recv_ts).total_seconds() * 1000
-        max_age_ms = max(get_settings().quote_stale_ms, 1000)
-        if quote.source in ORDER_BOOK_SOURCES:
-            max_age_ms = max(max_age_ms, ORDER_BOOK_OVERRIDE_MS)
-        return age_ms <= max_age_ms
 
     async def _hyperliquid_l2book_main(self, *, fast: bool, hip3_only: bool, source: str) -> None:
         try:
@@ -274,44 +191,14 @@ class MarketDataManager:
         self._write_hyperliquid_levels(symbol, levels, source, _exchange_time_from_hyperliquid_ms(data.get("time")))
 
     def _write_hyperliquid_levels(self, symbol: str, levels: Any, source: str, exchange_ts: datetime | None = None) -> None:
-        if not levels or len(levels) < 2 or not levels[0] or not levels[1]:
+        bids, asks = parse_hyperliquid_levels(levels)
+        if not bids or not asks:
             return
-        bid_level = levels[0][0]
-        ask_level = levels[1][0]
-        bid = float(bid_level.get("px"))
-        ask = float(ask_level.get("px"))
-        bid_size = float(bid_level.get("sz", 0))
-        ask_size = float(ask_level.get("sz", 0))
+        bid, bid_size = bids[0]
+        ask, ask_size = asks[0]
         depth_notional = min(bid * bid_size, ask * ask_size)
+        order_book_cache.put("hyperliquid", symbol, bids, asks, source, exchange_ts)
         quote_cache.put("hyperliquid", symbol, bid, ask, depth_notional, source, exchange_ts)
-
-    def _write_hyperliquid_dex_quote(self, internal_symbol: str, hyperliquid_symbol: str) -> None:
-        settings = get_settings()
-        dex, _ = hyperliquid_symbol.split(":", 1)
-        payload = json.dumps({"type": "metaAndAssetCtxs", "dex": dex}).encode("utf-8")
-        req = request.Request(
-            settings.hyperliquid_info_url,
-            data=payload,
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        with request.urlopen(req, timeout=10) as resp:
-            meta, contexts = json.loads(resp.read().decode("utf-8"))
-        for asset, context in zip(meta.get("universe", []), contexts):
-            if asset.get("name") != hyperliquid_symbol:
-                continue
-            impact = context.get("impactPxs") or []
-            if len(impact) >= 2:
-                bid = float(impact[0])
-                ask = float(impact[1])
-            else:
-                mid = float(context.get("midPx") or context.get("markPx") or context.get("oraclePx"))
-                bid = mid
-                ask = mid
-            depth_notional = float(context.get("openInterest", 0.0)) * ((bid + ask) / 2)
-            quote_cache.put("hyperliquid", internal_symbol, bid, ask, depth_notional, "hyperliquid_metaAndAssetCtxs_dex", None)
-            return
-
 
 def _exchange_time_from_hyperliquid_ms(value: Any) -> datetime | None:
     try:
@@ -339,3 +226,13 @@ def hyperliquid_symbol_map(mappings, *, hip3_only: bool) -> dict[str, str]:
 
 
 market_data_manager = MarketDataManager()
+
+
+def _put_synthetic_l2(symbol: str, bid: float, ask: float, depth_notional: float, source: str) -> None:
+    levels = 10
+    mid = max((bid + ask) / 2, 1e-12)
+    step = max((ask - bid) / max(levels, 1), mid * 0.00002)
+    level_notional = max(depth_notional, mid * 1000) / levels
+    bids = [(bid - step * index, level_notional / max(bid - step * index, 1e-12)) for index in range(levels)]
+    asks = [(ask + step * index, level_notional / max(ask + step * index, 1e-12)) for index in range(levels)]
+    order_book_cache.put("hyperliquid", symbol, bids, asks, source)

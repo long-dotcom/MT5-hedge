@@ -6,8 +6,10 @@ from app.db.init_db import init_db
 from app.db.session import SessionLocal
 from app.execution.auto_closer import run_auto_close
 from app.execution.auto_executor import run_auto_execute
+from app.execution.carry_costs import run_carry_cost_sync
 from app.execution.reconciler import run_execution_reconcile
 from app.market.scanner import run_scan
+from app.strategy.statistical_signal import refresh_signal_stats_cache
 from app.workers.market_data import market_data_manager
 from app.workers.scheduler import start_scheduler, stop_scheduler
 
@@ -33,8 +35,10 @@ def on_startup() -> None:
     # 中文注释：启动时先执行一次扫描，让前端首次打开就能看到样例数据。
     db = SessionLocal()
     try:
+        refresh_signal_stats_cache(db)
         run_scan(db)
         run_auto_execute(db)
+        run_carry_cost_sync(db, force=True)
         run_auto_close(db)
         run_execution_reconcile(db)
     finally:

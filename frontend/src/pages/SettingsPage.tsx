@@ -146,7 +146,7 @@ export function SettingsPage() {
                   <Form.Item name="auto_close_enabled" label="自动平仓" valuePropName="checked"><Switch /></Form.Item>
                   <Form.Item name="auto_close_live_enabled" label="Live 自动平仓" valuePropName="checked"><Switch /></Form.Item>
                   <Form.Item name="exit_target_percentile" label="退出线低分位数"><InputNumber min={0.05} max={0.5} step={0.01} /></Form.Item>
-                  <Form.Item name="auto_close_unit_profit_buffer" label="每份平仓利润缓冲"><InputNumber min={0} step={1} /></Form.Item>
+                  <Form.Item name="auto_close_unit_profit_buffer" label="每份平仓利润缓冲"><InputNumber min={0} step={0.01} /></Form.Item>
                   <Form.Item name="auto_close_min_profit" label="自动平仓最小利润 USD"><InputNumber min={0} step={0.1} /></Form.Item>
                   <Form.Item name="auto_execute_confirm_ticks" label="确认次数"><InputNumber min={1} step={1} /></Form.Item>
                   <Form.Item name="auto_execute_min_hold_ms" label="最小持续毫秒"><InputNumber min={0} step={50} /></Form.Item>

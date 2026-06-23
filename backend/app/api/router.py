@@ -38,12 +38,14 @@ from app.db.models import (
 )
 from app.db.session import SessionLocal, get_db
 from app.diagnostics.pipeline import build_pipeline_diagnostics
+from app.execution.carry_costs import run_carry_cost_sync
 from app.execution.engine import close_hedge_group, open_hedge_group
 from app.execution.readiness import live_execution_readiness, paper_execution_readiness
 from app.execution.reconciler import run_execution_reconcile
 from app.market.scanner import run_scan
 from app.market.scan_state import scan_state_store
 from app.market.quotes import quote_cache
+from app.market.hedge_spreads import hedge_group_spreads
 from app.market.mt5_sessions import as_session_dict, mt5_session_state
 from app.config.settings import get_settings
 from app.schemas import AdoptPositionIn, CloseHedgeGroupIn, LiveTradingIn, LoginRequest, RiskModeIn, RiskSettingsIn, StrategySettingsIn, SymbolMappingIn, TokenResponse
@@ -338,7 +340,7 @@ def hedge_groups(_: User = Depends(get_current_user), db: Session = Depends(get_
     query = db.query(HedgeGroup)
     total = query.count()
     rows = query.order_by(desc(HedgeGroup.created_at)).offset((page - 1) * page_size).limit(page_size).all()
-    return {"total": total, "items": [as_dict(row) for row in rows]}
+    return {"total": total, "items": [_hedge_group_payload(row) for row in rows]}
 
 
 @router.get("/hedge-groups/{group_id}")
@@ -346,9 +348,15 @@ def hedge_group_detail(group_id: int, _: User = Depends(get_current_user), db: S
     group = db.get(HedgeGroup, group_id)
     if not group:
         raise HTTPException(status_code=404, detail="对冲组不存在")
-    data = as_dict(group)
+    data = _hedge_group_payload(group)
     data["events"] = [as_dict(row) for row in group.events]
     data["orders"] = [as_dict(row) for row in db.query(Order).filter(Order.hedge_group_id == group_id).all()]
+    return data
+
+
+def _hedge_group_payload(group: HedgeGroup) -> dict[str, Any]:
+    data = as_dict(group)
+    data.update(hedge_group_spreads(group))
     return data
 
 
@@ -473,10 +481,11 @@ def _position_has_live_group(db: Session, position: Position, mapping: SymbolMap
 
 @router.post("/execution/reconcile")
 def execution_reconcile(user: User = Depends(require_admin), db: Session = Depends(get_db)) -> dict[str, Any]:
+    cost_changed = run_carry_cost_sync(db, force=True)
     changed = run_execution_reconcile(db)
     audit(db, user.id, "run_execution_reconcile", "execution", str(changed))
     db.commit()
-    return {"status": "ok", "changed": changed}
+    return {"status": "ok", "changed": changed, "cost_changed": cost_changed}
 
 
 @router.get("/orders")

@@ -3,7 +3,7 @@ import { Button, Card, Descriptions, Space, Table, Tag, Typography, message } fr
 import type { ColumnsType } from 'antd/es/table';
 import { useState } from 'react';
 import { api } from '../api/client';
-import { fmtMoney, fmtNum, fmtSpread } from '../utils/format';
+import { executionModeLabel, fmtAdaptive, fmtMoney, fmtSpread } from '../utils/format';
 
 function statusTag(status: string) {
   const map: Record<string, { label: string; color: string }> = {
@@ -41,16 +41,13 @@ function directionTags(direction: string) {
 
 function fmtCarryCost(value?: number) {
   if (value === undefined || value === null || Number.isNaN(Number(value))) return '-';
-  const numeric = Number(value);
-  if (numeric > 0) return `付出 ${fmtMoney(numeric)}`;
-  if (numeric < 0) return `收到 ${fmtMoney(Math.abs(numeric))}`;
-  return fmtMoney(0);
+  return fmtMoney(-Number(value));
 }
 
 function detailItems(row: any) {
   return [
-    { key: 'mt5_quantity', label: 'MT5 数量', children: fmtNum(row.mt5_quantity, 4) },
-    { key: 'hyperliquid_quantity', label: 'HL 数量', children: fmtNum(row.hyperliquid_quantity, 6) },
+    { key: 'mt5_quantity', label: 'MT5 数量', children: fmtAdaptive(row.mt5_quantity, 2, 6) },
+    { key: 'hyperliquid_quantity', label: 'HL 数量', children: fmtAdaptive(row.hyperliquid_quantity, 4, 8) },
     { key: 'trigger_spread', label: '触发价差', children: fmtSpread(row.trigger_spread) },
     { key: 'entry_spread', label: '真实开仓价差', children: fmtSpread(row.entry_spread) },
     { key: 'current_entry_spread', label: '当前重新入场价差', children: row.current_entry_spread == null ? '-' : fmtSpread(row.current_entry_spread) },
@@ -100,15 +97,15 @@ export function HedgeGroupsPage() {
     { title: '品种', dataIndex: 'symbol', width: 92 },
     { title: '方向', dataIndex: 'direction', width: 168, render: directionTags },
     { title: '状态', dataIndex: 'status', width: 96, render: statusTag },
-    { title: '模式', dataIndex: 'execution_mode', width: 86 },
+    { title: '模式', dataIndex: 'execution_mode', width: 86, render: executionModeLabel },
     { title: '名义价值', dataIndex: 'notional', width: 112, align: 'right', render: fmtMoney },
-    { title: '数量', dataIndex: 'quantity', width: 92, align: 'right', render: (v) => fmtNum(v, 4) },
+    { title: '数量', dataIndex: 'quantity', width: 92, align: 'right', render: (v) => fmtAdaptive(v, 2, 6) },
     { title: '触发价差', dataIndex: 'trigger_spread', width: 112, align: 'right', render: fmtSpread },
     { title: '真实开仓价差', dataIndex: 'entry_spread', width: 132, align: 'right', render: fmtSpread },
     { title: '当前平仓价差', dataIndex: 'current_close_spread', width: 132, align: 'right', render: (v) => (v == null ? '-' : fmtSpread(v)) },
     { title: 'HL资金费', dataIndex: 'funding', width: 124, align: 'right', render: fmtCarryCost },
     { title: 'MT5隔夜费', dataIndex: 'swap', width: 124, align: 'right', render: fmtCarryCost },
-    { title: 'PnL', width: 112, align: 'right', render: (_, row) => fmtMoney((row.realized_pnl || 0) + (row.unrealized_pnl || 0)) },
+    { title: 'PnL', width: 112, align: 'right', render: (_, row) => fmtMoney(Number(row.realized_pnl || 0) + Number(row.unrealized_pnl || 0)) },
     { title: '操作', fixed: 'right', width: 100, render: (_, row) => <Button size="small" disabled={!['open', 'open_partial', 'manual_intervention'].includes(row.status)} onClick={() => close.mutate(row.id)}>平仓</Button> }
   ];
   return (

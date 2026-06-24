@@ -4,7 +4,7 @@ import type { ColumnsType } from 'antd/es/table';
 import ReactECharts from 'echarts-for-react';
 import { useMemo, useState } from 'react';
 import { api } from '../api/client';
-import { fmtChartTime, fmtLocalTime, fmtNum } from '../utils/format';
+import { fmtAdaptive, fmtChartTime, fmtLocalTime } from '../utils/format';
 
 function fmtMs(value?: number | null) {
   if (value === undefined || value === null || Number.isNaN(value)) return '-';
@@ -16,16 +16,24 @@ function fmtPct(value?: number | null) {
   return `${(value * 100).toFixed(1)}%`;
 }
 
+function fmtMid(value?: number | null) {
+  if (value === undefined || value === null || Number.isNaN(value) || value === 0) return '-';
+  return value.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 6 });
+}
+
 export function LeadLagPage() {
-  const [symbol, setSymbol] = useState('JP225');
+  const symbols = useQuery({ queryKey: ['symbols'], queryFn: async () => (await api.get('/markets/symbols')).data });
+  const [symbol, setSymbol] = useState<string>('');
   const [windowSeconds, setWindowSeconds] = useState(300);
   const [thresholdBps, setThresholdBps] = useState(3);
   const [minMove, setMinMove] = useState(0);
   const [maxLagMs, setMaxLagMs] = useState(2000);
+  const activeSymbol = symbol || symbols.data?.[0]?.symbol || '';
   const query = useQuery({
-    queryKey: ['lead-lag', symbol, windowSeconds, thresholdBps, minMove, maxLagMs],
-    queryFn: async () => (await api.get('/analytics/lead-lag', { params: { symbol, window_seconds: windowSeconds, threshold_bps: thresholdBps, min_move: minMove, max_lag_ms: maxLagMs } })).data,
-    refetchInterval: 2000
+    queryKey: ['lead-lag', activeSymbol, windowSeconds, thresholdBps, minMove, maxLagMs],
+    enabled: Boolean(activeSymbol),
+    queryFn: async () => (await api.get('/analytics/lead-lag', { params: { symbol: activeSymbol, window_seconds: windowSeconds, threshold_bps: thresholdBps, min_move: minMove, max_lag_ms: maxLagMs } })).data,
+    refetchInterval: 5000
   });
   const series = query.data?.series || [];
   const summary = query.data?.summary || {};
@@ -40,8 +48,8 @@ export function LeadLagPage() {
       grid: { left: 48, right: 42, top: 48, bottom: 60 },
       xAxis: { type: 'category', data: times },
       yAxis: [
-        { type: 'value', scale: true },
-        { type: 'value', scale: true }
+        { type: 'value', scale: true, name: '标准化', nameLocation: 'middle', nameGap: 36, axisLabel: { formatter: (v: number) => v.toFixed(2) } },
+        { type: 'value', scale: true, name: 'Mid差', nameLocation: 'middle', nameGap: 36 }
       ],
       dataZoom: [{ type: 'inside' }, { type: 'slider', height: 24 }],
       series: [
@@ -53,15 +61,15 @@ export function LeadLagPage() {
   }, [series]);
   const eventColumns: ColumnsType<any> = [
     { title: '时间', dataIndex: 'leader_time', width: 190, render: fmtLocalTime },
-    { title: '领先方', dataIndex: 'leader_platform', width: 120, render: (v) => <Tag color={v === 'hyperliquid' ? 'blue' : 'green'}>{v}</Tag> },
-    { title: '跟随方', dataIndex: 'follower_platform', width: 120 },
+    { title: '领先方', dataIndex: 'leader_platform', width: 120, render: (v) => <Tag color={v === 'hyperliquid' ? 'cyan' : 'geekblue'}>{v === 'hyperliquid' ? 'HL' : v === 'mt5' ? 'MT5' : v}</Tag> },
+    { title: '跟随方', dataIndex: 'follower_platform', width: 120, render: (v) => <Tag color={v === 'hyperliquid' ? 'cyan' : 'geekblue'}>{v === 'hyperliquid' ? 'HL' : v === 'mt5' ? 'MT5' : v}</Tag> },
     { title: '方向', dataIndex: 'direction', width: 80 },
     { title: '跟随', dataIndex: 'followed', width: 80, render: (v) => <Tag color={v ? 'green' : 'gold'}>{v ? '是' : '否'}</Tag> },
     { title: '滞后', dataIndex: 'lag_ms', width: 100, render: fmtMs },
-    { title: '领先跳动', dataIndex: 'leader_move', width: 110, render: (v) => fmtNum(v, 2) },
-    { title: '领先bps', dataIndex: 'leader_move_bps', width: 110, render: (v) => fmtNum(v, 2) },
-    { title: '跟随跳动', dataIndex: 'follower_move', width: 110, render: (v) => fmtNum(v, 2) },
-    { title: '期间最大Mid差', dataIndex: 'max_mid_diff', width: 130, render: (v) => fmtNum(v, 2) }
+    { title: '领先跳动', dataIndex: 'leader_move', width: 110, render: (v) => fmtAdaptive(v, 2, 6) },
+    { title: '领先bps', dataIndex: 'leader_move_bps', width: 110, render: (v) => fmtAdaptive(v, 2, 6) },
+    { title: '跟随跳动', dataIndex: 'follower_move', width: 110, render: (v) => fmtAdaptive(v, 2, 6) },
+    { title: '期间最大Mid差', dataIndex: 'max_mid_diff', width: 130, render: (v) => fmtAdaptive(v, 2, 6) }
   ];
   const hlToMt5 = summary.hyperliquid_to_mt5 || {};
   const mt5ToHl = summary.mt5_to_hyperliquid || {};
@@ -74,7 +82,7 @@ export function LeadLagPage() {
       <Card>
         <Form layout="inline">
           <Form.Item label="品种">
-            <Select value={symbol} onChange={setSymbol} style={{ width: 160 }} options={['JP225', 'SP500', 'BTC', 'ETH', 'OIL', 'SPCX'].map((value) => ({ value }))} />
+            <Select value={activeSymbol} onChange={setSymbol} style={{ width: 160 }} loading={symbols.isLoading} options={(symbols.data || []).map((row: any) => ({ value: row.symbol, label: row.symbol }))} />
           </Form.Item>
           <Form.Item label="窗口">
             <Select value={windowSeconds} onChange={setWindowSeconds} style={{ width: 120 }} options={[{ value: 60, label: '1分钟' }, { value: 300, label: '5分钟' }, { value: 900, label: '15分钟' }, { value: 1800, label: '30分钟' }]} />
@@ -91,8 +99,8 @@ export function LeadLagPage() {
         </Form>
       </Card>
       <Row gutter={[16, 16]}>
-        <Col xs={24} lg={6}><Card><Statistic title="HL 最新Mid" value={latest.hyperliquid?.mid || 0} precision={2} suffix={latest.hyperliquid?.source ? ` ${latest.hyperliquid.source}` : ''} /></Card></Col>
-        <Col xs={24} lg={6}><Card><Statistic title="MT5 最新Mid" value={latest.mt5?.mid || 0} precision={2} suffix={latest.mt5?.source ? ` ${latest.mt5.source}` : ''} /></Card></Col>
+        <Col xs={24} lg={6}><Card><Statistic title="HL 最新Mid" value={fmtMid(latest.hyperliquid?.mid)} suffix={latest.hyperliquid?.source ? ` ${latest.hyperliquid.source}` : ''} /></Card></Col>
+        <Col xs={24} lg={6}><Card><Statistic title="MT5 最新Mid" value={fmtMid(latest.mt5?.mid)} suffix={latest.mt5?.source ? ` ${latest.mt5.source}` : ''} /></Card></Col>
         <Col xs={24} lg={6}><Card><Statistic title="HL->MT5 平均滞后" value={fmtMs(hlToMt5.avg_lag_ms)} /></Card></Col>
         <Col xs={24} lg={6}><Card><Statistic title="MT5->HL 平均滞后" value={fmtMs(mt5ToHl.avg_lag_ms)} /></Card></Col>
       </Row>

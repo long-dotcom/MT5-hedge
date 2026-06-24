@@ -1,9 +1,9 @@
 import { ThunderboltOutlined } from '@ant-design/icons';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { Button, Card, Descriptions, Space, Table, Typography, message } from 'antd';
+import { Button, Card, Descriptions, Space, Table, Tag, Typography, message } from 'antd';
 import type { ColumnsType } from 'antd/es/table';
 import { api } from '../api/client';
-import { fmtLocalTime, fmtMoney, fmtPct } from '../utils/format';
+import { fmtLocalTime, fmtMoney, fmtPct, riskModeLabel, riskModeColor } from '../utils/format';
 
 export function RiskPage() {
   const queryClient = useQueryClient();
@@ -18,7 +18,7 @@ export function RiskPage() {
     }
   });
   const columns: ColumnsType<any> = [
-    { title: '等级', dataIndex: 'level' },
+    { title: '等级', dataIndex: 'level', render: (v) => <Tag color={v === 'critical' ? 'red' : v === 'warning' ? 'gold' : 'default'}>{v}</Tag> },
     { title: '规则', dataIndex: 'rule' },
     { title: '品种', dataIndex: 'symbol' },
     { title: '消息', dataIndex: 'message', ellipsis: true },
@@ -34,7 +34,7 @@ export function RiskPage() {
       </div>
       <Card>
         <Descriptions column={4} size="small">
-          <Descriptions.Item label="模式">{risk.mode}</Descriptions.Item>
+          <Descriptions.Item label="模式"><Tag color={riskModeColor(risk.mode)}>{riskModeLabel(risk.mode)}</Tag></Descriptions.Item>
           <Descriptions.Item label="单笔上限">{fmtMoney(risk.max_order_notional)}</Descriptions.Item>
           <Descriptions.Item label="品种敞口">{fmtMoney(risk.max_symbol_exposure)}</Descriptions.Item>
           <Descriptions.Item label="总杠杆">{risk.max_total_leverage}</Descriptions.Item>

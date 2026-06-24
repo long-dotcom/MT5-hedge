@@ -18,7 +18,7 @@ export function PipelinePage() {
   return (
     <Space direction="vertical" size={16} className="full-width pipeline-page">
       {query.isError && <Alert type="error" showIcon message="链路诊断加载失败" />}
-      {data && <PipelineDashboardV2 data={toV2DashboardData(data)} autoRefresh={autoRefresh} onAutoRefreshToggle={() => setAutoRefresh((value) => !value)} onRefresh={() => query.refetch()} loading={query.isFetching} />}
+      {data && <PipelineDashboardV2 data={toV2DashboardData(data)} autoRefresh={autoRefresh} onAutoRefreshToggle={() => setAutoRefresh((value) => !value)} />}
     </Space>
   );
 }

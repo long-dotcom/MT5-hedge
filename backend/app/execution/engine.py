@@ -12,7 +12,7 @@ from app.adapters.mt5 import mt5_market_order_check
 from app.config.settings import get_settings
 from app.db.models import Alert, ArbitrageOpportunity, Fill, HedgeGroup, HedgeGroupEvent, Order, StrategySetting, SymbolMapping, SystemSetting
 from app.execution.gateway import LegOrderIntent, build_execution_gateway
-from app.execution.pnl import actual_entry_spread_from_fills, realized_pnl_from_fills
+from app.execution.pnl import actual_entry_spread_from_fills, pnl_from_close_spread, realized_pnl_from_fills
 from app.execution.readiness import live_execution_readiness, paper_execution_readiness
 from app.market.active_refresh import refresh_execution_quotes
 from app.market.mt5_sessions import mt5_action_allowed, mt5_session_state
@@ -220,6 +220,41 @@ def _refreshed_opportunity_still_executable(opportunity: ArbitrageOpportunity, s
     if refreshed_net_profit < min_profit:
         return False, f"主动刷新后净利润不足: {refreshed_net_profit:.2f} < {min_profit:.2f}"
     return True, ""
+
+
+def _final_close_still_executable(db: Session, group: HedgeGroup, mapping: SymbolMapping, strategy: StrategySetting, reason: str) -> tuple[bool, str]:
+    settings = get_settings()
+    synced, sync_reason, refreshed = _strict_sync_for_execution(mapping, group.symbol, settings)
+    if not synced:
+        return False, sync_reason
+    close_spread = spreads_for_direction(
+        group.direction,
+        synced.hyperliquid.bid,
+        synced.hyperliquid.ask,
+        synced.mt5.bid,
+        synced.mt5.ask,
+    ).close_spread
+    exit_target = _effective_close_exit_target(group, mapping)
+    hold_expired = "超过最大持仓时间" in reason
+    if exit_target != 0 and close_spread > exit_target and not hold_expired:
+        suffix = "；执行前主动刷新" if refreshed else ""
+        return False, f"自动平仓最终复核失败{suffix}: 平仓价差 {close_spread:.6f} > 退出线 {exit_target:.6f}"
+    estimated_profit = pnl_from_close_spread(group, close_spread)
+    min_profit = float(strategy.auto_close_min_profit or 0.0)
+    if estimated_profit < min_profit:
+        suffix = "；执行前主动刷新" if refreshed else ""
+        return False, f"自动平仓最终复核失败{suffix}: 估算平仓利润 {estimated_profit:.2f} < {min_profit:.2f}"
+    return True, ""
+
+
+def _effective_close_exit_target(group: HedgeGroup, mapping: SymbolMapping) -> float:
+    group_target = float(group.exit_target or 0.0)
+    mapping_target = float(getattr(mapping, "max_close_spread", 0.0) or 0.0)
+    if mapping_target == 0:
+        return group_target
+    if group_target == 0:
+        return mapping_target
+    return min(group_target, mapping_target)
 
 
 def _execute_hyper_then_mt5_after_fill(
@@ -591,19 +626,19 @@ def _strategy_latency_snapshot(strategy: StrategySetting):
     )
 
 
-def close_hedge_group(db: Session, group_id: int, reason: str) -> HedgeGroup:
+def close_hedge_group(db: Session, group_id: int, reason: str, *, validate_final_close: bool = False) -> HedgeGroup:
     group = db.get(HedgeGroup, group_id)
     if not group:
         raise ValueError("对冲组不存在")
     if group.status not in {"open", "open_partial", "manual_intervention"}:
         raise ValueError("当前状态不允许平仓")
     if group.execution_mode == "paper":
-        return _execute_close_hedge_group(db, group, reason, live=False, simulated=True, estimated_realized_pnl=None, success_event_type="closed", pending_event_type="close_pending", failed_event_type="close_failed")
+        return _execute_close_hedge_group(db, group, reason, live=False, simulated=True, estimated_realized_pnl=None, success_event_type="closed", pending_event_type="close_pending", failed_event_type="close_failed", validate_final_close=validate_final_close)
     if group.execution_mode == "live":
         if not live_trading_enabled(db):
             raise ValueError("实盘平仓需要先开启 live_trading_enabled")
         _ensure_live_execution_ready(db)
-        return _execute_close_hedge_group(db, group, reason, live=True, simulated=False, estimated_realized_pnl=None, success_event_type="closed", pending_event_type="close_pending", failed_event_type="close_failed")
+        return _execute_close_hedge_group(db, group, reason, live=True, simulated=False, estimated_realized_pnl=None, success_event_type="closed", pending_event_type="close_pending", failed_event_type="close_failed", validate_final_close=validate_final_close)
 
     group.status = "closed"
     group.closed_at = datetime.utcnow()
@@ -633,6 +668,7 @@ def paper_close_hedge_group(db: Session, group_id: int, reason: str, estimated_r
         success_event_type="auto_closed",
         pending_event_type="auto_close_pending",
         failed_event_type="auto_close_failed",
+        validate_final_close=True,
     )
 
 
@@ -647,6 +683,7 @@ def _execute_close_hedge_group(
     success_event_type: str,
     pending_event_type: str,
     failed_event_type: str,
+    validate_final_close: bool = False,
 ) -> HedgeGroup:
     mapping = db.query(SymbolMapping).filter(SymbolMapping.symbol == group.symbol).first()
     if not mapping:
@@ -657,6 +694,11 @@ def _execute_close_hedge_group(
         raise ValueError(mt5_close_reason)
 
     strategy = db.query(StrategySetting).first() or StrategySetting()
+    if validate_final_close:
+        final_ok, final_reason = _final_close_still_executable(db, group, mapping, strategy, reason)
+        if not final_ok:
+            record_risk_event(db, "auto_close_final_quote_check", final_reason, group.symbol)
+            raise ValueError(final_reason)
     hl_side, mt5_side = _close_sides(group.direction)
     if simulated:
         _ensure_paper_execution_ready(db)

@@ -51,7 +51,7 @@ def run_auto_close(db: Session) -> int:
             if not evaluation.should_close:
                 continue
             if group.execution_mode == "live":
-                close_hedge_group(db, group.id, f"auto_live: {evaluation.reason}")
+                close_hedge_group(db, group.id, f"auto_live: {evaluation.reason}", validate_final_close=True)
                 db.add(SystemLog(level="info", category="auto_close", message=f"自动实盘平仓已提交: {group.symbol} #{group.id}", context=evaluation.reason))
             else:
                 paper_close_hedge_group(db, group.id, evaluation.reason, evaluation.estimated_profit)

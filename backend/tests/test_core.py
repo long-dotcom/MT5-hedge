@@ -19,7 +19,7 @@ from app.execution.auto_closer import evaluate_auto_close, run_auto_close
 from app.execution.auto_executor import run_auto_execute
 from app.execution.carry_costs import _mt5_swap_cost, _paper_hyperliquid_funding_cost
 from app.execution import gateway as gateway_module
-from app.execution.engine import _execution_adapters, _has_position_effect, _is_pending_result, _maker_price, close_hedge_group, open_hedge_group
+from app.execution.engine import _effective_close_exit_target, _execution_adapters, _final_close_still_executable, _has_position_effect, _is_pending_result, _maker_price, close_hedge_group, open_hedge_group
 from app.execution.gateway import AdapterExecutionGateway, FillEvent, GatewayOrderResult, LegOrderIntent, OrderEvent, build_execution_gateway
 from app.execution.readiness import live_execution_readiness, paper_execution_readiness
 from app.execution.reconciler import reconcile_hedge_group, reconcile_orphan_positions, reconcile_residual_positions, sync_live_positions
@@ -2837,6 +2837,43 @@ def test_auto_close_fallback_uses_symbol_max_close_spread_without_samples(monkey
 
     assert evaluation.exit_target == 10
     assert evaluation.should_close is True
+
+
+def test_auto_close_final_check_uses_current_symbol_max_close_spread(monkeypatch) -> None:
+    engine = create_engine("sqlite:///:memory:", future=True)
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine, future=True)
+    with Session() as db:
+        strategy = StrategySetting(auto_close_min_profit=0)
+        mapping = SymbolMapping(symbol="SPCX", hyperliquid_symbol="xyz:SPCX", mt5_symbol="SPCX", max_close_spread=-0.11)
+        group = HedgeGroup(
+            symbol="SPCX",
+            direction="long_mt5_short_hyperliquid",
+            status="open",
+            execution_mode="paper",
+            notional=2000,
+            quantity=0.13,
+            mt5_quantity=0.13,
+            hyperliquid_quantity=13,
+            entry_spread=0.14,
+            exit_target=0.047,
+            fees=0.18,
+            opened_at=datetime.utcnow(),
+        )
+        db.add_all([strategy, mapping, group])
+        db.commit()
+        synced = SimpleNamespace(
+            hyperliquid=SimpleNamespace(bid=157.58, ask=157.59, local_recv_ts=datetime.utcnow()),
+            mt5=SimpleNamespace(bid=157.59, ask=157.65, local_recv_ts=datetime.utcnow()),
+            time_diff_ms=0,
+        )
+        monkeypatch.setattr("app.execution.engine.quote_synchronizer.synchronized", lambda *args, **kwargs: (synced, ""))
+
+        ok, reason = _final_close_still_executable(db, group, mapping, strategy, "平仓价差回归至退出线: 0.00 <= 0.05")
+
+    assert _effective_close_exit_target(group, mapping) == pytest.approx(-0.11)
+    assert ok is False
+    assert "平仓价差 0.000000 > 退出线 -0.110000" in reason
 
 
 def test_scanner_records_two_direction_current_rows(monkeypatch) -> None:

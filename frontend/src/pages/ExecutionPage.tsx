@@ -29,18 +29,18 @@ function statusTag(status?: string) {
 }
 
 function orderTypeTag(orderType?: string) {
-  if (orderType === 'market') return <Tag>市价</Tag>;
-  if (orderType === 'limit') return <Tag>限价</Tag>;
+  if (orderType === 'market') return <Tag color="blue">市价</Tag>;
+  if (orderType === 'limit') return <Tag color="orange">限价</Tag>;
   return <Tag>{orderType || '-'}</Tag>;
 }
 
 function orderDetailItems(row: any) {
   return [
+    { key: 'external_order_id', label: '外部单号', children: row.external_order_id || '-' },
     { key: 'post_only', label: 'Post-only', children: row.post_only ? <Tag color="purple">是</Tag> : '-' },
     { key: 'reduce_only', label: 'Reduce-only', children: row.reduce_only ? <Tag color="orange">是</Tag> : '-' },
-    { key: 'ttl_seconds', label: 'TTL 秒', children: row.ttl_seconds ?? '-' },
-    { key: 'external_order_id', label: '外部单号', children: row.external_order_id || '-' },
     { key: 'error_message', label: '错误信息', children: row.error_message || '-' },
+    { key: 'ttl_seconds', label: 'TTL 秒', children: row.ttl_seconds ?? '-' },
     { key: 'updated_at', label: '更新时间', children: fmtLocalTime(row.updated_at) }
   ];
 }
@@ -48,6 +48,7 @@ function orderDetailItems(row: any) {
 export function ExecutionPage() {
   const [orderPage, setOrderPage] = useState(1);
   const [fillPage, setFillPage] = useState(1);
+  const [activeTab, setActiveTab] = useState('orders');
   const orders = useQuery({ queryKey: ['orders', orderPage], queryFn: async () => (await api.get('/orders', { params: { page: orderPage, page_size: 20 } })).data });
   const fills = useQuery({ queryKey: ['fills', fillPage], queryFn: async () => (await api.get('/fills', { params: { page: fillPage, page_size: 20 } })).data });
 
@@ -81,6 +82,8 @@ export function ExecutionPage() {
       <Typography.Title level={3}>执行记录</Typography.Title>
       <Card>
         <Tabs
+          activeKey={activeTab}
+          onChange={(key) => { setActiveTab(key); setOrderPage(1); setFillPage(1); }}
           items={[
             {
               key: 'orders',

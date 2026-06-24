@@ -3,6 +3,7 @@ import { Alert, Button, Card, Collapse, Form, Input, InputNumber, List, Modal, P
 import type { ColumnsType } from 'antd/es/table';
 import { useState } from 'react';
 import { api } from '../api/client';
+import { RISK_MODE_MAP } from '../utils/format';
 
 export function SettingsPage() {
   const queryClient = useQueryClient();
@@ -260,7 +261,7 @@ export function SettingsPage() {
               label: '风控参数',
               children: (
                 <Form key={risk.data?.updated_at || 'risk-loading'} layout="vertical" className="settings-form" initialValues={risk.data} onFinish={(v) => saveRisk.mutate({ ...risk.data, ...v })}>
-                  <Form.Item name="mode" label="系统模式"><Select options={[{ value: 'normal' }, { value: 'reduce_only' }, { value: 'paused' }, { value: 'emergency_stop' }]} /></Form.Item>
+                  <Form.Item name="mode" label="系统模式"><Select options={Object.entries(RISK_MODE_MAP).map(([value, { label }]) => ({ value, label }))} /></Form.Item>
                   <Form.Item name="max_order_notional" label="单笔名义价值上限 USD"><InputNumber min={1} /></Form.Item>
                   <Form.Item name="max_slippage_bps" label="最大滑点 bps"><InputNumber min={0} /></Form.Item>
                   <Form.Item name="max_market_age_seconds" label="最大行情延迟秒"><InputNumber min={1} /></Form.Item>

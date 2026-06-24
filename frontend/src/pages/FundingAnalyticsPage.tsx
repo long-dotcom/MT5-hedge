@@ -46,11 +46,10 @@ function fmtChartRate(value: unknown) {
 
 export function FundingAnalyticsPage() {
   const symbols = useQuery({ queryKey: ['symbols'], queryFn: async () => (await api.get('/markets/symbols')).data });
-  const defaultSymbol = symbols.data?.[0]?.symbol || 'BTC';
-  const [symbol, setSymbol] = useState(defaultSymbol);
+  const [symbol, setSymbol] = useState<string>('');
   const [range, setRange] = useState('7d');
   const [bucket, setBucket] = useState('day');
-  const activeSymbol = symbol || defaultSymbol;
+  const activeSymbol = symbol || symbols.data?.[0]?.symbol || '';
 
   const query = useQuery({
     queryKey: ['funding-analytics', activeSymbol, range, bucket],

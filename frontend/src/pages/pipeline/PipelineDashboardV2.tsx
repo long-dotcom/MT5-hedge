@@ -1,5 +1,4 @@
-import { ReloadOutlined } from '@ant-design/icons';
-import { Button, Select, Switch, Typography } from 'antd';
+import { Switch, Typography } from 'antd';
 import { fmtAdaptive, fmtSpread } from '../../utils/format';
 import type { V2DashboardData, V2HedgeGroup, V2LifecycleCounts, V2NodeStatus, V2PipelineSymbol } from './v2Types';
 
@@ -237,20 +236,16 @@ export function PipelineDashboardV2({
   data,
   autoRefresh,
   onAutoRefreshToggle,
-  onRefresh,
-  loading,
 }: {
   data: V2DashboardData;
   autoRefresh: boolean;
   onAutoRefreshToggle: () => void;
-  onRefresh: () => void;
-  loading: boolean;
 }) {
   return (
     <div className="pipeline-v2">
       <div className="v2-topbar">
         <div className="v2-title"><h1>链路与对冲池</h1><span /><p>SSE 在线</p><em>最后推送：{data.sseStatus.lastPush}s 前</em></div>
-        <div className="v2-actions"><Button icon={<ReloadOutlined />} loading={loading} onClick={onRefresh}>刷新</Button><span>自动刷新</span><Switch checked={autoRefresh} onChange={onAutoRefreshToggle} /><Select value="5s" options={[{ value: '5s', label: '5s' }]} /></div>
+        <div className="v2-actions"><span>自动刷新</span><Switch checked={autoRefresh} onChange={onAutoRefreshToggle} /></div>
       </div>
       <SummaryCardsV2 data={data} />
       <div className="v2-main-grid">

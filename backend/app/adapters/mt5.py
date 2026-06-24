@@ -13,6 +13,13 @@ class MT5DemoCheck:
     server: str = ""
 
 
+@dataclass(frozen=True)
+class MT5OrderCheck:
+    allowed: bool
+    message: str
+    retcode: int | None = None
+
+
 class MT5Adapter(PaperAdapter):
     def __init__(self, live: bool = False, demo: bool = False) -> None:
         super().__init__("mt5", price_bias_bps=20.0)
@@ -215,6 +222,65 @@ def mt5_demo_order_check(mt5, settings) -> MT5DemoCheck:
     if expected_server and server.lower() != expected_server.lower():
         return MT5DemoCheck(False, f"当前 MT5 demo 服务器与 MT5_SERVER 不匹配: expected={expected_server}, actual={server}", login, server)
     return MT5DemoCheck(True, f"MT5 demo 账户检查通过: {login} {server}".strip(), login, server)
+
+
+def mt5_market_order_check(symbol: str, side: str, quantity: float, *, demo: bool = False, reduce_only: bool = False) -> MT5OrderCheck:
+    settings = get_settings()
+    try:
+        import MetaTrader5 as mt5  # type: ignore
+    except Exception as exc:
+        return MT5OrderCheck(False, f"MetaTrader5 包不可用: {exc}")
+
+    if not _initialize_mt5(mt5, settings):
+        return MT5OrderCheck(False, f"MT5 initialize 失败: {mt5.last_error()}")
+    if demo:
+        demo_check = mt5_demo_order_check(mt5, settings)
+        if not demo_check.allowed:
+            return MT5OrderCheck(False, demo_check.message)
+
+    if not mt5.symbol_select(symbol, True):
+        return MT5OrderCheck(False, f"MT5 symbol_select 失败: {symbol}; {mt5.last_error()}")
+    tick = mt5.symbol_info_tick(symbol)
+    if not tick:
+        return MT5OrderCheck(False, f"MT5 tick 不可用: {symbol}")
+
+    normalized_side = side.lower()
+    if normalized_side not in {"buy", "sell"}:
+        return MT5OrderCheck(False, f"MT5 不支持的方向: {side}")
+    order_type = mt5.ORDER_TYPE_BUY if normalized_side == "buy" else mt5.ORDER_TYPE_SELL
+    price = float(tick.ask if normalized_side == "buy" else tick.bid)
+    request = {
+        "action": mt5.TRADE_ACTION_DEAL,
+        "symbol": symbol,
+        "volume": float(quantity),
+        "type": order_type,
+        "price": price,
+        "deviation": int(settings.mt5_order_deviation_points),
+        "magic": int(settings.mt5_order_magic),
+        "comment": "mt5-hedge-check",
+        "type_time": mt5.ORDER_TIME_GTC,
+        "type_filling": _mt5_filling_mode(mt5, symbol),
+    }
+    if reduce_only:
+        position = _matching_reduce_position(mt5, symbol, normalized_side, float(quantity))
+        if position is None:
+            return MT5OrderCheck(False, f"MT5 reduce-only 未找到可平仓持仓: {symbol} {side} {quantity}")
+        request["position"] = int(getattr(position, "ticket", 0) or 0)
+
+    result = mt5.order_check(request)
+    if result is None:
+        return MT5OrderCheck(False, f"MT5 order_check 无返回: {mt5.last_error()}")
+    retcode = int(getattr(result, "retcode", -1))
+    done_codes = {
+        0,
+        int(getattr(mt5, "TRADE_RETCODE_DONE", 10009)),
+        int(getattr(mt5, "TRADE_RETCODE_DONE_PARTIAL", 10010)),
+        int(getattr(mt5, "TRADE_RETCODE_PLACED", 10008)),
+    }
+    comment = str(getattr(result, "comment", "") or "")
+    if retcode not in done_codes:
+        return MT5OrderCheck(False, f"MT5 order_check 失败 retcode={retcode}: {comment}", retcode)
+    return MT5OrderCheck(True, comment or "MT5 order_check 通过", retcode)
 
 
 def _mt5_filling_mode(mt5, symbol: str) -> int:

@@ -35,7 +35,7 @@ def live_execution_readiness(db: Session, settings: Settings | None = None) -> d
 def paper_execution_readiness(db: Session, settings: Settings | None = None) -> dict:
     settings = settings or get_settings()
     checks: list[ReadinessCheck] = []
-    checks.extend(_hyperliquid_paper_checks(db))
+    checks.extend(_hyperliquid_paper_checks(db, settings))
     checks.extend(_mt5_demo_checks(settings))
     checks.extend(_symbol_mapping_checks(db))
     overall = _overall_status(checks)
@@ -73,17 +73,39 @@ def _hyperliquid_live_checks(settings: Settings) -> list[ReadinessCheck]:
     return checks
 
 
-def _hyperliquid_paper_checks(db: Session) -> list[ReadinessCheck]:
+def _hyperliquid_paper_checks(db: Session, settings: Settings) -> list[ReadinessCheck]:
     mappings = db.query(SymbolMapping).filter(SymbolMapping.enabled.is_(True)).all()
     if not mappings:
         return [ReadinessCheck("hyperliquid_paper_matching", "block", "没有启用的品种映射，无法进行 Hyperliquid paper 撮合")]
-    return [
+    checks = [
         ReadinessCheck(
             "hyperliquid_paper_matching",
             "ok",
             f"Hyperliquid paper 使用本地 QuoteCache 撮合，已启用 {len(mappings)} 个品种",
         )
     ]
+    if not getattr(settings, "hyperliquid_paper_live_order_enabled", False):
+        return checks
+    checks[0] = ReadinessCheck(
+        "hyperliquid_paper_live_probe",
+        "ok",
+        f"Hyperliquid paper-live 探针已开启，paper 账本数量不变，HL 使用最小真实订单取成交价；已启用 {len(mappings)} 个品种",
+    )
+    user = _hyperliquid_user_address(settings)
+    checks.append(
+        ReadinessCheck(
+            "hyperliquid_paper_live_credentials",
+            "ok" if user and getattr(settings, "hyperliquid_secret_key", "") else "block",
+            "Hyperliquid paper-live 账户地址和 API 私钥已配置" if user and getattr(settings, "hyperliquid_secret_key", "") else "HYPERLIQUID_ACCOUNT_ADDRESS 或 HYPERLIQUID_SECRET_KEY 未配置",
+        )
+    )
+    try:
+        import_module("hyperliquid.exchange")
+        import_module("eth_account")
+        checks.append(ReadinessCheck("hyperliquid_sdk_import", "ok", "hyperliquid-python-sdk 可导入"))
+    except Exception as exc:
+        checks.append(ReadinessCheck("hyperliquid_sdk_import", "block", f"hyperliquid-python-sdk 不可导入: {exc}"))
+    return checks
 
 
 def _mt5_checks(settings: Settings) -> list[ReadinessCheck]:

@@ -82,6 +82,21 @@ class AdoptPositionIn(BaseModel):
     symbol: str = ""
 
 
+class HyperliquidProbeTestIn(BaseModel):
+    symbol: str
+    side: str = "buy"
+    quantity: float | None = None
+    reduce_only: bool = False
+    submit: bool = False
+    slippage: float | None = None
+    confirmation: str = ""
+
+    @field_validator("symbol", "side", "confirmation")
+    @classmethod
+    def strip_probe_text(cls, value: str) -> str:
+        return value.strip()
+
+
 class SymbolMappingIn(BaseModel):
     symbol: str
     hyperliquid_symbol: str
@@ -90,6 +105,8 @@ class SymbolMappingIn(BaseModel):
     quote_asset: str = "USD"
     contract_multiplier: float = 1.0
     min_order_size: float = 0.001
+    min_entry_spread: float = 0.0
+    max_close_spread: float = 0.0
     mt5_min_lot: float = 0.0
     mt5_volume_step: float = 0.0
     mt5_contract_size: float = 1.0
@@ -110,6 +127,14 @@ class SymbolMappingIn(BaseModel):
     single_leg_action: str = "manual_intervention"
     mt5_open_order_type: str = "market"
     mt5_close_order_type: str = "market"
+    mt5_session_enabled: bool = True
+    mt5_session_auto_sync: bool = True
+    mt5_session_template: str = "auto"
+    mt5_session_timezone: str = "UTC"
+    mt5_regular_sessions_json: str = "[]"
+    mt5_close_only_sessions_json: str = "[]"
+    mt5_quote_only_sessions_json: str = "[]"
+    mt5_session_source: str = "manual"
     mt5_pre_close_no_open_minutes: int = 15
     mt5_post_open_cooldown_minutes: int = 10
     allow_hold_through_mt5_close: bool = False
@@ -119,7 +144,7 @@ class SymbolMappingIn(BaseModel):
     max_slippage_bps: float = 8.0
     enabled: bool = True
 
-    @field_validator("symbol", "hyperliquid_symbol", "mt5_symbol", "base_asset", "quote_asset", "mt5_currency_base", "mt5_currency_profit", "mt5_currency_margin")
+    @field_validator("symbol", "hyperliquid_symbol", "mt5_symbol", "base_asset", "quote_asset", "mt5_currency_base", "mt5_currency_profit", "mt5_currency_margin", "mt5_session_template", "mt5_session_timezone", "mt5_session_source")
     @classmethod
     def strip_symbol_text(cls, value: str) -> str:
         return value.strip()

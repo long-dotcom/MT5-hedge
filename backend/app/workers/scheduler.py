@@ -10,13 +10,19 @@ from app.execution.auto_executor import run_auto_execute
 from app.execution.carry_costs import run_carry_cost_sync
 from app.execution.reconciler import run_execution_reconcile
 from app.market.scanner import run_scan
+from app.market.mt5_schedule import sync_mt5_session_templates
+from app.market.mt5_tradability import refresh_mt5_tradability_cache
 from app.strategy.statistical_signal import refresh_signal_stats_cache
 
 
 _timer: Optional[threading.Timer] = None
 _stats_timer: Optional[threading.Timer] = None
+_tradability_timer: Optional[threading.Timer] = None
+_session_template_timer: Optional[threading.Timer] = None
 _running = False
 _stats_refreshing = False
+_tradability_refreshing = False
+_session_template_refreshing = False
 
 
 def scanner_job() -> None:
@@ -51,6 +57,40 @@ def signal_stats_job() -> None:
     _schedule_next_stats()
 
 
+def mt5_tradability_job() -> None:
+    global _tradability_refreshing
+    if _tradability_refreshing:
+        _schedule_next_tradability()
+        return
+    _tradability_refreshing = True
+    db = SessionLocal()
+    try:
+        refresh_mt5_tradability_cache(db)
+    except Exception as exc:
+        logger.exception(f"MT5 交易能力刷新任务失败: {exc}")
+    finally:
+        db.close()
+        _tradability_refreshing = False
+    _schedule_next_tradability()
+
+
+def mt5_session_template_job() -> None:
+    global _session_template_refreshing
+    if _session_template_refreshing:
+        _schedule_next_session_templates()
+        return
+    _session_template_refreshing = True
+    db = SessionLocal()
+    try:
+        sync_mt5_session_templates(db, only_auto=True)
+    except Exception as exc:
+        logger.exception(f"MT5 交易时段模板刷新任务失败: {exc}")
+    finally:
+        db.close()
+        _session_template_refreshing = False
+    _schedule_next_session_templates()
+
+
 def _schedule_next() -> None:
     global _timer
     if not _running:
@@ -73,12 +113,36 @@ def _schedule_next_stats() -> None:
     _stats_timer.start()
 
 
+def _schedule_next_tradability() -> None:
+    global _tradability_timer
+    if not _running:
+        return
+    settings = get_settings()
+    interval = max(settings.mt5_tradability_refresh_seconds, 1)
+    _tradability_timer = threading.Timer(interval, mt5_tradability_job)
+    _tradability_timer.daemon = True
+    _tradability_timer.start()
+
+
+def _schedule_next_session_templates() -> None:
+    global _session_template_timer
+    if not _running:
+        return
+    settings = get_settings()
+    interval = max(settings.mt5_session_template_refresh_hours, 1) * 3600
+    _session_template_timer = threading.Timer(interval, mt5_session_template_job)
+    _session_template_timer.daemon = True
+    _session_template_timer.start()
+
+
 def start_scheduler() -> None:
     global _running
     if not _running:
         _running = True
         _schedule_next()
         _schedule_next_stats()
+        _schedule_next_tradability()
+        _schedule_next_session_templates()
 
 
 def stop_scheduler() -> None:
@@ -88,3 +152,7 @@ def stop_scheduler() -> None:
         _timer.cancel()
     if _stats_timer:
         _stats_timer.cancel()
+    if _tradability_timer:
+        _tradability_timer.cancel()
+    if _session_template_timer:
+        _session_template_timer.cancel()

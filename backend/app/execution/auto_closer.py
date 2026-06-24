@@ -13,6 +13,7 @@ from app.execution.pnl import pnl_from_close_spread
 from app.market.active_refresh import refresh_execution_quotes
 from app.market.quotes import quote_synchronizer
 from app.strategy.statistical_signal import _exit_target_with_profit_buffer, _percentile
+from app.strategy.spread_math import spreads_for_direction
 
 
 @dataclass(frozen=True)
@@ -91,7 +92,7 @@ def evaluate_auto_close(db: Session, strategy: StrategySetting, group: HedgeGrou
             suffix = f"；执行前主动刷新: {','.join(refreshed)}" if refreshed else ""
             return CloseEvaluation(False, f"{sync_reason}{suffix}", 0.0, group.exit_target or 0.0, group.unrealized_pnl)
 
-    close_spread = _close_spread(group.direction, synced.hyperliquid.bid, synced.hyperliquid.ask, synced.mt5.bid, synced.mt5.ask)
+    close_spread = spreads_for_direction(group.direction, synced.hyperliquid.bid, synced.hyperliquid.ask, synced.mt5.bid, synced.mt5.ask).close_spread
     exit_target = group.exit_target or _fallback_exit_target(db, strategy, group)
     estimated_profit = pnl_from_close_spread(group, close_spread)
     min_profit = strategy.auto_close_min_profit
@@ -101,37 +102,42 @@ def evaluate_auto_close(db: Session, strategy: StrategySetting, group: HedgeGrou
         return CloseEvaluation(False, f"估算平仓利润不足: {estimated_profit:.2f} < {min_profit:.2f}", close_spread, exit_target, estimated_profit)
     if exit_target <= 0:
         if close_spread <= 0:
-            return CloseEvaluation(True, f"无统计退出线但价差已回到零轴: {close_spread:.2f} <= 0.00", close_spread, exit_target, estimated_profit)
+            return CloseEvaluation(True, f"无统计退出线但平仓价差已回到零轴: {close_spread:.2f} <= 0.00", close_spread, exit_target, estimated_profit)
         if hold_expired:
             return CloseEvaluation(True, f"缺少退出线但超过最大持仓时间且利润达标: {estimated_profit:.2f}", close_spread, exit_target, estimated_profit)
         return CloseEvaluation(False, "缺少退出线，等待更多统计样本", close_spread, exit_target, estimated_profit)
     if close_spread <= exit_target:
-        return CloseEvaluation(True, f"价差回归至退出线: {close_spread:.2f} <= {exit_target:.2f}", close_spread, exit_target, estimated_profit)
+        return CloseEvaluation(True, f"平仓价差回归至退出线: {close_spread:.2f} <= {exit_target:.2f}", close_spread, exit_target, estimated_profit)
     if hold_expired:
         return CloseEvaluation(True, f"超过最大持仓时间且利润达标: {estimated_profit:.2f}", close_spread, exit_target, estimated_profit)
-    return CloseEvaluation(False, f"等待价差回归: {close_spread:.2f} > {exit_target:.2f}", close_spread, exit_target, estimated_profit)
-
-
-def _close_spread(direction: str, hl_bid: float, hl_ask: float, mt5_bid: float, mt5_ask: float) -> float:
-    if direction == "long_hyperliquid_short_mt5":
-        return mt5_ask - hl_bid
-    return hl_ask - mt5_bid
+    return CloseEvaluation(False, f"等待平仓价差回归: {close_spread:.2f} > {exit_target:.2f}", close_spread, exit_target, estimated_profit)
 
 
 def _fallback_exit_target(db: Session, strategy: StrategySetting, group: HedgeGroup) -> float:
-    points = load_spread_points(db, group.symbol, group.direction, strategy.statistical_lookback_range)
+    points = load_spread_points(db, group.symbol, group.direction, strategy.statistical_lookback_range, basis="close")
     if len(points) < strategy.statistical_min_samples:
-        return 0.0
+        return _mapping_max_close_spread(db, group.symbol)
     spreads = [point.spread for point in points]
     quantity = group.hyperliquid_quantity or group.quantity or 1.0
     entry_spread = group.entry_spread or group.entry_threshold
     unit_open_cost = group.open_cost / max(quantity, 1e-12)
-    return _exit_target_with_profit_buffer(
+    statistical_target = _exit_target_with_profit_buffer(
         percentile_target=_percentile(spreads, strategy.exit_target_percentile),
         entry_spread=entry_spread,
         unit_cost=unit_open_cost,
         unit_profit_buffer=strategy.auto_close_unit_profit_buffer,
     )
+    max_close_spread = _mapping_max_close_spread(db, group.symbol)
+    if max_close_spread <= 0:
+        return statistical_target
+    if statistical_target <= 0:
+        return max_close_spread
+    return min(statistical_target, max_close_spread)
+
+
+def _mapping_max_close_spread(db: Session, symbol: str) -> float:
+    mapping = db.query(SymbolMapping).filter(SymbolMapping.symbol == symbol).first()
+    return float(getattr(mapping, "max_close_spread", 0.0) or 0.0) if mapping else 0.0
 
 
 def _hold_expired(group: HedgeGroup, strategy: StrategySetting) -> bool:

@@ -19,6 +19,12 @@ const ranges = [
   { value: '7d', label: '7天' }
 ];
 
+const bases = [
+  { value: 'entry', label: '入场价差' },
+  { value: 'close', label: '平仓价差' },
+  { value: 'mid', label: 'Mid价差' }
+];
+
 function statusColor(status?: string) {
   if (status === 'mean_reversion') return 'green';
   if (status === 'too_risky' || status === 'slow_reversion') return 'red';
@@ -46,12 +52,13 @@ export function SpreadAnalyticsPage() {
   const [symbol, setSymbol] = useState(defaultSymbol);
   const [direction, setDirection] = useState('long_mt5_short_hyperliquid');
   const [range, setRange] = useState('1h');
+  const [basis, setBasis] = useState('entry');
 
   const activeSymbol = symbol || defaultSymbol;
   const query = useQuery({
-    queryKey: ['spread-analytics', activeSymbol, direction, range],
+    queryKey: ['spread-analytics', activeSymbol, direction, range, basis],
     enabled: Boolean(activeSymbol),
-    queryFn: async () => (await api.get('/analytics/spread-series', { params: { symbol: activeSymbol, direction, range } })).data
+    queryFn: async () => (await api.get('/analytics/spread-series', { params: { symbol: activeSymbol, direction, range, basis } })).data
   });
 
   const summary = query.data?.summary;
@@ -107,6 +114,7 @@ export function SpreadAnalyticsPage() {
           <Select className="analytics-control" value={activeSymbol} options={symbolOptions} loading={symbols.isLoading} onChange={setSymbol} />
           <Select className="analytics-control-wide" value={direction} options={directions} onChange={setDirection} />
           <Select className="analytics-control" value={range} options={ranges} onChange={setRange} />
+          <Select className="analytics-control" value={basis} options={bases} onChange={setBasis} />
           <Tag icon={<ExperimentOutlined />} color={statusColor(summary?.analytics_status)}>
             {summary?.analytics_status || 'no_data'}
           </Tag>
@@ -119,7 +127,7 @@ export function SpreadAnalyticsPage() {
       <Row gutter={[16, 16]}>
         <Col xs={24} sm={12} lg={6}>
           <Card className="metric-card">
-            <Statistic title="当前价差" value={summary?.current_spread || 0} formatter={(value) => fmtChartValue(value)} />
+            <Statistic title={`当前${bases.find((item) => item.value === basis)?.label || '价差'}`} value={summary?.current_spread || 0} formatter={(value) => fmtChartValue(value)} />
           </Card>
         </Col>
         <Col xs={24} sm={12} lg={6}>

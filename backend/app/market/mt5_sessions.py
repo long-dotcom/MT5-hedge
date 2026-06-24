@@ -7,6 +7,7 @@ from typing import Any
 
 from app.config.settings import get_settings
 from app.db.models import SymbolMapping
+from app.market.mt5_schedule import LocalScheduleState, local_schedule_state
 
 
 @dataclass(frozen=True)
@@ -38,6 +39,9 @@ _session_cache: dict[int, tuple[float, MT5SessionState]] = {}
 
 def mt5_session_state(mapping: SymbolMapping, now: datetime | None = None) -> MT5SessionState:
     current = now or datetime.now()
+    local_state = local_schedule_state(mapping, now)
+    if local_state and local_state.status != "normal_trade":
+        return _from_local_schedule(local_state)
     settings = get_settings()
     if settings.quote_source_mode != "live":
         return MT5SessionState(
@@ -182,6 +186,23 @@ def as_session_dict(state: MT5SessionState) -> dict[str, Any]:
         "trade_mode": state.trade_mode,
         "session_source": state.session_source,
     }
+
+
+def _from_local_schedule(state: LocalScheduleState) -> MT5SessionState:
+    return MT5SessionState(
+        symbol=state.symbol,
+        status=state.status,
+        reason=state.reason,
+        can_quote=state.can_quote,
+        can_open_long=state.can_open_long,
+        can_open_short=state.can_open_short,
+        can_close_long=state.can_close_long,
+        can_close_short=state.can_close_short,
+        seconds_to_open=state.seconds_to_open,
+        seconds_to_close=state.seconds_to_close,
+        trade_mode=state.status,
+        session_source=state.source,
+    )
 
 
 def _read_sessions(mt5: Any, symbol: str, current: datetime, kind: str) -> list[tuple[datetime, datetime]]:

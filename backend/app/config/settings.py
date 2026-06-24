@@ -7,6 +7,7 @@ from pathlib import Path
 ROOT_DIR = Path(__file__).resolve().parents[3]
 HYPERLIQUID_MAINNET_INFO_URL = "https://api.hyperliquid.xyz/info"
 HYPERLIQUID_TESTNET_INFO_URL = "https://api.hyperliquid-testnet.xyz/info"
+HYPERLIQUID_MAINNET_API_URL = "https://api.hyperliquid.xyz"
 
 
 def _load_env_file() -> dict[str, str]:
@@ -68,11 +69,19 @@ class Settings:
     hyperliquid_default_maker_fee_rate: float = 0.00015
     hyperliquid_default_min_notional: float = 10.0
     hyperliquid_fee_round_trips: float = 2.0
+    hyperliquid_secret_key: str = ""
+    hyperliquid_paper_live_order_enabled: bool = False
+    paper_live_parallel_execution: bool = True
+    hyperliquid_paper_live_slippage: float = 0.01
     mt5_default_commission_rate: float = 0.0
     mt5_spread_rebate_rate: float = 0.20
     mt5_swap_free: bool = True
     mt5_session_cache_ttl_seconds: int = 30
     mt5_session_tick_stale_seconds: int = 120
+    mt5_tradability_cache_ttl_ms: int = 15000
+    mt5_tradability_refresh_seconds: int = 5
+    mt5_trade_reject_quarantine_seconds: int = 21600
+    mt5_session_template_refresh_hours: int = 24
     default_slippage_bps: float = 0.0
     default_fx_cost_rate: float = 0.0
     fx_fallback_rates: str = '{"JPY":0.00625}'

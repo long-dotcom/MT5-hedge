@@ -96,8 +96,8 @@ def refresh_signal_stats_cache(db: Session) -> int:
     now = monotonic()
     for symbol in symbols:
         for direction in ("long_hyperliquid_short_mt5", "long_mt5_short_hyperliquid"):
-            points = load_spread_points(db, symbol, direction, strategy.statistical_lookback_range)
-            stats = _compute_signal_stats(points, strategy)
+            entry_points, close_points = _load_entry_and_close_points(db, symbol, direction, strategy.statistical_lookback_range)
+            stats = _compute_signal_stats(entry_points, close_points, strategy)
             _stats_cache[_stats_cache_key(db, strategy, symbol, direction)] = (now, stats)
             refreshed += 1
     return refreshed
@@ -108,8 +108,8 @@ def _signal_stats(db: Session, strategy: StrategySetting, symbol: str, direction
     cached = _stats_cache.get(key)
     if cached:
         return cached[1]
-    points = load_spread_points(db, symbol, direction, strategy.statistical_lookback_range)
-    stats = _compute_signal_stats(points, strategy)
+    entry_points, close_points = _load_entry_and_close_points(db, symbol, direction, strategy.statistical_lookback_range)
+    stats = _compute_signal_stats(entry_points, close_points, strategy)
     _stats_cache[key] = (monotonic(), stats)
     return stats
 
@@ -128,18 +128,29 @@ def _stats_cache_key(db: Session, strategy: StrategySetting, symbol: str, direct
     )
 
 
-def _compute_signal_stats(points: list[SpreadPoint], strategy: StrategySetting) -> SignalStats:
-    sample_count = len(points)
-    if not points:
+def _load_entry_and_close_points(db: Session, symbol: str, direction: str, range_value: str) -> tuple[list[SpreadPoint], list[SpreadPoint]]:
+    try:
+        entry_points = load_spread_points(db, symbol, direction, range_value, basis="entry")
+        close_points = load_spread_points(db, symbol, direction, range_value, basis="close")
+        return entry_points, close_points
+    except TypeError:
+        points = load_spread_points(db, symbol, direction, range_value)
+        return points, points
+
+
+def _compute_signal_stats(entry_points: list[SpreadPoint], close_points: list[SpreadPoint], strategy: StrategySetting) -> SignalStats:
+    sample_count = len(entry_points)
+    if not entry_points:
         return SignalStats(0, 0.0, 0.0, 0.0, 0.0, 0.0)
-    spreads = [point.spread for point in points]
-    costs = [point.total_cost for point in points]
+    spreads = [point.spread for point in entry_points]
+    close_spreads = [point.spread for point in close_points] or spreads
+    costs = [point.total_cost for point in entry_points]
     avg = mean(spreads)
     std = pstdev(spreads) if sample_count > 1 else 0.0
     reachable_entry = max(_percentile(spreads, _strategy_float(strategy, "reachable_entry_percentile", 0.75)), avg + _strategy_float(strategy, "reachable_entry_zscore", 1.0) * std)
     cost_guard = _percentile(costs, _strategy_float(strategy, "cost_guard_percentile", 0.90))
     strong_entry = max(_percentile(spreads, 0.90), avg + 1.5 * std)
-    exit_percentile_target = _percentile(spreads, _strategy_float(strategy, "exit_target_percentile", 0.25))
+    exit_percentile_target = _percentile(close_spreads, _strategy_float(strategy, "exit_target_percentile", 0.25))
     overheat = _percentile(spreads, 0.99)
     return SignalStats(sample_count, reachable_entry, cost_guard, strong_entry, exit_percentile_target, overheat)
 

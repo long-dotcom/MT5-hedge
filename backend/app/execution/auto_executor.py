@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 from app.db.models import ArbitrageOpportunity, HedgeGroup, StrategySetting, SystemLog, WorkerRun
 from app.db.retention import prune_table_by_id
 from app.execution.engine import open_hedge_group
+from app.market.mt5_tradability import mt5_tradability_cache
 
 
 @dataclass
@@ -33,6 +34,9 @@ def run_auto_execute(db: Session) -> int:
         return 0
     if strategy.auto_execute_paper_only and strategy.execution_mode != "paper":
         _record_skip(db, "auto_execute 要求 paper 模式，当前执行模式不是 paper")
+        return 0
+    if not mt5_tradability_cache.initialized():
+        _record_skip(db, "MT5 交易能力缓存尚未初始化，暂不自动开仓")
         return 0
 
     opportunities = (
@@ -61,10 +65,13 @@ def run_auto_execute(db: Session) -> int:
             group = open_hedge_group(db, opportunity.id, source="auto_paper")
             _set_cooldown(strategy, opportunity.symbol, opportunity.direction)
             _confirmations.pop(_confirmation_key(opportunity), None)
-            db.add(SystemLog(level="info", category="auto_execute", message=f"自动纸面执行成功: {opportunity.symbol} #{group.id}"))
+            if group.status in {"failed", "manual_intervention"}:
+                db.add(SystemLog(level="warning", category="auto_execute", message=f"自动纸面执行异常: {opportunity.symbol} #{group.id}", context=f"group_status={group.status}"))
+            else:
+                db.add(SystemLog(level="info", category="auto_execute", message=f"自动纸面执行成功: {opportunity.symbol} #{group.id}"))
+                executed += 1
             prune_table_by_id(db, SystemLog)
             db.commit()
-            executed += 1
         except Exception as exc:
             db.rollback()
             row = db.get(ArbitrageOpportunity, opportunity.id)

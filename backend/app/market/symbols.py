@@ -29,6 +29,8 @@ def seed_symbol_mappings_from_file(db: Session) -> int:
             "quote_asset": item.get("quote_asset", "USD"),
             "contract_multiplier": float(item.get("contract_multiplier", 1.0)),
             "min_order_size": float(item.get("min_order_size", 0.001)),
+            "min_entry_spread": float(item.get("min_entry_spread", 0.0)),
+            "max_close_spread": float(item.get("max_close_spread", 0.0)),
             "mt5_min_lot": float(item.get("mt5_min_lot", 0.0)),
             "mt5_volume_step": float(item.get("mt5_volume_step", 0.0)),
             "mt5_contract_size": float(item.get("mt5_contract_size", item.get("contract_multiplier", 1.0))),

@@ -39,19 +39,30 @@ function directionTags(direction: string) {
   return <Tag>{direction || '-'}</Tag>;
 }
 
+function fmtCarryCost(value?: number) {
+  if (value === undefined || value === null || Number.isNaN(Number(value))) return '-';
+  const numeric = Number(value);
+  if (numeric > 0) return `付出 ${fmtMoney(numeric)}`;
+  if (numeric < 0) return `收到 ${fmtMoney(Math.abs(numeric))}`;
+  return fmtMoney(0);
+}
+
 function detailItems(row: any) {
   return [
     { key: 'mt5_quantity', label: 'MT5 数量', children: fmtNum(row.mt5_quantity, 4) },
     { key: 'hyperliquid_quantity', label: 'HL 数量', children: fmtNum(row.hyperliquid_quantity, 6) },
     { key: 'trigger_spread', label: '触发价差', children: fmtSpread(row.trigger_spread) },
     { key: 'entry_spread', label: '真实开仓价差', children: fmtSpread(row.entry_spread) },
-    { key: 'current_entry_spread', label: '当前入场价差', children: row.current_entry_spread == null ? '-' : fmtSpread(row.current_entry_spread) },
+    { key: 'current_entry_spread', label: '当前重新入场价差', children: row.current_entry_spread == null ? '-' : fmtSpread(row.current_entry_spread) },
     { key: 'current_close_spread', label: '当前平仓价差', children: row.current_close_spread == null ? '-' : fmtSpread(row.current_close_spread) },
     { key: 'quote_time_diff_ms', label: '报价时间差', children: row.quote_time_diff_ms == null ? '-' : `${Math.round(row.quote_time_diff_ms)}ms` },
     { key: 'quote_age_ms', label: '报价年龄', children: row.quote_age_ms == null ? '-' : `${Math.round(row.quote_age_ms)}ms` },
     { key: 'entry_threshold', label: '入场线', children: fmtSpread(row.entry_threshold) },
-    { key: 'exit_target', label: '退出线', children: fmtSpread(row.exit_target) },
+    { key: 'exit_target', label: '退出线（平仓价差分位）', children: fmtSpread(row.exit_target) },
     { key: 'open_cost', label: '开仓成本', children: fmtMoney(row.open_cost) },
+    { key: 'fees', label: '手续费成本', children: fmtMoney(row.fees) },
+    { key: 'funding', label: 'HL 资金费', children: fmtCarryCost(row.funding) },
+    { key: 'swap', label: 'MT5 隔夜费', children: fmtCarryCost(row.swap) },
     { key: 'realized_pnl', label: '已实现', children: fmtMoney(row.realized_pnl) },
     { key: 'unrealized_pnl', label: '未实现', children: fmtMoney(row.unrealized_pnl) },
     { key: 'source', label: '来源', children: row.source || '-' },
@@ -95,6 +106,8 @@ export function HedgeGroupsPage() {
     { title: '触发价差', dataIndex: 'trigger_spread', width: 112, align: 'right', render: fmtSpread },
     { title: '真实开仓价差', dataIndex: 'entry_spread', width: 132, align: 'right', render: fmtSpread },
     { title: '当前平仓价差', dataIndex: 'current_close_spread', width: 132, align: 'right', render: (v) => (v == null ? '-' : fmtSpread(v)) },
+    { title: 'HL资金费', dataIndex: 'funding', width: 124, align: 'right', render: fmtCarryCost },
+    { title: 'MT5隔夜费', dataIndex: 'swap', width: 124, align: 'right', render: fmtCarryCost },
     { title: 'PnL', width: 112, align: 'right', render: (_, row) => fmtMoney((row.realized_pnl || 0) + (row.unrealized_pnl || 0)) },
     { title: '操作', fixed: 'right', width: 100, render: (_, row) => <Button size="small" disabled={!['open', 'open_partial', 'manual_intervention'].includes(row.status)} onClick={() => close.mutate(row.id)}>平仓</Button> }
   ];
@@ -111,7 +124,7 @@ export function HedgeGroupsPage() {
           columns={columns}
           dataSource={query.data?.items || []}
           loading={query.isLoading}
-          scroll={{ x: 1320 }}
+          scroll={{ x: 1560 }}
           pagination={{ current: page, pageSize: 20, total: query.data?.total || 0, onChange: setPage }}
           expandable={{
             expandedRowRender: (row) => <Descriptions size="small" column={{ xs: 1, sm: 2, lg: 4 }} items={detailItems(row)} />,

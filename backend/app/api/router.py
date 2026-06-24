@@ -12,6 +12,8 @@ from app.analytics.funding import funding_history
 from app.analytics.lead_lag import lead_lag_report
 from app.analytics.spreads import downsample_spreads, load_spread_points, summarize_spreads
 from app.accounts.sync import latest_account_snapshots, sync_account_snapshots
+from app.adapters.base import AdapterOrder
+from app.adapters.hyperliquid import HyperliquidAdapter, _load_hyperliquid_exchange
 from app.auth.dependencies import get_current_user, require_admin
 from app.auth.security import create_access_token, decode_access_token, verify_password
 from app.db.models import (
@@ -29,6 +31,7 @@ from app.db.models import (
     RiskSetting,
     SpreadBucket,
     SpreadCurrent,
+    SpreadDirectionCurrent,
     SpreadSnapshot,
     StrategySetting,
     SymbolMapping,
@@ -47,8 +50,9 @@ from app.market.scan_state import scan_state_store
 from app.market.quotes import quote_cache
 from app.market.hedge_spreads import hedge_group_spreads
 from app.market.mt5_sessions import as_session_dict, mt5_session_state
+from app.market.mt5_schedule import apply_mt5_session_template, mt5_session_templates
 from app.config.settings import get_settings
-from app.schemas import AdoptPositionIn, CloseHedgeGroupIn, LiveTradingIn, LoginRequest, RiskModeIn, RiskSettingsIn, StrategySettingsIn, SymbolMappingIn, TokenResponse
+from app.schemas import AdoptPositionIn, CloseHedgeGroupIn, HyperliquidProbeTestIn, LiveTradingIn, LoginRequest, RiskModeIn, RiskSettingsIn, StrategySettingsIn, SymbolMappingIn, TokenResponse
 
 
 router = APIRouter(prefix="/api")
@@ -256,9 +260,11 @@ def spread_summary(
     symbol: str = "BTC",
     direction: str = "long_mt5_short_hyperliquid",
     range: str = "1h",
+    basis: str = "entry",
 ) -> dict[str, Any]:
-    points = load_spread_points(db, symbol, direction, range)
-    return {"symbol": symbol.upper(), "direction": direction, **summarize_spreads(points, range)}
+    safe_basis = basis if basis in {"entry", "close", "mid"} else "entry"
+    points = load_spread_points(db, symbol, direction, range, basis=safe_basis)
+    return {"symbol": symbol.upper(), "direction": direction, "basis": safe_basis, **summarize_spreads(points, range)}
 
 
 @router.get("/analytics/spread-series")
@@ -268,12 +274,15 @@ def spread_series(
     symbol: str = "BTC",
     direction: str = "long_mt5_short_hyperliquid",
     range: str = "1h",
+    basis: str = "entry",
 ) -> dict[str, Any]:
-    points = load_spread_points(db, symbol, direction, range)
+    safe_basis = basis if basis in {"entry", "close", "mid"} else "entry"
+    points = load_spread_points(db, symbol, direction, range, basis=safe_basis)
     summary = summarize_spreads(points, range)
     return {
         "symbol": symbol.upper(),
         "direction": direction,
+        "basis": safe_basis,
         "range": summary["range"],
         "summary": summary,
         "items": downsample_spreads(points, range),
@@ -488,6 +497,79 @@ def execution_reconcile(user: User = Depends(require_admin), db: Session = Depen
     return {"status": "ok", "changed": changed, "cost_changed": cost_changed}
 
 
+@router.post("/execution/hyperliquid-probe-test")
+def hyperliquid_probe_test(payload: HyperliquidProbeTestIn, user: User = Depends(require_admin), db: Session = Depends(get_db)) -> dict[str, Any]:
+    side = payload.side.lower()
+    if side not in {"buy", "sell"}:
+        raise HTTPException(status_code=400, detail="side 必须是 buy 或 sell")
+    mapping = db.query(SymbolMapping).filter(SymbolMapping.symbol == payload.symbol).first()
+    venue_symbol = mapping.hyperliquid_symbol if mapping else payload.symbol
+    settings = get_settings()
+    adapter = HyperliquidAdapter(live=True)
+    adapter.paper_price_probe = True
+    slippage = float(payload.slippage if payload.slippage is not None else settings.hyperliquid_paper_live_slippage)
+    try:
+        probe_quantity = float(payload.quantity) if payload.quantity is not None else adapter._probe_quantity(venue_symbol)
+        exchange = _load_hyperliquid_exchange(settings)
+        slippage_price = exchange._slippage_price(venue_symbol, side == "buy", slippage, None)
+        response: dict[str, Any] = {
+            "symbol": payload.symbol,
+            "venue_symbol": venue_symbol,
+            "side": side,
+            "reduce_only": payload.reduce_only,
+            "submit": payload.submit,
+            "probe_quantity": probe_quantity,
+            "slippage": slippage,
+            "slippage_price": slippage_price,
+            "asset": exchange.info.coin_to_asset.get(venue_symbol),
+            "status": "dry_run_ok",
+        }
+        if not payload.submit:
+            audit(db, user.id, "hyperliquid_probe_dry_run", "execution", f"{venue_symbol} {side} {probe_quantity}")
+            db.commit()
+            return response
+        if payload.confirmation != "SUBMIT HYPERLIQUID PROBE":
+            raise HTTPException(status_code=400, detail="真实提交必须传 confirmation='SUBMIT HYPERLIQUID PROBE'")
+        order_result = adapter.place_order(
+            AdapterOrder(
+                platform="hyperliquid",
+                symbol=payload.symbol,
+                venue_symbol=venue_symbol,
+                side=side,
+                quantity=probe_quantity,
+                order_type="market",
+                reduce_only=payload.reduce_only,
+            )
+        )
+        response.update(
+            {
+                "status": order_result.status,
+                "success": order_result.success,
+                "external_order_id": order_result.external_order_id,
+                "filled_quantity": order_result.filled_quantity,
+                "average_price": order_result.average_price,
+                "fee": order_result.fee,
+                "message": order_result.error_message,
+            }
+        )
+        audit(db, user.id, "hyperliquid_probe_submit", "execution", f"{venue_symbol} {side} {probe_quantity} {order_result.status}")
+        db.commit()
+        return response
+    except HTTPException:
+        raise
+    except Exception as exc:
+        return {
+            "symbol": payload.symbol,
+            "venue_symbol": venue_symbol,
+            "side": side,
+            "reduce_only": payload.reduce_only,
+            "submit": payload.submit,
+            "status": "failed",
+            "error_type": type(exc).__name__,
+            "error": str(exc),
+        }
+
+
 @router.get("/orders")
 def orders(_: User = Depends(get_current_user), db: Session = Depends(get_db), page: int = 1, page_size: int = 20) -> dict[str, Any]:
     query = db.query(Order)
@@ -578,6 +660,11 @@ def get_symbol_mappings(_: User = Depends(get_current_user), db: Session = Depen
     return [as_dict(row) for row in db.query(SymbolMapping).order_by(SymbolMapping.symbol).all()]
 
 
+@router.get("/settings/mt5-session-templates")
+def get_mt5_session_templates(_: User = Depends(get_current_user)) -> list[dict[str, Any]]:
+    return mt5_session_templates()
+
+
 @router.put("/settings/symbol-mappings")
 def put_symbol_mappings(payload: list[SymbolMappingIn], user: User = Depends(require_admin), db: Session = Depends(get_db)) -> list[dict[str, Any]]:
     stale_symbols: set[str] = set()
@@ -650,6 +737,7 @@ def _clear_scan_results_for_symbols(db: Session, symbols: set[str]) -> None:
     if not normalized:
         return
     db.query(SpreadCurrent).filter(SpreadCurrent.symbol.in_(normalized)).delete(synchronize_session=False)
+    db.query(SpreadDirectionCurrent).filter(SpreadDirectionCurrent.symbol.in_(normalized)).delete(synchronize_session=False)
     active_rows = db.query(ArbitrageOpportunity).filter(
         ArbitrageOpportunity.symbol.in_(normalized),
         ArbitrageOpportunity.status.in_(["candidate", "executable", "executing"]),
@@ -722,6 +810,19 @@ def sync_symbol_mapping_from_broker(mapping_id: int, user: User = Depends(requir
             "swap_mode": int(getattr(info, "swap_mode", 0)),
         },
     }
+
+
+@router.post("/settings/symbol-mappings/{mapping_id}/sync-sessions")
+def sync_symbol_mapping_sessions(mapping_id: int, user: User = Depends(require_admin), db: Session = Depends(get_db)) -> dict[str, Any]:
+    row = db.get(SymbolMapping, mapping_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="品种映射不存在")
+    apply_mt5_session_template(row, row.mt5_session_template or "auto")
+    db.add(row)
+    audit(db, user.id, "sync_symbol_mapping_sessions", "settings", row.symbol)
+    db.commit()
+    db.refresh(row)
+    return as_dict(row)
 
 
 def _effective_min_order_size(row: SymbolMapping) -> float:

@@ -51,16 +51,16 @@ def parse_range(range_value: str) -> tuple[str, datetime, int]:
     return key, datetime.utcnow() - timedelta(seconds=seconds), seconds
 
 
-def load_spread_points(db: Session, symbol: str, direction: str, range_value: str) -> list[SpreadPoint]:
+def load_spread_points(db: Session, symbol: str, direction: str, range_value: str, basis: str = "entry") -> list[SpreadPoint]:
     range_key, start_at, _ = parse_range(range_value)
     if range_key in RAW_POINT_RANGES:
-        snapshot_points = _load_snapshot_points(db, symbol, direction, start_at)
-        return snapshot_points or _load_bucket_points(db, symbol, direction, start_at)
-    bucket_points = _load_bucket_points(db, symbol, direction, start_at)
-    return bucket_points or _load_snapshot_points(db, symbol, direction, start_at)
+        snapshot_points = _load_snapshot_points(db, symbol, direction, start_at, basis)
+        return snapshot_points or _load_bucket_points(db, symbol, direction, start_at, basis)
+    bucket_points = _load_bucket_points(db, symbol, direction, start_at, basis)
+    return bucket_points or _load_snapshot_points(db, symbol, direction, start_at, basis)
 
 
-def _load_snapshot_points(db: Session, symbol: str, direction: str, start_at: datetime) -> list[SpreadPoint]:
+def _load_snapshot_points(db: Session, symbol: str, direction: str, start_at: datetime, basis: str) -> list[SpreadPoint]:
     rows = (
         db.query(SpreadSnapshot)
         .filter(
@@ -74,7 +74,7 @@ def _load_snapshot_points(db: Session, symbol: str, direction: str, start_at: da
     return [
         SpreadPoint(
             created_at=row.created_at,
-            spread=float(row.gross_spread),
+            spread=float(_snapshot_spread(row, basis)),
             total_cost=float(row.unit_cost),
             net_profit=float(row.unit_net_profit),
         )
@@ -82,7 +82,7 @@ def _load_snapshot_points(db: Session, symbol: str, direction: str, start_at: da
     ]
 
 
-def _load_bucket_points(db: Session, symbol: str, direction: str, start_at: datetime) -> list[SpreadPoint]:
+def _load_bucket_points(db: Session, symbol: str, direction: str, start_at: datetime, basis: str) -> list[SpreadPoint]:
     bucket_rows = (
         db.query(SpreadBucket)
         .filter(
@@ -97,13 +97,29 @@ def _load_bucket_points(db: Session, symbol: str, direction: str, start_at: date
         return [
             SpreadPoint(
                 created_at=row.bucket_start,
-                spread=float(row.close_spread),
+                spread=float(_bucket_spread(row, basis)),
                 total_cost=float(row.avg_unit_cost),
                 net_profit=float(row.avg_unit_net_profit),
             )
             for row in bucket_rows
         ]
     return []
+
+
+def _snapshot_spread(row: SpreadSnapshot, basis: str) -> float:
+    if basis == "close":
+        return float(getattr(row, "close_spread", 0.0) or row.gross_spread)
+    if basis == "mid":
+        return float(getattr(row, "mid_spread", 0.0) or row.gross_spread)
+    return float(getattr(row, "entry_spread", 0.0) or row.gross_spread)
+
+
+def _bucket_spread(row: SpreadBucket, basis: str) -> float:
+    if basis == "close":
+        return float(getattr(row, "avg_close_basis_spread", 0.0) or row.avg_spread)
+    if basis == "mid":
+        return float(getattr(row, "avg_mid_spread", 0.0) or row.avg_spread)
+    return float(getattr(row, "avg_entry_spread", 0.0) or row.avg_spread)
 
 
 def summarize_spreads(points: list[SpreadPoint], range_value: str) -> dict[str, object]:

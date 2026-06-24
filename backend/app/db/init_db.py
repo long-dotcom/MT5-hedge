@@ -23,6 +23,8 @@ def ensure_schema_columns() -> None:
     existing = {column["name"] for column in inspector.get_columns("symbol_mappings")}
     columns = {
         "mt5_min_lot": "FLOAT DEFAULT 0.0",
+        "min_entry_spread": "FLOAT DEFAULT 0.0",
+        "max_close_spread": "FLOAT DEFAULT 0.0",
         "mt5_volume_step": "FLOAT DEFAULT 0.0",
         "mt5_contract_size": "FLOAT DEFAULT 1.0",
         "mt5_currency_base": "VARCHAR(16) DEFAULT ''",
@@ -42,6 +44,15 @@ def ensure_schema_columns() -> None:
         "single_leg_action": "VARCHAR(32) DEFAULT 'manual_intervention'",
         "mt5_open_order_type": "VARCHAR(16) DEFAULT 'market'",
         "mt5_close_order_type": "VARCHAR(16) DEFAULT 'market'",
+        "mt5_session_enabled": "BOOLEAN DEFAULT 1",
+        "mt5_session_auto_sync": "BOOLEAN DEFAULT 1",
+        "mt5_session_template": "VARCHAR(64) DEFAULT 'auto'",
+        "mt5_session_timezone": "VARCHAR(64) DEFAULT 'UTC'",
+        "mt5_regular_sessions_json": "TEXT DEFAULT '[]'",
+        "mt5_close_only_sessions_json": "TEXT DEFAULT '[]'",
+        "mt5_quote_only_sessions_json": "TEXT DEFAULT '[]'",
+        "mt5_session_source": "VARCHAR(64) DEFAULT 'manual'",
+        "mt5_session_last_synced_at": "DATETIME",
         "mt5_pre_close_no_open_minutes": "INTEGER DEFAULT 15",
         "mt5_post_open_cooldown_minutes": "INTEGER DEFAULT 10",
         "allow_hold_through_mt5_close": "BOOLEAN DEFAULT 0",
@@ -141,6 +152,10 @@ def ensure_schema_columns() -> None:
             "hyperliquid_quantity": "FLOAT DEFAULT 1.0",
             "notional_currency": "VARCHAR(16) DEFAULT 'USD'",
             "fx_rate_to_usd": "FLOAT DEFAULT 1.0",
+            "entry_spread": "FLOAT DEFAULT 0.0",
+            "close_spread": "FLOAT DEFAULT 0.0",
+            "mid_spread": "FLOAT DEFAULT 0.0",
+            "spread_cost": "FLOAT DEFAULT 0.0",
             "unit_cost": "FLOAT DEFAULT 0.0",
             "unit_net_profit": "FLOAT DEFAULT 0.0",
         }
@@ -153,8 +168,12 @@ def ensure_schema_columns() -> None:
                     """
                     UPDATE spread_snapshots
                     SET unit_cost = CASE WHEN quantity > 0 THEN total_cost / quantity ELSE total_cost END,
-                        unit_net_profit = CASE WHEN quantity > 0 THEN net_profit / quantity ELSE net_profit END
-                    WHERE unit_cost = 0.0 AND total_cost != 0.0
+                        unit_net_profit = CASE WHEN quantity > 0 THEN net_profit / quantity ELSE net_profit END,
+                        entry_spread = CASE WHEN entry_spread = 0.0 THEN gross_spread ELSE entry_spread END,
+                        close_spread = CASE WHEN close_spread = 0.0 THEN gross_spread ELSE close_spread END,
+                        mid_spread = CASE WHEN mid_spread = 0.0 THEN gross_spread ELSE mid_spread END,
+                        spread_cost = CASE WHEN spread_cost = 0.0 THEN close_spread - entry_spread ELSE spread_cost END
+                    WHERE (unit_cost = 0.0 AND total_cost != 0.0) OR entry_spread = 0.0 OR close_spread = 0.0
                     """
                 )
             )
@@ -193,16 +212,60 @@ def ensure_schema_columns() -> None:
             "hyperliquid_quantity": "FLOAT DEFAULT 1.0",
             "notional_currency": "VARCHAR(16) DEFAULT 'USD'",
             "fx_rate_to_usd": "FLOAT DEFAULT 1.0",
+            "entry_spread": "FLOAT DEFAULT 0.0",
+            "close_spread": "FLOAT DEFAULT 0.0",
+            "mid_spread": "FLOAT DEFAULT 0.0",
+            "spread_cost": "FLOAT DEFAULT 0.0",
         }
         with engine.begin() as conn:
             for name, ddl in current_columns.items():
                 if name not in existing_current:
                     conn.execute(text(f"ALTER TABLE spread_current ADD COLUMN {name} {ddl}"))
+            conn.execute(
+                text(
+                    """
+                    UPDATE spread_current
+                    SET entry_spread = CASE WHEN entry_spread = 0.0 THEN gross_spread ELSE entry_spread END,
+                        close_spread = CASE WHEN close_spread = 0.0 THEN gross_spread ELSE close_spread END,
+                        mid_spread = CASE WHEN mid_spread = 0.0 THEN gross_spread ELSE mid_spread END,
+                        spread_cost = CASE WHEN spread_cost = 0.0 THEN close_spread - entry_spread ELSE spread_cost END
+                    WHERE entry_spread = 0.0 OR close_spread = 0.0
+                    """
+                )
+            )
+    if "spread_buckets" in inspector.get_table_names():
+        existing_buckets = {column["name"] for column in inspector.get_columns("spread_buckets")}
+        bucket_columns = {
+            "entry_spread": "FLOAT DEFAULT 0.0",
+            "avg_entry_spread": "FLOAT DEFAULT 0.0",
+            "avg_close_basis_spread": "FLOAT DEFAULT 0.0",
+            "avg_mid_spread": "FLOAT DEFAULT 0.0",
+            "avg_spread_cost": "FLOAT DEFAULT 0.0",
+        }
+        with engine.begin() as conn:
+            for name, ddl in bucket_columns.items():
+                if name not in existing_buckets:
+                    conn.execute(text(f"ALTER TABLE spread_buckets ADD COLUMN {name} {ddl}"))
+            conn.execute(
+                text(
+                    """
+                    UPDATE spread_buckets
+                    SET entry_spread = CASE WHEN entry_spread = 0.0 THEN close_spread ELSE entry_spread END,
+                        avg_entry_spread = CASE WHEN avg_entry_spread = 0.0 THEN avg_spread ELSE avg_entry_spread END,
+                        avg_close_basis_spread = CASE WHEN avg_close_basis_spread = 0.0 THEN avg_spread ELSE avg_close_basis_spread END,
+                        avg_mid_spread = CASE WHEN avg_mid_spread = 0.0 THEN avg_spread ELSE avg_mid_spread END
+                    WHERE entry_spread = 0.0 OR avg_entry_spread = 0.0 OR avg_close_basis_spread = 0.0
+                    """
+                )
+            )
     if "hedge_groups" in inspector.get_table_names():
         existing_groups = {column["name"] for column in inspector.get_columns("hedge_groups")}
         group_columns = {
             "mt5_quantity": "FLOAT DEFAULT 1.0",
             "hyperliquid_quantity": "FLOAT DEFAULT 1.0",
+            "fees": "FLOAT DEFAULT 0.0",
+            "funding": "FLOAT DEFAULT 0.0",
+            "swap": "FLOAT DEFAULT 0.0",
             "trigger_spread": "FLOAT DEFAULT 0.0",
             "entry_spread": "FLOAT DEFAULT 0.0",
             "entry_threshold": "FLOAT DEFAULT 0.0",

@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import json
 import time
 from importlib import reload
@@ -14,18 +14,20 @@ from app.analytics.funding import FundingPoint, bucket_funding_points, summarize
 from app.analytics.lead_lag import lead_lag_report
 from app.market import scanner as scanner_module
 from app.market import symbols as symbol_module
-from app.db.models import Alert, ArbitrageOpportunity, AuditLog, Base, Fill, HedgeGroup, HedgeGroupEvent, Order, Position, RiskSetting, SpreadCurrent, StrategySetting, SymbolMapping, SystemSetting, User
+from app.db.models import Alert, ArbitrageOpportunity, AuditLog, Base, Fill, HedgeGroup, HedgeGroupEvent, Order, Position, RiskSetting, SpreadCurrent, SpreadDirectionCurrent, StrategySetting, SymbolMapping, SystemLog, SystemSetting, User
 from app.execution.auto_closer import evaluate_auto_close, run_auto_close
+from app.execution.auto_executor import run_auto_execute
 from app.execution.carry_costs import _mt5_swap_cost, _paper_hyperliquid_funding_cost
 from app.execution import gateway as gateway_module
-from app.execution.engine import _has_position_effect, _is_pending_result, _maker_price, close_hedge_group, open_hedge_group
+from app.execution.engine import _execution_adapters, _has_position_effect, _is_pending_result, _maker_price, close_hedge_group, open_hedge_group
 from app.execution.gateway import AdapterExecutionGateway, FillEvent, GatewayOrderResult, LegOrderIntent, OrderEvent, build_execution_gateway
 from app.execution.readiness import live_execution_readiness, paper_execution_readiness
 from app.execution.reconciler import reconcile_hedge_group, reconcile_orphan_positions, reconcile_residual_positions, sync_live_positions
 from app.config.settings import HYPERLIQUID_MAINNET_INFO_URL, HYPERLIQUID_TESTNET_INFO_URL, hyperliquid_execution_info_url
 from app.api import router as api_router
 from app.diagnostics.pipeline import _pool_payload
-from app.market.mt5_sessions import MT5SessionState, mt5_action_allowed
+from app.market.mt5_schedule import apply_mt5_session_template, infer_template, local_schedule_state
+from app.market.mt5_sessions import MT5SessionState, mt5_action_allowed, mt5_session_state
 from app.market.orderbook import order_book_cache, simulate_market_fill
 from app.market.scan_state import scan_state_store
 from app.risk.engine import pre_trade_check
@@ -39,6 +41,7 @@ from app.schemas import SymbolMappingIn
 from app.strategy.cost import estimate_cost
 from app.strategy.live_costs import _estimate_mt5_swap_cost, _hyperliquid_effective_fee_rates
 from app.strategy.statistical_signal import evaluate_entry_signal, refresh_signal_stats_cache
+from app.strategy.spread_math import spreads_for_direction
 from app.strategy.signals import evaluate_signal
 from app.workers.market_data import MarketDataManager, _exchange_time_from_hyperliquid_ms, hyperliquid_symbol_map, l2book_subscription
 
@@ -749,6 +752,61 @@ def test_hyperliquid_live_positions_use_execution_info_url(monkeypatch) -> None:
     assert urls == [HYPERLIQUID_MAINNET_INFO_URL, HYPERLIQUID_MAINNET_INFO_URL]
 
 
+def test_hyperliquid_paper_live_probe_uses_minimum_real_order_and_paper_quantity(monkeypatch) -> None:
+    submitted = []
+
+    class FakeExchange:
+        def market_open(self, name, is_buy, sz, px, slippage):
+            submitted.append((name, is_buy, sz, px, slippage))
+            return {
+                "status": "ok",
+                "response": {
+                    "data": {
+                        "statuses": [
+                            {"filled": {"totalSz": str(sz), "avgPx": "100.5", "oid": 12345}},
+                        ]
+                    }
+                },
+            }
+
+    adapter = HyperliquidAdapter(live=True)
+    adapter.paper_price_probe = True
+    adapter.settings = SimpleNamespace(
+        hyperliquid_paper_live_order_enabled=True,
+        hyperliquid_account_address="0xabc",
+        hyperliquid_secret_key="0xkey",
+        hyperliquid_default_min_notional=10.0,
+        hyperliquid_paper_live_slippage=0.01,
+        hyperliquid_info_url="https://example.test/info",
+    )
+    adapter._post_info = lambda payload: (
+        {"universe": [{"name": "BTC", "szDecimals": 5}]} if payload["type"] == "meta" else {"BTC": "65000"}
+    )
+    adapter._fee_rate = lambda order: 0.001
+    monkeypatch.setattr("app.adapters.hyperliquid._load_hyperliquid_exchange", lambda settings: FakeExchange())
+
+    result = adapter.place_order(AdapterOrder(platform="hyperliquid", symbol="BTC", side="buy", quantity=0.25, venue_symbol="BTC"))
+
+    assert submitted == [("BTC", True, 0.00016, None, 0.01)]
+    assert result.success
+    assert result.external_order_id == "12345"
+    assert result.filled_quantity == 0.25
+    assert result.average_price == 100.5
+    assert result.fee == pytest.approx(0.25 * 100.5 * 0.001)
+    assert "探针真实成交量" in result.error_message
+
+
+def test_execution_adapters_enable_hyperliquid_probe_only_for_paper_switch(monkeypatch) -> None:
+    monkeypatch.setattr("app.execution.engine.get_settings", lambda: SimpleNamespace(hyperliquid_paper_live_order_enabled=True))
+
+    hl, mt5 = _execution_adapters(live=False, simulated=True)
+
+    assert hl.live is True
+    assert hl.paper_price_probe is True
+    assert getattr(hl, "simulated") is True
+    assert mt5.demo is True
+
+
 def test_symbol_mapping_rejects_mt5_style_hyperliquid_symbol() -> None:
     with pytest.raises(ValueError, match="Hyperliquid 标准永续"):
         SymbolMappingIn(symbol="BTC", hyperliquid_symbol="BTCUSD", mt5_symbol="BTCUSD")
@@ -902,6 +960,8 @@ def test_live_open_orders_are_not_reduce_only(monkeypatch) -> None:
 
     monkeypatch.setattr("app.execution.engine.build_execution_gateway", lambda adapter: FakeGateway())
     monkeypatch.setattr("app.execution.engine.live_execution_readiness", lambda db: {"checks": []})
+    monkeypatch.setattr("app.execution.engine.mt5_session_state", lambda mapping: MT5SessionState(mapping.symbol, "normal_trade", "", True, True, True, True, True))
+    monkeypatch.setattr("app.execution.engine.mt5_market_order_check", lambda *args, **kwargs: SimpleNamespace(allowed=True, message="ok"))
     monkeypatch.setattr("app.execution.engine.quote_synchronizer.synchronized", lambda *args, **kwargs: (SimpleNamespace(hyperliquid=SimpleNamespace(local_recv_ts=datetime.utcnow()), time_diff_ms=0), ""))
     monkeypatch.setattr("app.execution.engine.pre_trade_check", lambda *args, **kwargs: SimpleNamespace(allowed=True, reason=""))
 
@@ -962,15 +1022,210 @@ def test_paper_open_uses_hyperliquid_sim_and_mt5_demo_adapters(monkeypatch) -> N
             return GatewayOrderResult(True, event, (fill,), result)
 
     monkeypatch.setattr("app.execution.engine.paper_execution_readiness", lambda db: {"checks": []})
+    monkeypatch.setattr("app.execution.engine.mt5_session_state", lambda mapping: MT5SessionState(mapping.symbol, "normal_trade", "", True, True, True, True, True))
+    monkeypatch.setattr("app.execution.engine.mt5_market_order_check", lambda *args, **kwargs: SimpleNamespace(allowed=True, message="ok"))
     monkeypatch.setattr("app.execution.engine.build_execution_gateway", lambda adapter: FakeGateway(adapter))
     monkeypatch.setattr("app.execution.engine.quote_synchronizer.synchronized", lambda *args, **kwargs: (SimpleNamespace(hyperliquid=SimpleNamespace(local_recv_ts=datetime.utcnow()), time_diff_ms=0), ""))
     monkeypatch.setattr("app.execution.engine.pre_trade_check", lambda *args, **kwargs: SimpleNamespace(allowed=True, reason=""))
+    monkeypatch.setattr("app.execution.engine.get_settings", lambda: SimpleNamespace(hyperliquid_paper_live_order_enabled=False, paper_live_parallel_execution=False, strict_quote_sync_ms=500, quote_stale_ms=1500, default_slippage_bps=0))
+    monkeypatch.setattr("app.execution.engine.get_settings", lambda: SimpleNamespace(hyperliquid_paper_live_order_enabled=False, strict_quote_sync_ms=500, quote_stale_ms=1500, default_slippage_bps=0))
 
     group = open_hedge_group(db, opportunity.id)
 
     assert group.status == "open"
     assert ("hyperliquid", True, False, False) in seen
     assert ("mt5", False, True, False) in seen
+
+
+def test_open_blocks_when_mt5_session_disallows_open_before_hyperliquid_leg(monkeypatch) -> None:
+    engine = create_engine("sqlite:///:memory:", future=True)
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine, future=True)
+    db = Session()
+    db.add(StrategySetting(execution_mode="paper"))
+    db.add(SymbolMapping(symbol="SPCX", hyperliquid_symbol="xyz:SPCX", mt5_symbol="SPCXz"))
+    opportunity = ArbitrageOpportunity(
+        symbol="SPCX",
+        direction="long_mt5_short_hyperliquid",
+        status="executable",
+        notional=500,
+        quantity=34.0,
+        hyperliquid_quantity=34.0,
+        mt5_quantity=0.34,
+        gross_spread=0.2,
+        unit_cost=0.01,
+        unit_net_profit=0.19,
+        entry_threshold=0.1,
+        exit_target=0.0,
+        total_cost=0.34,
+        net_profit=6.46,
+        annualized_return=0.1,
+    )
+    db.add(opportunity)
+    db.commit()
+    gateway_calls = []
+    sync_calls = []
+
+    monkeypatch.setattr("app.execution.engine.paper_execution_readiness", lambda db: {"checks": []})
+    monkeypatch.setattr(
+        "app.execution.engine.mt5_session_state",
+        lambda mapping: MT5SessionState(mapping.symbol, "reduce_only", "MT5 当前只允许平仓", True, False, False, True, True),
+    )
+    monkeypatch.setattr("app.execution.engine.build_execution_gateway", lambda adapter: gateway_calls.append(adapter.platform))
+    monkeypatch.setattr("app.execution.engine.quote_synchronizer.synchronized", lambda *args, **kwargs: sync_calls.append(args) or (None, "should not sync"))
+
+    with pytest.raises(ValueError, match="MT5 当前不允许该方向新开仓"):
+        open_hedge_group(db, opportunity.id)
+
+    db.refresh(opportunity)
+    assert "MT5 当前不允许该方向新开仓" in opportunity.reject_reason
+    assert db.query(HedgeGroup).count() == 0
+    assert db.query(Order).count() == 0
+    assert db.query(Fill).count() == 0
+    assert gateway_calls == []
+    assert sync_calls == []
+
+
+def test_open_blocks_when_mt5_order_check_rejects_before_hyperliquid_leg(monkeypatch) -> None:
+    engine = create_engine("sqlite:///:memory:", future=True)
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine, future=True)
+    db = Session()
+    db.add(StrategySetting(execution_mode="paper"))
+    db.add(SymbolMapping(symbol="SPCX", hyperliquid_symbol="xyz:SPCX", mt5_symbol="SPCXz"))
+    opportunity = ArbitrageOpportunity(
+        symbol="SPCX",
+        direction="long_mt5_short_hyperliquid",
+        status="executable",
+        notional=500,
+        quantity=34.0,
+        hyperliquid_quantity=34.0,
+        mt5_quantity=0.34,
+        gross_spread=0.2,
+        unit_cost=0.01,
+        unit_net_profit=0.19,
+        entry_threshold=0.1,
+        exit_target=0.0,
+        total_cost=0.34,
+        net_profit=6.46,
+        annualized_return=0.1,
+    )
+    db.add(opportunity)
+    db.commit()
+    gateway_calls = []
+    checks = []
+
+    monkeypatch.setattr("app.execution.engine.paper_execution_readiness", lambda db: {"checks": []})
+    monkeypatch.setattr("app.execution.engine.mt5_session_state", lambda mapping: MT5SessionState(mapping.symbol, "normal_trade", "", True, True, True, True, True))
+    monkeypatch.setattr(
+        "app.execution.engine.mt5_market_order_check",
+        lambda symbol, side, quantity, **kwargs: checks.append((symbol, side, quantity, kwargs)) or SimpleNamespace(allowed=False, message="retcode=10044: Only position closing is allowed"),
+    )
+    monkeypatch.setattr("app.execution.engine.build_execution_gateway", lambda adapter: gateway_calls.append(adapter.platform))
+
+    with pytest.raises(ValueError, match="MT5 当前订单预检查失败"):
+        open_hedge_group(db, opportunity.id)
+
+    db.refresh(opportunity)
+    assert checks == [("SPCXz", "buy", 0.34, {"demo": True})]
+    assert "retcode=10044" in opportunity.reject_reason
+    assert db.query(HedgeGroup).count() == 0
+    assert db.query(Order).count() == 0
+    assert gateway_calls == []
+
+
+def test_auto_execute_waits_for_mt5_tradability_cache(monkeypatch) -> None:
+    engine = create_engine("sqlite:///:memory:", future=True)
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine, future=True)
+    db = Session()
+    db.add(StrategySetting(execution_mode="paper", auto_execute_enabled=True, auto_execute_min_hold_ms=0, auto_execute_confirm_ticks=1))
+    db.add(
+        ArbitrageOpportunity(
+            symbol="SPCX",
+            direction="long_mt5_short_hyperliquid",
+            status="executable",
+            notional=500,
+            quantity=34.0,
+            hyperliquid_quantity=34.0,
+            mt5_quantity=0.34,
+            gross_spread=0.2,
+            unit_cost=0.01,
+            unit_net_profit=0.19,
+            entry_threshold=0.1,
+            exit_target=0.0,
+            total_cost=0.34,
+            net_profit=6.46,
+            annualized_return=0.1,
+        )
+    )
+    db.commit()
+    calls = []
+
+    monkeypatch.setattr("app.execution.auto_executor.mt5_tradability_cache.initialized", lambda: False)
+    monkeypatch.setattr("app.execution.auto_executor.open_hedge_group", lambda *args, **kwargs: calls.append(args))
+
+    assert run_auto_execute(db) == 0
+    assert calls == []
+    assert "缓存尚未初始化" in db.query(SystemLog).order_by(SystemLog.id.desc()).first().message
+
+
+def test_open_quarantines_mt5_side_after_order_send_10044(monkeypatch) -> None:
+    engine = create_engine("sqlite:///:memory:", future=True)
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine, future=True)
+    db = Session()
+    db.add(StrategySetting(execution_mode="paper"))
+    db.add(SymbolMapping(symbol="SPCX", hyperliquid_symbol="xyz:SPCX", mt5_symbol="SPCXz"))
+    opportunity = ArbitrageOpportunity(
+        symbol="SPCX",
+        direction="long_mt5_short_hyperliquid",
+        status="executable",
+        notional=500,
+        quantity=34.0,
+        hyperliquid_quantity=34.0,
+        mt5_quantity=0.34,
+        gross_spread=0.2,
+        unit_cost=0.01,
+        unit_net_profit=0.19,
+        entry_threshold=0.1,
+        exit_target=0.0,
+        total_cost=0.34,
+        net_profit=6.46,
+        annualized_return=0.1,
+    )
+    db.add(opportunity)
+    db.commit()
+
+    class FakeGateway:
+        def __init__(self, adapter) -> None:
+            self.platform = adapter.platform
+
+        def submit_order(self, intent, *, paper_latency_ms=0):
+            if intent.platform == "hyperliquid":
+                result = AdapterOrderResult(True, "hl-1", "filled", intent.quantity, 151.0, 0.1)
+                event = OrderEvent(intent.platform, intent.symbol, intent.side, "filled", result.external_order_id, intent.quantity, intent.quantity, 151.0, 0.1)
+                fill = FillEvent(intent.platform, intent.symbol, intent.side, intent.quantity, 151.0, 0.1, result.external_order_id)
+                return GatewayOrderResult(True, event, (fill,), result)
+            result = AdapterOrderResult(False, "mt5-1", "rejected", 0.0, 0.0, 0.0, "MT5 order_send 失败 retcode=10044: mt5-hedge")
+            event = OrderEvent(intent.platform, intent.symbol, intent.side, "rejected", result.external_order_id, intent.quantity, 0.0, 0.0, 0.0, result.error_message)
+            return GatewayOrderResult(False, event, (), result)
+
+    monkeypatch.setattr("app.execution.engine.paper_execution_readiness", lambda db: {"checks": []})
+    monkeypatch.setattr("app.execution.engine.mt5_session_state", lambda mapping: MT5SessionState(mapping.symbol, "normal_trade", "", True, True, True, True, True))
+    monkeypatch.setattr("app.execution.engine.mt5_market_order_check", lambda *args, **kwargs: SimpleNamespace(allowed=True, message="Done"))
+    monkeypatch.setattr("app.execution.engine.build_execution_gateway", lambda adapter: FakeGateway(adapter))
+    monkeypatch.setattr("app.execution.engine.quote_synchronizer.synchronized", lambda *args, **kwargs: (SimpleNamespace(hyperliquid=SimpleNamespace(local_recv_ts=datetime.utcnow()), time_diff_ms=0), ""))
+    monkeypatch.setattr("app.execution.engine.pre_trade_check", lambda *args, **kwargs: SimpleNamespace(allowed=True, reason=""))
+    monkeypatch.setattr("app.execution.engine.get_settings", lambda: SimpleNamespace(hyperliquid_paper_live_order_enabled=False, paper_live_parallel_execution=False, strict_quote_sync_ms=500, quote_stale_ms=1500, default_slippage_bps=0))
+
+    group = open_hedge_group(db, opportunity.id)
+
+    assert group.status == "manual_intervention"
+    block = db.get(SystemSetting, "mt5_tradability_block:SPCX:buy")
+    assert block is not None
+    assert "retcode=10044" in block.value
+    assert db.query(Order).filter(Order.hedge_group_id == group.id, Order.platform == "mt5", Order.status == "rejected").count() == 1
 
 
 def test_paper_open_records_actual_entry_spread_from_fills(monkeypatch) -> None:
@@ -1013,6 +1268,8 @@ def test_paper_open_records_actual_entry_spread_from_fills(monkeypatch) -> None:
 
     monkeypatch.setattr("app.execution.engine.paper_execution_readiness", lambda db: {"checks": []})
     monkeypatch.setattr("app.execution.engine.refresh_execution_quotes", lambda *args, **kwargs: ["hyperliquid"])
+    monkeypatch.setattr("app.execution.engine.mt5_session_state", lambda mapping: MT5SessionState(mapping.symbol, "normal_trade", "", True, True, True, True, True))
+    monkeypatch.setattr("app.execution.engine.mt5_market_order_check", lambda *args, **kwargs: SimpleNamespace(allowed=True, message="ok"))
     monkeypatch.setattr("app.execution.engine.build_execution_gateway", lambda adapter: FakeGateway(adapter))
     monkeypatch.setattr("app.execution.engine.quote_synchronizer.synchronized", lambda *args, **kwargs: (SimpleNamespace(hyperliquid=SimpleNamespace(local_recv_ts=datetime.utcnow()), time_diff_ms=0), ""))
     monkeypatch.setattr("app.execution.engine.pre_trade_check", lambda *args, **kwargs: SimpleNamespace(allowed=True, reason=""))
@@ -1064,9 +1321,12 @@ def test_paper_open_waits_for_hyperliquid_fill_before_mt5(monkeypatch) -> None:
             return GatewayOrderResult(True, event, (), result)
 
     monkeypatch.setattr("app.execution.engine.paper_execution_readiness", lambda db: {"checks": []})
+    monkeypatch.setattr("app.execution.engine.mt5_session_state", lambda mapping: MT5SessionState(mapping.symbol, "normal_trade", "", True, True, True, True, True))
+    monkeypatch.setattr("app.execution.engine.mt5_market_order_check", lambda *args, **kwargs: SimpleNamespace(allowed=True, message="ok"))
     monkeypatch.setattr("app.execution.engine.build_execution_gateway", lambda adapter: FakeGateway(adapter))
     monkeypatch.setattr("app.execution.engine.quote_synchronizer.synchronized", lambda *args, **kwargs: (SimpleNamespace(hyperliquid=SimpleNamespace(local_recv_ts=datetime.utcnow()), time_diff_ms=0), ""))
     monkeypatch.setattr("app.execution.engine.pre_trade_check", lambda *args, **kwargs: SimpleNamespace(allowed=True, reason=""))
+    monkeypatch.setattr("app.execution.engine.get_settings", lambda: SimpleNamespace(hyperliquid_paper_live_order_enabled=False, paper_live_parallel_execution=False, strict_quote_sync_ms=500, quote_stale_ms=1500, default_slippage_bps=0))
 
     group = open_hedge_group(db, opportunity.id)
 
@@ -1121,13 +1381,70 @@ def test_open_refreshes_execution_quotes_after_strict_sync_failure(monkeypatch) 
 
     monkeypatch.setattr("app.execution.engine.paper_execution_readiness", lambda db: {"checks": []})
     monkeypatch.setattr("app.execution.engine.refresh_execution_quotes", lambda mapping, **kwargs: refreshed.append((mapping.symbol, kwargs.get("refresh_mt5"))) or ["hyperliquid", "mt5"])
+    monkeypatch.setattr("app.execution.engine.mt5_session_state", lambda mapping: MT5SessionState(mapping.symbol, "normal_trade", "", True, True, True, True, True))
+    monkeypatch.setattr("app.execution.engine.mt5_market_order_check", lambda *args, **kwargs: SimpleNamespace(allowed=True, message="ok"))
     monkeypatch.setattr("app.execution.engine.quote_synchronizer.synchronized", lambda *args, **kwargs: sync_results.pop(0))
     monkeypatch.setattr("app.execution.engine.build_execution_gateway", lambda adapter: FakeGateway())
+    monkeypatch.setattr("app.execution.engine.get_settings", lambda: SimpleNamespace(hyperliquid_paper_live_order_enabled=False, paper_live_parallel_execution=False, strict_quote_sync_ms=500, quote_stale_ms=1500, default_slippage_bps=0))
 
     group = open_hedge_group(db, opportunity.id)
 
     assert refreshed == [("JP225", None), ("JP225", False)]
     assert group.status == "open"
+    assert db.query(Order).filter(Order.hedge_group_id == group.id).count() == 2
+
+
+def test_paper_live_parallel_submits_hyperliquid_and_mt5_without_waiting(monkeypatch) -> None:
+    engine = create_engine("sqlite:///:memory:", future=True)
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine, future=True)
+    db = Session()
+    db.add(StrategySetting(execution_mode="paper", paper_hyperliquid_latency_ms_min=0, paper_hyperliquid_latency_ms_max=0, paper_mt5_latency_ms_min=0, paper_mt5_latency_ms_max=0))
+    db.add(SymbolMapping(symbol="JP225", hyperliquid_symbol="xyz:JP225", mt5_symbol="JP225z"))
+    opportunity = ArbitrageOpportunity(
+        symbol="JP225",
+        direction="long_hyperliquid_short_mt5",
+        status="executable",
+        notional=450,
+        quantity=1.0,
+        hyperliquid_quantity=0.00015,
+        mt5_quantity=1.0,
+        gross_spread=20,
+        unit_cost=1,
+        unit_net_profit=19,
+        entry_threshold=10,
+        exit_target=2,
+        total_cost=1,
+        net_profit=19,
+        annualized_return=0.1,
+    )
+    db.add(opportunity)
+    db.commit()
+    submitted = []
+
+    class FakeGateway:
+        def __init__(self, adapter) -> None:
+            self.platform = adapter.platform
+
+        def submit_order(self, intent, *, paper_latency_ms=0):
+            submitted.append(intent)
+            result = AdapterOrderResult(True, f"{intent.platform}-open", "filled", intent.quantity, 100.0, 0.1)
+            event = OrderEvent(intent.platform, intent.symbol, intent.side, "filled", result.external_order_id, intent.quantity, intent.quantity, 100.0, 0.1)
+            fill = FillEvent(intent.platform, intent.symbol, intent.side, intent.quantity, 100.0, 0.1, result.external_order_id)
+            return GatewayOrderResult(True, event, (fill,), result)
+
+    monkeypatch.setattr("app.execution.engine.paper_execution_readiness", lambda db: {"checks": []})
+    monkeypatch.setattr("app.execution.engine.mt5_session_state", lambda mapping: MT5SessionState(mapping.symbol, "normal_trade", "", True, True, True, True, True))
+    monkeypatch.setattr("app.execution.engine.mt5_market_order_check", lambda *args, **kwargs: SimpleNamespace(allowed=True, message="ok"))
+    monkeypatch.setattr("app.execution.engine.build_execution_gateway", lambda adapter: FakeGateway(adapter))
+    monkeypatch.setattr("app.execution.engine.quote_synchronizer.synchronized", lambda *args, **kwargs: (SimpleNamespace(hyperliquid=SimpleNamespace(local_recv_ts=datetime.utcnow()), time_diff_ms=0), ""))
+    monkeypatch.setattr("app.execution.engine.pre_trade_check", lambda *args, **kwargs: SimpleNamespace(allowed=True, reason=""))
+    monkeypatch.setattr("app.execution.engine.get_settings", lambda: SimpleNamespace(hyperliquid_paper_live_order_enabled=True, paper_live_parallel_execution=True, strict_quote_sync_ms=500, quote_stale_ms=1500, default_slippage_bps=0))
+
+    group = open_hedge_group(db, opportunity.id)
+
+    assert group.status == "open"
+    assert {intent.platform for intent in submitted} == {"hyperliquid", "mt5"}
     assert db.query(Order).filter(Order.hedge_group_id == group.id).count() == 2
 
 
@@ -1166,6 +1483,8 @@ def test_open_rejects_when_refreshed_quotes_no_longer_meet_entry(monkeypatch) ->
 
     monkeypatch.setattr("app.execution.engine.paper_execution_readiness", lambda db: {"checks": []})
     monkeypatch.setattr("app.execution.engine.refresh_execution_quotes", lambda mapping: ["hyperliquid", "mt5"])
+    monkeypatch.setattr("app.execution.engine.mt5_session_state", lambda mapping: MT5SessionState(mapping.symbol, "normal_trade", "", True, True, True, True, True))
+    monkeypatch.setattr("app.execution.engine.mt5_market_order_check", lambda *args, **kwargs: SimpleNamespace(allowed=True, message="ok"))
     monkeypatch.setattr("app.execution.engine.quote_synchronizer.synchronized", lambda *args, **kwargs: sync_results.pop(0))
 
     with pytest.raises(ValueError, match="主动刷新后价差不再满足入场线"):
@@ -2378,6 +2697,178 @@ def test_spread_analytics_uses_buckets_for_24h_and_7d() -> None:
     assert [point.spread for point in points] == [100]
 
 
+def test_direction_spreads_separate_entry_close_and_mid() -> None:
+    long_hl = spreads_for_direction("long_hyperliquid_short_mt5", hl_bid=99, hl_ask=101, mt5_bid=110, mt5_ask=111)
+    long_mt5 = spreads_for_direction("long_mt5_short_hyperliquid", hl_bid=99, hl_ask=101, mt5_bid=110, mt5_ask=111)
+
+    assert long_hl.entry_spread == 9
+    assert long_hl.close_spread == 12
+    assert long_hl.mid_spread == 10.5
+    assert long_hl.spread_cost == 3
+    assert long_mt5.entry_spread == -12
+    assert long_mt5.close_spread == -9
+    assert long_mt5.spread_cost == 3
+
+
+def test_load_spread_points_supports_close_and_mid_basis() -> None:
+    engine = create_engine("sqlite:///:memory:", future=True)
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine, future=True)
+    now = datetime.utcnow()
+    with Session() as db:
+        from app.db.models import SpreadSnapshot
+
+        db.add(
+            SpreadSnapshot(
+                symbol="BTC",
+                direction="long_mt5_short_hyperliquid",
+                hyperliquid_bid=99,
+                hyperliquid_ask=101,
+                mt5_bid=110,
+                mt5_ask=111,
+                gross_spread=9,
+                entry_spread=9,
+                close_spread=12,
+                mid_spread=10.5,
+                spread_cost=3,
+                total_cost=0,
+                net_profit=0,
+                annualized_return=0,
+                status="candidate",
+                created_at=now,
+            )
+        )
+        db.commit()
+
+        entry = load_spread_points(db, "BTC", "long_mt5_short_hyperliquid", "1h", basis="entry")
+        close = load_spread_points(db, "BTC", "long_mt5_short_hyperliquid", "1h", basis="close")
+        mid = load_spread_points(db, "BTC", "long_mt5_short_hyperliquid", "1h", basis="mid")
+
+    assert [point.spread for point in entry] == [9]
+    assert [point.spread for point in close] == [12]
+    assert [point.spread for point in mid] == [10.5]
+
+
+def test_statistical_exit_target_uses_close_spread_distribution() -> None:
+    engine = create_engine("sqlite:///:memory:", future=True)
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine, future=True)
+    now = datetime.utcnow()
+    with Session() as db:
+        from app.db.models import SpreadBucket
+
+        strategy = StrategySetting(
+            signal_mode="statistical",
+            statistical_lookback_range="1h",
+            statistical_min_samples=20,
+            reachable_entry_percentile=0.75,
+            reachable_entry_zscore=0.0,
+            exit_target_percentile=0.25,
+            cost_guard_percentile=0.5,
+            min_total_profit=0,
+        )
+        for index in range(30):
+            db.add(
+                SpreadBucket(
+                    symbol="JP225",
+                    direction="long_hyperliquid_short_mt5",
+                    bucket_start=now - timedelta(seconds=30 - index),
+                    bucket_seconds=1,
+                    open_spread=100 + index,
+                    high_spread=100 + index,
+                    low_spread=100 + index,
+                    close_spread=100 + index,
+                    avg_spread=100 + index,
+                    avg_entry_spread=100 + index,
+                    avg_close_basis_spread=20 + index,
+                    avg_unit_cost=0,
+                    avg_unit_net_profit=100 + index,
+                    sample_count=1,
+                )
+            )
+        db.commit()
+
+        signal = evaluate_entry_signal(db, strategy, "JP225", "long_hyperliquid_short_mt5", 126, 0, 126, 1, 1)
+
+    assert signal.reachable_entry > 100
+    assert signal.exit_target < 30
+
+
+def test_symbol_spread_limits_tighten_statistical_thresholds() -> None:
+    mapping = SymbolMapping(symbol="JP225", hyperliquid_symbol="xyz:JP225", mt5_symbol="JP225", min_entry_spread=150, max_close_spread=12)
+
+    assert scanner_module._effective_entry_threshold(mapping, 120) == 150
+    assert scanner_module._effective_entry_threshold(mapping, 180) == 180
+    assert scanner_module._effective_exit_target(mapping, 20) == 12
+    assert scanner_module._effective_exit_target(mapping, 0) == 12
+
+
+def test_auto_close_fallback_uses_symbol_max_close_spread_without_samples(monkeypatch) -> None:
+    engine = create_engine("sqlite:///:memory:", future=True)
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine, future=True)
+    now = datetime.utcnow()
+    with Session() as db:
+        strategy = StrategySetting(statistical_min_samples=20, auto_close_min_profit=0)
+        mapping = SymbolMapping(symbol="JP225", hyperliquid_symbol="xyz:JP225", mt5_symbol="JP225", max_close_spread=10)
+        group = HedgeGroup(
+            symbol="JP225",
+            direction="long_hyperliquid_short_mt5",
+            notional=1000,
+            quantity=1,
+            hyperliquid_quantity=1,
+            entry_spread=100,
+            entry_threshold=100,
+            exit_target=0,
+            open_cost=0,
+            opened_at=now,
+            status="open",
+            unrealized_pnl=20,
+        )
+        db.add_all([strategy, mapping, group])
+        db.commit()
+        synced = SimpleNamespace(
+            hyperliquid=SimpleNamespace(bid=110, ask=111),
+            mt5=SimpleNamespace(bid=100, ask=101),
+        )
+        monkeypatch.setattr("app.execution.auto_closer.quote_synchronizer.synchronized", lambda *args, **kwargs: (synced, ""))
+
+        evaluation = evaluate_auto_close(db, strategy, group)
+
+    assert evaluation.exit_target == 10
+    assert evaluation.should_close is True
+
+
+def test_scanner_records_two_direction_current_rows(monkeypatch) -> None:
+    engine = create_engine("sqlite:///:memory:", future=True)
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine, future=True)
+    db = Session()
+    db.add(StrategySetting(signal_mode="fixed_profit", min_net_profit=-999, min_annualized_return=-999, default_notional=1000))
+    db.add(SymbolMapping(symbol="DUAL", hyperliquid_symbol="DUAL", mt5_symbol="DUAL", mt5_min_lot=1, mt5_volume_step=1, mt5_contract_size=1, enabled=True))
+    db.commit()
+    quote_cache.put("hyperliquid", "DUAL", bid=99, ask=101, depth_notional=100000, source="test")
+    quote_cache.put("mt5", "DUAL", bid=110, ask=111, depth_notional=100000, source="test")
+    synced = SimpleNamespace(
+        hyperliquid=SimpleNamespace(bid=99, ask=101, mid=100, depth_notional=100000, local_recv_ts=datetime.utcnow()),
+        mt5=SimpleNamespace(bid=110, ask=111, mid=110.5, depth_notional=100000, local_recv_ts=datetime.utcnow()),
+        time_diff_ms=0,
+    )
+    monkeypatch.setattr(scanner_module.quote_synchronizer, "synchronized", lambda *args, **kwargs: (synced, ""))
+    monkeypatch.setattr(scanner_module, "mt5_session_state", lambda mapping: MT5SessionState(mapping.symbol, "normal_trade", "", True, True, True, True, True))
+    monkeypatch.setattr(scanner_module, "hyperliquid_cost_inputs", lambda symbol: SimpleNamespace(source="test", maker_fee_rate=0, taker_fee_rate=0, funding_rate=0))
+    monkeypatch.setattr(scanner_module, "mt5_cost_inputs", lambda *args, **kwargs: SimpleNamespace(source="test", commission_rate=0, swap_cost=0))
+    monkeypatch.setattr(scanner_module.mt5_tradability_cache, "is_fresh_allowed", lambda *args, **kwargs: (True, "ok"))
+
+    scanner_module.run_scan(db)
+    rows = db.query(SpreadDirectionCurrent).filter(SpreadDirectionCurrent.symbol == "DUAL").all()
+    current = db.query(SpreadCurrent).filter(SpreadCurrent.symbol == "DUAL").one()
+
+    assert {row.direction for row in rows} == {"long_hyperliquid_short_mt5", "long_mt5_short_hyperliquid"}
+    assert current.entry_spread == current.gross_spread
+    assert current.close_spread != current.entry_spread
+
+
 def test_funding_day_bucket_and_positive_bias() -> None:
     now = datetime(2026, 1, 1)
     points = [
@@ -2817,6 +3308,39 @@ def test_mt5_pre_close_blocks_open_but_allows_close() -> None:
     assert "不允许" in open_reason
     assert can_close
     assert close_reason == ""
+
+
+def test_local_mt5_stock_close_only_blocks_open_but_allows_close() -> None:
+    mapping = SymbolMapping(symbol="SPCX", hyperliquid_symbol="xyz:SPCX", mt5_symbol="SPCXz")
+    apply_mt5_session_template(mapping, "stock_us_close_only")
+    state = mt5_session_state(mapping, datetime(2026, 6, 23, 10, 30, tzinfo=timezone.utc))
+
+    can_open, open_reason = mt5_action_allowed(state, "long_hyperliquid_short_mt5", "open")
+    can_close, close_reason = mt5_action_allowed(state, "long_hyperliquid_short_mt5", "close")
+
+    assert state.status == "reduce_only"
+    assert state.session_source == "exness_template"
+    assert not can_open
+    assert "只平仓" in state.reason
+    assert "不允许" in open_reason
+    assert can_close
+    assert close_reason == ""
+
+
+def test_local_mt5_quote_only_blocks_close_for_indices() -> None:
+    mapping = SymbolMapping(symbol="JP225", hyperliquid_symbol="JP225", mt5_symbol="JP225")
+    apply_mt5_session_template(mapping, "index_us_jp")
+    state = local_schedule_state(mapping, datetime(2026, 6, 23, 21, 30, tzinfo=timezone.utc))
+
+    assert state is not None
+    assert state.status == "quote_only"
+    assert not state.can_open_long
+    assert not state.can_close_long
+
+
+def test_mt5_session_template_infers_spcx_as_stock() -> None:
+    mapping = SymbolMapping(symbol="SPCX", hyperliquid_symbol="xyz:SPCX", mt5_symbol="SPCXz")
+    assert infer_template(mapping) == "stock_us_close_only"
 
 
 def test_live_execution_readiness_blocks_missing_live_prerequisites(monkeypatch) -> None:

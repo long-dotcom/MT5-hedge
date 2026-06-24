@@ -84,7 +84,7 @@ Hyperliquid maker 能降低手续费，但会带来成交不确定性：
 
 任一边下单失败时，默认把对冲组标记为 `manual_intervention` 并产生告警。只有品种映射显式设置 `single_leg_action=auto_close` 或 `reverse_filled_leg` 时，reconciler 才会对已成交腿提交反向市价冲销单；补偿单未确认成交时仍保持人工介入。
 
-live 平仓和单腿补偿都会使用 reduce-only 语义。MT5Adapter 会把 MT5 hedging 持仓 ticket 写入 `order_send.position`；若找不到对应可减仓持仓，则拒绝发单而不是开反向新仓。Hyperliquid live 下单 SDK 当前未启用，readiness 会阻止真实提交。
+live 平仓和单腿补偿都会使用 reduce-only 语义。MT5Adapter 会把 MT5 hedging 持仓 ticket 写入 `order_send.position`；若找不到对应可减仓持仓，则拒绝发单而不是开反向新仓。Hyperliquid `execution_mode=live` 下单当前仍被 readiness 阻止；`execution_mode=paper` 可单独开启 paper-live 最小探针单取真实成交价，但账本仍按 paper 风控和目标数量计算。
 
 实盘就绪检查会读取当前已同步的 Hyperliquid/MT5 live 仓位管理状态。外部仓位必须同时匹配 live 对冲组的平台、映射品种、方向和该平台预期数量；同品种但方向或数量不一致也会视为未归属。若发现外部仓位无法匹配任何 live 对冲组，或已关闭 live 对冲组仍有残余仓位，系统会把 readiness 标为 `blocked`，live 开仓和平仓入口不会继续提交真实订单。
 

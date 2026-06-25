@@ -1,18 +1,37 @@
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 
 from sqlalchemy.orm import Session
 
-from app.analytics.spreads import load_spread_points
 from app.config.settings import get_settings
-from app.db.models import HedgeGroup, StrategySetting, SymbolMapping, SystemLog, SystemSetting, WorkerRun
+from app.db.models import StrategySetting, SystemLog, WorkerRun
 from app.db.retention import prune_table_by_id
-from app.execution.engine import close_hedge_group, paper_close_hedge_group
+from app.execution.engine import (
+    _close_sides,
+    _execution_adapters,
+    _has_position_effect,
+    _is_pending_result,
+    _paper_latency_ms,
+    _paper_live_parallel_enabled,
+    _platform_close_quantity,
+)
+from app.execution.gateway import LegOrderIntent, build_execution_gateway
+from app.execution.hedge_pool import (
+    CloseFillSnapshot,
+    CloseOrderSnapshot,
+    CloseResultEvent,
+    HedgeGroupSnapshot,
+    hedge_pool,
+)
 from app.execution.pnl import pnl_from_close_spread
 from app.market.active_refresh import refresh_execution_quotes
+from app.market.mt5_sessions import mt5_action_allowed, mt5_session_state
 from app.market.quotes import quote_synchronizer
-from app.strategy.statistical_signal import _exit_target_with_profit_buffer, _percentile
+from app.market.scanner import get_strategy_setting
+from app.market.symbols import enabled_mappings
 from app.strategy.spread_math import spreads_for_direction
 
 
@@ -25,52 +44,101 @@ class CloseEvaluation:
     estimated_profit: float
 
 
-AUTO_CLOSE_STATUSES = ("open", "open_partial")
-
-
 def run_auto_close(db: Session) -> int:
     started = time.perf_counter()
     closed = 0
-    strategy = db.query(StrategySetting).first() or StrategySetting()
+    strategy = get_strategy_setting(db)
     if not strategy.auto_close_enabled:
         return 0
 
     modes = ["paper"]
     if strategy.auto_close_live_enabled:
         modes.append("live")
-    groups = db.query(HedgeGroup).filter(HedgeGroup.status.in_(AUTO_CLOSE_STATUSES), HedgeGroup.execution_mode.in_(modes)).order_by(HedgeGroup.opened_at).limit(50).all()
-    for group in groups:
+    mappings = {mapping.symbol: mapping for mapping in enabled_mappings(db)}
+    for group in hedge_pool.snapshot_open_groups(modes):
         try:
-            if group.execution_mode == "live" and not _live_auto_close_allowed(db):
-                db.add(SystemLog(level="warning", category="auto_close", message=f"跳过 live 自动平仓: {group.symbol} #{group.id}", context="live_trading_enabled 未开启"))
-                prune_table_by_id(db, SystemLog)
-                db.commit()
-                continue
-            evaluation = evaluate_auto_close(db, strategy, group)
-            group.unrealized_pnl = evaluation.estimated_profit
-            if not evaluation.should_close:
-                continue
             if group.execution_mode == "live":
-                close_hedge_group(db, group.id, f"auto_live: {evaluation.reason}", validate_final_close=True)
-                db.add(SystemLog(level="info", category="auto_close", message=f"自动实盘平仓已提交: {group.symbol} #{group.id}", context=evaluation.reason))
-            else:
-                paper_close_hedge_group(db, group.id, evaluation.reason, evaluation.estimated_profit)
-                db.add(SystemLog(level="info", category="auto_close", message=f"自动纸面平仓成功: {group.symbol} #{group.id}", context=evaluation.reason))
-            prune_table_by_id(db, SystemLog)
-            db.commit()
-            closed += 1
+                _log(db, "warning", f"跳过 live 自动平仓: {group.symbol} #{group.id}", "内存化自动平仓首版仅执行 paper 路径")
+                continue
+            mapping = mappings.get(group.symbol)
+            if not mapping:
+                _log(db, "warning", f"自动平仓跳过: {group.symbol} #{group.id}", "品种映射不在运行缓存中")
+                continue
+            evaluation = evaluate_auto_close(db, strategy, group, mapping=mapping)
+            if not evaluation.should_close:
+                hedge_pool.upsert_group(group.with_updates(unrealized_pnl=evaluation.estimated_profit))
+                continue
+            if close_hedge_group_from_pool(db, group.id, evaluation.reason, evaluation=evaluation, mapping=mapping, strategy=strategy, auto=True):
+                closed += 1
         except Exception as exc:
             db.rollback()
-            db.add(SystemLog(level="warning", category="auto_close", message=f"自动平仓检查失败: {group.symbol} #{group.id}", context=str(exc)))
+            _log(db, "warning", f"自动平仓检查失败: {group.symbol} #{group.id}", str(exc))
             db.add(WorkerRun(worker_name="auto_closer", status="failed", duration_ms=int((time.perf_counter() - started) * 1000), error_message=str(exc)))
-            prune_table_by_id(db, SystemLog)
             prune_table_by_id(db, WorkerRun)
             db.commit()
-    db.commit()
     return closed
 
 
-def evaluate_auto_close(db: Session, strategy: StrategySetting, group: HedgeGroup) -> CloseEvaluation:
+def close_hedge_group_from_pool(
+    db: Session,
+    group_id: int,
+    reason: str,
+    *,
+    evaluation: CloseEvaluation | None = None,
+    mapping: SimpleNamespace | None = None,
+    strategy: SimpleNamespace | None = None,
+    auto: bool = False,
+) -> HedgeGroupSnapshot:
+    snapshot = hedge_pool.get(group_id)
+    if not snapshot:
+        raise ValueError("对冲组不在运行池中")
+    if snapshot.execution_mode != "paper":
+        raise ValueError("内存化平仓首版仅支持 paper 对冲组")
+    if snapshot.status not in {"open", "open_partial"}:
+        raise ValueError("当前状态不允许平仓")
+    strategy = strategy or get_strategy_setting(db)
+    mappings = {item.symbol: item for item in enabled_mappings(db)}
+    mapping = mapping or mappings.get(snapshot.symbol)
+    if not mapping:
+        raise ValueError("品种映射不在运行缓存中")
+    if evaluation is None:
+        evaluation = evaluate_auto_close(db, strategy, snapshot, mapping=mapping, force=True)
+    if not evaluation.should_close:
+        raise ValueError(evaluation.reason)
+    closing = hedge_pool.try_mark_closing(snapshot.id, reason, evaluation.estimated_profit)
+    if not closing:
+        raise ValueError("对冲组已经在平仓中")
+    try:
+        result = _execute_paper_close_snapshot(closing, mapping, strategy, reason, evaluation, auto=auto)
+        hedge_pool.enqueue_close_result(result)
+        if result.status == "closed":
+            closed = hedge_pool.mark_closed(closing.id, realized_pnl=result.realized_pnl, fees_delta=result.fees_delta, reason=result.close_reason, status="closed")
+            _log(db, "info", f"{'自动' if auto else '手工'}纸面平仓成功: {closing.symbol} #{closing.id}", result.event_detail)
+            return closed or closing
+        if result.status == "manual_intervention":
+            manual = hedge_pool.mark_manual_intervention(closing.id, result.close_reason)
+            _log(db, "warning", f"{'自动' if auto else '手工'}平仓单边异常: {closing.symbol} #{closing.id}", result.event_detail)
+            return manual or closing
+        hedge_pool.upsert_group(closing.with_updates(status=result.status, close_reason=result.close_reason, unrealized_pnl=result.unrealized_pnl or closing.unrealized_pnl))
+        _log(db, "info", f"{'自动' if auto else '手工'}纸面平仓已提交: {closing.symbol} #{closing.id}", result.event_detail)
+        return hedge_pool.get(closing.id) or closing
+    except Exception as exc:
+        hedge_pool.restore_status(snapshot, reason=str(exc))
+        raise
+
+
+def evaluate_auto_close(
+    db: Session,
+    strategy: StrategySetting | SimpleNamespace,
+    group: HedgeGroupSnapshot,
+    *,
+    mapping: SimpleNamespace | None = None,
+    force: bool = False,
+) -> CloseEvaluation:
+    if not isinstance(group, HedgeGroupSnapshot):
+        group = HedgeGroupSnapshot.from_row(group)
+    if mapping is None:
+        mapping = next((item for item in enabled_mappings(db) if item.symbol == group.symbol), None)
     settings = get_settings()
     synced, sync_reason = quote_synchronizer.synchronized(
         group.symbol,
@@ -78,9 +146,9 @@ def evaluate_auto_close(db: Session, strategy: StrategySetting, group: HedgeGrou
         max_time_diff_ms=settings.strict_quote_sync_ms,
         max_age_ms=settings.quote_stale_ms,
     )
-    if not synced:
-        mapping = db.query(SymbolMapping).filter(SymbolMapping.symbol == group.symbol).first()
-        refreshed = refresh_execution_quotes(mapping) if mapping else []
+    refreshed: list[str] = []
+    if not synced and mapping is not None:
+        refreshed = refresh_execution_quotes(mapping)
         if refreshed:
             synced, sync_reason = quote_synchronizer.synchronized(
                 group.symbol,
@@ -88,18 +156,23 @@ def evaluate_auto_close(db: Session, strategy: StrategySetting, group: HedgeGrou
                 max_time_diff_ms=settings.strict_quote_sync_ms,
                 max_age_ms=settings.quote_stale_ms,
             )
-        if not synced:
-            suffix = f"；执行前主动刷新: {','.join(refreshed)}" if refreshed else ""
-            return CloseEvaluation(False, f"{sync_reason}{suffix}", 0.0, group.exit_target or 0.0, group.unrealized_pnl)
+    if not synced:
+        suffix = f"；执行前主动刷新: {','.join(refreshed)}" if refreshed else ""
+        return CloseEvaluation(False, f"{sync_reason}{suffix}", 0.0, group.exit_target or 0.0, group.unrealized_pnl)
 
     close_spread = spreads_for_direction(group.direction, synced.hyperliquid.bid, synced.hyperliquid.ask, synced.mt5.bid, synced.mt5.ask).close_spread
-    exit_target = group.exit_target or _fallback_exit_target(db, strategy, group)
+    exit_target = _effective_exit_target(group, mapping)
     estimated_profit = pnl_from_close_spread(group, close_spread)
-    min_profit = strategy.auto_close_min_profit
+    min_profit = float(strategy.auto_close_min_profit or 0.0)
     hold_expired = _hold_expired(group, strategy)
 
     if estimated_profit < min_profit:
         return CloseEvaluation(False, f"估算平仓利润不足: {estimated_profit:.2f} < {min_profit:.2f}", close_spread, exit_target, estimated_profit)
+    if force:
+        final_ok, final_reason = _final_close_still_executable_snapshot(group, mapping, strategy, close_spread, exit_target, estimated_profit)
+        if not final_ok:
+            return CloseEvaluation(False, final_reason, close_spread, exit_target, estimated_profit)
+        return CloseEvaluation(True, f"手工平仓: {estimated_profit:.2f}", close_spread, exit_target, estimated_profit)
     if exit_target <= 0:
         if close_spread <= 0:
             return CloseEvaluation(True, f"无统计退出线但平仓价差已回到零轴: {close_spread:.2f} <= 0.00", close_spread, exit_target, estimated_profit)
@@ -113,39 +186,161 @@ def evaluate_auto_close(db: Session, strategy: StrategySetting, group: HedgeGrou
     return CloseEvaluation(False, f"等待平仓价差回归: {close_spread:.2f} > {exit_target:.2f}", close_spread, exit_target, estimated_profit)
 
 
-def _fallback_exit_target(db: Session, strategy: StrategySetting, group: HedgeGroup) -> float:
-    points = load_spread_points(db, group.symbol, group.direction, strategy.statistical_lookback_range, basis="close")
-    if len(points) < strategy.statistical_min_samples:
-        return _mapping_max_close_spread(db, group.symbol)
-    spreads = [point.spread for point in points]
-    quantity = group.hyperliquid_quantity or group.quantity or 1.0
-    entry_spread = group.entry_spread or group.entry_threshold
-    unit_open_cost = group.open_cost / max(quantity, 1e-12)
-    statistical_target = _exit_target_with_profit_buffer(
-        percentile_target=_percentile(spreads, strategy.exit_target_percentile),
-        entry_spread=entry_spread,
-        unit_cost=unit_open_cost,
-        unit_profit_buffer=strategy.auto_close_unit_profit_buffer,
+def _execute_paper_close_snapshot(
+    group: HedgeGroupSnapshot,
+    mapping: SimpleNamespace,
+    strategy: SimpleNamespace,
+    reason: str,
+    evaluation: CloseEvaluation,
+    *,
+    auto: bool,
+) -> CloseResultEvent:
+    session_state = mt5_session_state(mapping)
+    mt5_close_allowed, mt5_close_reason = mt5_action_allowed(session_state, group.direction, "close")
+    if not mt5_close_allowed:
+        raise ValueError(mt5_close_reason)
+    final_ok, final_reason = _final_close_still_executable_snapshot(group, mapping, strategy, evaluation.close_spread, evaluation.exit_target, evaluation.estimated_profit)
+    if not final_ok:
+        raise ValueError(final_reason)
+
+    hl_side, mt5_side = _close_sides(group.direction)
+    hl, mt5 = _execution_adapters(live=False, simulated=True)
+    hl_quantity = _platform_close_quantity(group.hyperliquid_quantity, group.quantity)
+    mt5_quantity = _platform_close_quantity(group.mt5_quantity, group.quantity)
+    if hl_quantity <= 0 and mt5_quantity <= 0:
+        raise ValueError("对冲组没有可平仓数量")
+
+    results = []
+    if hl_quantity > 0 and mt5_quantity > 0 and _paper_live_parallel_enabled(live=False, simulated=True, hl=hl, mapping=mapping):
+        results = _submit_parallel_close(group, mapping, hl, mt5, hl_side, mt5_side, hl_quantity, mt5_quantity, strategy)
+    elif hl_quantity > 0:
+        hl_result = _submit_close_leg(group, mapping, hl, "hyperliquid", hl_side, hl_quantity, mapping.hl_close_order_type, mapping.hyperliquid_symbol, strategy)
+        results.append(hl_result)
+        if _has_position_effect(hl_result.adapter_result) and mt5_quantity > 0:
+            fill_ratio = hl_result.adapter_result.filled_quantity / hl_quantity if hl_quantity > 0 else 0.0
+            results.append(_submit_close_leg(group, mapping, mt5, "mt5", mt5_side, mt5_quantity * fill_ratio, mapping.mt5_close_order_type, mapping.mt5_symbol, strategy))
+    elif mt5_quantity > 0:
+        results.append(_submit_close_leg(group, mapping, mt5, "mt5", mt5_side, mt5_quantity, mapping.mt5_close_order_type, mapping.mt5_symbol, strategy))
+
+    order_snapshots = tuple(_order_snapshot(item) for item in results)
+    adapter_results = [item.adapter_result for item in results]
+    fees_delta = sum(float(result.fee or 0.0) for result in adapter_results)
+    event_prefix = "auto_" if auto else ""
+    if all(_has_position_effect(result) for result in adapter_results):
+        realized = _realized_pnl_from_close_fills(group, order_snapshots)
+        if realized is None:
+            realized = evaluation.estimated_profit
+        closed_at = datetime.now(timezone.utc).replace(tzinfo=None)
+        return CloseResultEvent(group.id, "closed", reason, f"{event_prefix}closed", reason, realized, 0.0, fees_delta, closed_at, order_snapshots)
+    if any(_has_position_effect(result) for result in adapter_results):
+        detail = f"平仓单边成交: {reason}"
+        return CloseResultEvent(group.id, "manual_intervention", detail, "manual_intervention", detail, None, evaluation.estimated_profit, fees_delta, None, order_snapshots)
+    if any(_is_pending_result(result) for result in adapter_results):
+        detail = f"平仓订单待成交: {reason}"
+        return CloseResultEvent(group.id, "closing", detail, f"{event_prefix}close_pending", detail, None, evaluation.estimated_profit, fees_delta, None, order_snapshots)
+    detail = f"平仓失败: {reason}"
+    return CloseResultEvent(group.id, "open", detail, f"{event_prefix}close_failed", detail, None, evaluation.estimated_profit, fees_delta, None, order_snapshots)
+
+
+def _submit_parallel_close(group, mapping, hl, mt5, hl_side, mt5_side, hl_quantity, mt5_quantity, strategy):
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [
+            pool.submit(_submit_close_leg, group, mapping, hl, "hyperliquid", hl_side, hl_quantity, mapping.hl_close_order_type, mapping.hyperliquid_symbol, strategy),
+            pool.submit(_submit_close_leg, group, mapping, mt5, "mt5", mt5_side, mt5_quantity, mapping.mt5_close_order_type, mapping.mt5_symbol, strategy),
+        ]
+        return [future.result() for future in futures]
+
+
+def _submit_close_leg(group, mapping, adapter, platform: str, side: str, quantity: float, order_type: str, venue_symbol: str, strategy):
+    if platform == "hyperliquid" and getattr(adapter, "simulated", False):
+        refresh_execution_quotes(mapping, refresh_mt5=False)
+    gateway = build_execution_gateway(adapter)
+    return gateway.submit_order(
+        LegOrderIntent(
+            platform=platform,
+            symbol=group.symbol,
+            side=side,
+            quantity=quantity,
+            venue_symbol=venue_symbol,
+            order_type=order_type,
+            reduce_only=True,
+            hedge_group_id=group.id,
+        ),
+        paper_latency_ms=_paper_latency_ms(strategy, platform, adapter),
     )
-    max_close_spread = _mapping_max_close_spread(db, group.symbol)
-    if max_close_spread <= 0:
-        return statistical_target
-    if statistical_target <= 0:
-        return max_close_spread
-    return min(statistical_target, max_close_spread)
 
 
-def _mapping_max_close_spread(db: Session, symbol: str) -> float:
-    mapping = db.query(SymbolMapping).filter(SymbolMapping.symbol == symbol).first()
-    return float(getattr(mapping, "max_close_spread", 0.0) or 0.0) if mapping else 0.0
+def _order_snapshot(gateway_result) -> CloseOrderSnapshot:
+    result = gateway_result.adapter_result
+    fills = tuple(
+        CloseFillSnapshot(
+            platform=fill.platform,
+            symbol=fill.symbol,
+            side=fill.side,
+            quantity=float(fill.quantity or 0.0),
+            price=float(fill.price or 0.0),
+            fee=float(fill.fee or 0.0),
+            external_order_id=str(fill.external_order_id or ""),
+        )
+        for fill in gateway_result.fill_events
+    )
+    event = gateway_result.order_event
+    return CloseOrderSnapshot(
+        platform=event.platform,
+        symbol=event.symbol,
+        side=event.side,
+        quantity=float(event.requested_quantity or result.requested_quantity or 0.0),
+        order_type="market",
+        price=None,
+        post_only=False,
+        reduce_only=True,
+        ttl_seconds=0,
+        status=str(result.status or event.status),
+        external_order_id=str(result.external_order_id or event.external_order_id or ""),
+        average_price=result.average_price or event.average_price,
+        error_message=str(result.error_message or event.message or ""),
+        filled_quantity=float(result.filled_quantity or event.filled_quantity or 0.0),
+        fee=float(result.fee or event.fee or 0.0),
+        fills=fills,
+    )
 
 
-def _hold_expired(group: HedgeGroup, strategy: StrategySetting) -> bool:
+def _realized_pnl_from_close_fills(group: HedgeGroupSnapshot, orders: tuple[CloseOrderSnapshot, ...]) -> float | None:
+    prices = {order.platform: order.average_price for order in orders if order.average_price}
+    if "hyperliquid" not in prices or "mt5" not in prices:
+        return None
+    if group.direction == "long_hyperliquid_short_mt5":
+        close_spread = float(prices["mt5"]) - float(prices["hyperliquid"])
+    else:
+        close_spread = float(prices["hyperliquid"]) - float(prices["mt5"])
+    return pnl_from_close_spread(group, close_spread)
+
+
+def _final_close_still_executable_snapshot(group, mapping, strategy, close_spread: float, exit_target: float, estimated_profit: float) -> tuple[bool, str]:
+    hold_expired = _hold_expired(group, strategy)
+    if exit_target != 0 and close_spread > exit_target and not hold_expired:
+        return False, f"自动平仓最终复核失败: 平仓价差 {close_spread:.6f} > 退出线 {exit_target:.6f}"
+    min_profit = float(strategy.auto_close_min_profit or 0.0)
+    if estimated_profit < min_profit:
+        return False, f"自动平仓最终复核失败: 估算平仓利润 {estimated_profit:.2f} < {min_profit:.2f}"
+    return True, ""
+
+
+def _effective_exit_target(group: HedgeGroupSnapshot, mapping: SimpleNamespace | None) -> float:
+    group_target = float(group.exit_target or 0.0)
+    mapping_target = float(getattr(mapping, "max_close_spread", 0.0) or 0.0) if mapping else 0.0
+    if group_target and mapping_target:
+        return min(group_target, mapping_target)
+    return group_target or mapping_target
+
+
+def _hold_expired(group: HedgeGroupSnapshot, strategy: StrategySetting | SimpleNamespace) -> bool:
     if not group.opened_at:
         return False
-    return datetime.now(timezone.utc).replace(tzinfo=None) - group.opened_at >= timedelta(minutes=max(strategy.max_holding_minutes, 1))
+    return datetime.now(timezone.utc).replace(tzinfo=None) - group.opened_at >= timedelta(minutes=max(int(strategy.max_holding_minutes or 1), 1))
 
 
-def _live_auto_close_allowed(db: Session) -> bool:
-    row = db.query(SystemSetting).filter(SystemSetting.key == "live_trading_enabled").first()
-    return bool(row and row.value == "true")
+def _log(db: Session, level: str, message: str, context: str = "") -> None:
+    db.add(SystemLog(level=level, category="auto_close", message=message, context=context))
+    prune_table_by_id(db, SystemLog)
+    db.commit()

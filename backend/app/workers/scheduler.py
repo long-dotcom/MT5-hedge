@@ -8,6 +8,7 @@ from app.db.session import SessionLocal
 from app.execution.auto_closer import run_auto_close
 from app.execution.auto_executor import run_auto_execute
 from app.execution.carry_costs import run_carry_cost_sync
+from app.execution.persistence import persist_hedge_pool_events
 from app.execution.reconciler import run_execution_reconcile
 from app.market.scanner import persist_scan_state, run_scan
 from app.market.mt5_schedule import sync_mt5_session_templates
@@ -21,12 +22,16 @@ _tradability_timer: Optional[threading.Timer] = None
 _session_template_timer: Optional[threading.Timer] = None
 _scan_persistence_timer: Optional[threading.Timer] = None
 _execution_timer: Optional[threading.Timer] = None
+_carry_cost_timer: Optional[threading.Timer] = None
+_execution_persistence_timer: Optional[threading.Timer] = None
 _running = False
 _stats_refreshing = False
 _tradability_refreshing = False
 _session_template_refreshing = False
 _scan_persisting = False
 _execution_running = False
+_carry_cost_running = False
+_execution_persisting = False
 
 
 def scanner_job() -> None:
@@ -50,7 +55,6 @@ def execution_maintenance_job() -> None:
     db = SessionLocal()
     try:
         run_auto_execute(db)
-        run_carry_cost_sync(db)
         run_auto_close(db)
         run_execution_reconcile(db)
     except Exception as exc:
@@ -60,6 +64,42 @@ def execution_maintenance_job() -> None:
         db.close()
         _execution_running = False
     _schedule_next_execution()
+
+
+def carry_cost_job() -> None:
+    global _carry_cost_running
+    if _carry_cost_running:
+        _schedule_next_carry_cost()
+        return
+    _carry_cost_running = True
+    db = SessionLocal()
+    try:
+        run_carry_cost_sync(db)
+    except Exception as exc:
+        db.rollback()
+        logger.exception(f"资金费/过夜费同步任务失败: {exc}")
+    finally:
+        db.close()
+        _carry_cost_running = False
+    _schedule_next_carry_cost()
+
+
+def execution_persistence_job() -> None:
+    global _execution_persisting
+    if _execution_persisting:
+        _schedule_next_execution_persistence()
+        return
+    _execution_persisting = True
+    db = SessionLocal()
+    try:
+        persist_hedge_pool_events(db)
+    except Exception as exc:
+        db.rollback()
+        logger.exception(f"对冲池执行事件持久化失败: {exc}")
+    finally:
+        db.close()
+        _execution_persisting = False
+    _schedule_next_execution_persistence()
 
 
 def scan_persistence_job() -> None:
@@ -178,6 +218,26 @@ def _schedule_next_execution() -> None:
     _execution_timer.start()
 
 
+def _schedule_next_carry_cost() -> None:
+    global _carry_cost_timer
+    if not _running:
+        return
+    settings = get_settings()
+    interval = max(settings.carry_cost_sync_interval_seconds, 1)
+    _carry_cost_timer = threading.Timer(interval, carry_cost_job)
+    _carry_cost_timer.daemon = True
+    _carry_cost_timer.start()
+
+
+def _schedule_next_execution_persistence() -> None:
+    global _execution_persistence_timer
+    if not _running:
+        return
+    _execution_persistence_timer = threading.Timer(1.0, execution_persistence_job)
+    _execution_persistence_timer.daemon = True
+    _execution_persistence_timer.start()
+
+
 def _schedule_next_tradability() -> None:
     global _tradability_timer
     if not _running:
@@ -207,6 +267,8 @@ def start_scheduler() -> None:
         _schedule_next()
         _schedule_next_scan_persistence()
         _schedule_next_execution()
+        _schedule_next_carry_cost()
+        _schedule_next_execution_persistence()
         _schedule_next_stats()
         _schedule_next_tradability()
         _schedule_next_session_templates()
@@ -227,3 +289,7 @@ def stop_scheduler() -> None:
         _scan_persistence_timer.cancel()
     if _execution_timer:
         _execution_timer.cancel()
+    if _carry_cost_timer:
+        _carry_cost_timer.cancel()
+    if _execution_persistence_timer:
+        _execution_persistence_timer.cancel()

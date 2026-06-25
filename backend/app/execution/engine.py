@@ -12,6 +12,7 @@ from app.adapters.mt5 import mt5_market_order_check
 from app.config.settings import get_settings
 from app.db.models import Alert, ArbitrageOpportunity, Fill, HedgeGroup, HedgeGroupEvent, Order, StrategySetting, SymbolMapping, SystemSetting
 from app.execution.gateway import LegOrderIntent, build_execution_gateway
+from app.execution.hedge_pool import hedge_pool
 from app.execution.pnl import actual_entry_spread_from_fills, pnl_from_close_spread, realized_pnl_from_fills
 from app.execution.readiness import live_execution_readiness, paper_execution_readiness
 from app.market.active_refresh import refresh_execution_quotes
@@ -170,6 +171,7 @@ def open_hedge_group(db: Session, opportunity_id: int, source: str = "system") -
         db.add(HedgeGroupEvent(hedge_group_id=group.id, event_type="failed", detail="双边下单均失败"))
     db.commit()
     db.refresh(group)
+    hedge_pool.upsert_group(group)
     return group
 
 
@@ -651,6 +653,7 @@ def close_hedge_group(db: Session, group_id: int, reason: str, *, validate_final
     db.add(HedgeGroupEvent(hedge_group_id=group.id, event_type="closed", detail=reason))
     db.commit()
     db.refresh(group)
+    hedge_pool.upsert_group(group)
     return group
 
 
@@ -779,6 +782,7 @@ def _execute_close_hedge_group(
         db.add(HedgeGroupEvent(hedge_group_id=group.id, event_type=failed_event_type, detail=group.close_reason))
     db.commit()
     db.refresh(group)
+    hedge_pool.upsert_group(group)
     return group
 
 

@@ -42,7 +42,10 @@ from app.db.models import (
 from app.db.session import SessionLocal, get_db
 from app.diagnostics.pipeline import build_pipeline_diagnostics
 from app.execution.carry_costs import run_carry_cost_sync
-from app.execution.engine import close_hedge_group, open_hedge_group
+from app.execution.auto_closer import close_hedge_group_from_pool
+from app.execution.engine import open_hedge_group
+from app.execution.hedge_pool import HedgeGroupSnapshot, hedge_pool
+from app.execution.persistence import persist_hedge_pool_events
 from app.execution.readiness import live_execution_readiness, paper_execution_readiness
 from app.execution.reconciler import run_execution_reconcile
 from app.market.scanner import clear_strategy_setting_cache, run_scan
@@ -61,6 +64,8 @@ router = APIRouter(prefix="/api")
 
 
 def as_dict(row: Any) -> dict[str, Any]:
+    if isinstance(row, HedgeGroupSnapshot):
+        return dict(row.__dict__)
     data = {column.name: getattr(row, column.name) for column in row.__table__.columns}
     return data
 
@@ -374,9 +379,10 @@ def _hedge_group_payload(group: HedgeGroup) -> dict[str, Any]:
 @router.post("/hedge-groups/{group_id}/close")
 def close_group(group_id: int, payload: CloseHedgeGroupIn, user: User = Depends(require_admin), db: Session = Depends(get_db)) -> dict[str, Any]:
     try:
-        group = close_hedge_group(db, group_id, payload.reason)
+        group = close_hedge_group_from_pool(db, group_id, payload.reason)
         audit(db, user.id, "close_hedge_group", "hedge_group", str(group_id))
         db.commit()
+        persist_hedge_pool_events(db)
         return as_dict(group)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -388,6 +394,7 @@ def mark_manual(group_id: int, user: User = Depends(require_admin), db: Session 
     if not group:
         raise HTTPException(status_code=404, detail="对冲组不存在")
     group.status = "manual_intervention"
+    hedge_pool.upsert_group(group)
     audit(db, user.id, "mark_manual", "hedge_group", str(group_id))
     db.commit()
     return as_dict(group)

@@ -9,6 +9,7 @@ from app.adapters.mt5 import _initialize_mt5
 from app.config.settings import get_settings, hyperliquid_execution_info_url
 from app.db.models import HedgeGroup, Order, SymbolMapping, SystemLog, WorkerRun
 from app.db.retention import prune_table_by_id
+from app.execution.hedge_pool import hedge_pool
 
 
 ACTIVE_COST_STATUSES = {"open", "open_partial", "closing", "manual_intervention"}
@@ -43,6 +44,7 @@ def run_carry_cost_sync(db: Session, *, force: bool = False) -> int:
         db.add(WorkerRun(worker_name="carry_cost_sync", status="success", duration_ms=int((time.perf_counter() - started) * 1000)))
         prune_table_by_id(db, WorkerRun)
         db.commit()
+        hedge_pool.load_from_db(db)
         return changed
     except Exception as exc:
         db.rollback()

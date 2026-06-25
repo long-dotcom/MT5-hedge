@@ -9,6 +9,7 @@ from app.config.settings import get_settings
 from app.db.models import Alert, Fill, HedgeGroup, HedgeGroupEvent, Order, Position, SymbolMapping, SystemLog, WorkerRun
 from app.db.retention import prune_table_by_id
 from app.execution.gateway import LegOrderIntent, build_execution_gateway
+from app.execution.hedge_pool import hedge_pool
 from app.execution.pnl import actual_entry_spread_from_fills, realized_pnl_from_fills
 
 
@@ -34,6 +35,7 @@ def run_execution_reconcile(db: Session) -> int:
         db.add(WorkerRun(worker_name="execution_reconciler", status="success", duration_ms=int((time.perf_counter() - started) * 1000)))
         prune_table_by_id(db, WorkerRun)
         db.commit()
+        hedge_pool.load_from_db(db)
         return reconciled
     except Exception as exc:
         db.rollback()

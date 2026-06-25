@@ -21,6 +21,8 @@ from app.execution.carry_costs import _mt5_swap_cost, _paper_hyperliquid_funding
 from app.execution import gateway as gateway_module
 from app.execution.engine import _effective_close_exit_target, _execution_adapters, _final_close_still_executable, _has_position_effect, _is_pending_result, _maker_price, close_hedge_group, open_hedge_group
 from app.execution.gateway import AdapterExecutionGateway, FillEvent, GatewayOrderResult, LegOrderIntent, OrderEvent, build_execution_gateway
+from app.execution.hedge_pool import HedgeGroupSnapshot, hedge_pool
+from app.execution.persistence import persist_hedge_pool_events
 from app.execution.readiness import live_execution_readiness, paper_execution_readiness
 from app.execution.reconciler import reconcile_hedge_group, reconcile_orphan_positions, reconcile_residual_positions, sync_live_positions
 from app.config.settings import HYPERLIQUID_MAINNET_INFO_URL, HYPERLIQUID_TESTNET_INFO_URL, hyperliquid_execution_info_url
@@ -1513,7 +1515,7 @@ def test_auto_close_skips_live_group_without_live_switch(monkeypatch) -> None:
     db, group_id = _live_close_test_db(auto_close_live_enabled=True, live_trading_enabled=False)
     _seed_auto_close_quotes()
     called = []
-    monkeypatch.setattr("app.execution.auto_closer.close_hedge_group", lambda *args, **kwargs: called.append(args))
+    hedge_pool.load_from_db(db)
 
     closed = run_auto_close(db)
     group = db.get(HedgeGroup, group_id)
@@ -1523,8 +1525,13 @@ def test_auto_close_skips_live_group_without_live_switch(monkeypatch) -> None:
     assert group.status == "open"
 
 
-def test_auto_close_live_group_submits_reverse_orders(monkeypatch) -> None:
+def test_auto_close_paper_group_submits_reverse_orders(monkeypatch) -> None:
     db, group_id = _live_close_test_db(auto_close_live_enabled=True, live_trading_enabled=True)
+    db.get(StrategySetting, 1).execution_mode = "paper"
+    group_row = db.get(HedgeGroup, group_id)
+    group_row.execution_mode = "paper"
+    db.commit()
+    hedge_pool.load_from_db(db)
     _seed_auto_close_quotes()
     submitted = []
 
@@ -1536,16 +1543,16 @@ def test_auto_close_live_group_submits_reverse_orders(monkeypatch) -> None:
             fill = FillEvent(intent.platform, intent.symbol, intent.side, intent.quantity, 100.0, 0.1, result.external_order_id)
             return GatewayOrderResult(True, event, (fill,), result)
 
-    monkeypatch.setattr("app.execution.engine.mt5_session_state", lambda mapping: MT5SessionState(mapping.symbol, "normal_trade", "", True, True, True, True, True))
-    monkeypatch.setattr("app.execution.engine.build_execution_gateway", lambda adapter: FakeGateway())
-    monkeypatch.setattr("app.execution.engine.live_execution_readiness", lambda db: {"checks": []})
+    monkeypatch.setattr("app.execution.auto_closer.mt5_session_state", lambda mapping: MT5SessionState(mapping.symbol, "normal_trade", "", True, True, True, True, True))
+    monkeypatch.setattr("app.execution.auto_closer.build_execution_gateway", lambda adapter: FakeGateway())
 
     closed = run_auto_close(db)
+    persist_hedge_pool_events(db)
     group = db.get(HedgeGroup, group_id)
 
     assert closed == 1
     assert group.status == "closed"
-    assert group.close_reason.startswith("auto_live:")
+    assert "平仓价差回归" in group.close_reason
     assert {order.reduce_only for order in db.query(Order).filter(Order.hedge_group_id == group.id).all()} == {True}
     assert [intent.reduce_only for intent in submitted] == [True, True]
     assert db.query(Fill).count() == 2
@@ -3903,3 +3910,148 @@ def test_strategy_setting_cache_requires_explicit_clear() -> None:
         assert first.min_total_profit == 1.0
         assert cached.min_total_profit == 1.0
         assert refreshed.min_total_profit == 2.0
+
+
+def test_hedge_pool_loads_and_cas_groups() -> None:
+    engine = create_engine("sqlite:///:memory:", future=True)
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine, future=True)
+    with Session() as db:
+        group = HedgeGroup(
+            symbol="POOL",
+            direction="long_hyperliquid_short_mt5",
+            status="open",
+            execution_mode="paper",
+            notional=1000,
+            quantity=1,
+            mt5_quantity=1,
+            hyperliquid_quantity=1,
+            entry_spread=20,
+            exit_target=2,
+            opened_at=datetime.now(timezone.utc).replace(tzinfo=None),
+        )
+        db.add(group)
+        db.commit()
+
+        assert hedge_pool.load_from_db(db) == 1
+        first = hedge_pool.try_mark_closing(group.id, "close", 10)
+        second = hedge_pool.try_mark_closing(group.id, "close again", 10)
+
+        assert first is not None
+        assert first.status == "closing"
+        assert second is None
+        closed = hedge_pool.mark_closed(group.id, realized_pnl=9, fees_delta=0.1, reason="done")
+        assert closed is not None
+        assert hedge_pool.get(group.id) is None
+
+
+def test_run_auto_close_uses_pool_without_hedge_group_query(monkeypatch) -> None:
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    group = HedgeGroupSnapshot(
+        id=999,
+        symbol="POOL-AUTO",
+        direction="long_hyperliquid_short_mt5",
+        status="open",
+        execution_mode="paper",
+        notional=1000,
+        quantity=1,
+        mt5_quantity=1,
+        hyperliquid_quantity=1,
+        open_cost=0,
+        fees=0,
+        funding=0,
+        swap=0,
+        realized_pnl=0,
+        unrealized_pnl=0,
+        trigger_spread=20,
+        entry_spread=20,
+        entry_threshold=10,
+        exit_target=2,
+        overheat_threshold=0,
+        close_reason="",
+        opened_at=now,
+        closed_at=None,
+        source="test",
+    )
+    hedge_pool.upsert_group(group)
+    quote_cache.put("hyperliquid", "POOL-AUTO", bid=100, ask=101, depth_notional=10000, source="test")
+    quote_cache.put("mt5", "POOL-AUTO", bid=100, ask=101, depth_notional=10000, source="test")
+    strategy = SimpleNamespace(
+        auto_close_enabled=True,
+        auto_close_live_enabled=False,
+        auto_close_min_profit=0,
+        max_holding_minutes=240,
+        paper_hyperliquid_latency_ms_min=0,
+        paper_hyperliquid_latency_ms_max=0,
+        paper_mt5_latency_ms_min=0,
+        paper_mt5_latency_ms_max=0,
+    )
+    mapping = SimpleNamespace(
+        symbol="POOL-AUTO",
+        hyperliquid_symbol="POOL-AUTO",
+        mt5_symbol="POOL-AUTO",
+        max_close_spread=2,
+        allow_hold_through_mt5_close=True,
+        execution_style="taker_taker",
+        hl_close_order_type="market",
+        mt5_close_order_type="market",
+    )
+    submitted = []
+
+    class FakeDb:
+        def query(self, *args, **kwargs):
+            raise AssertionError("auto close hot path must not query HedgeGroup")
+
+        def add(self, item):
+            return None
+
+        def commit(self):
+            return None
+
+        def rollback(self):
+            return None
+
+    class FakeGateway:
+        def submit_order(self, intent, *, paper_latency_ms=0):
+            submitted.append(intent)
+            result = AdapterOrderResult(True, f"{intent.platform}-pool", "filled", intent.quantity, 100.0, 0.0)
+            event = OrderEvent(intent.platform, intent.symbol, intent.side, "filled", result.external_order_id, intent.quantity, intent.quantity, 100.0, 0.0)
+            fill = FillEvent(intent.platform, intent.symbol, intent.side, intent.quantity, 100.0, 0.0, result.external_order_id)
+            return GatewayOrderResult(True, event, (fill,), result)
+
+    monkeypatch.setattr("app.execution.auto_closer.get_strategy_setting", lambda db: strategy)
+    monkeypatch.setattr("app.execution.auto_closer.enabled_mappings", lambda db: [mapping])
+    monkeypatch.setattr("app.execution.auto_closer.mt5_session_state", lambda mapping: MT5SessionState(mapping.symbol, "normal_trade", "", True, True, True, True, True))
+    monkeypatch.setattr("app.execution.auto_closer.build_execution_gateway", lambda adapter: FakeGateway())
+    monkeypatch.setattr("app.execution.auto_closer.prune_table_by_id", lambda *args, **kwargs: None)
+
+    closed = run_auto_close(FakeDb())
+
+    assert closed == 1
+    assert [intent.reduce_only for intent in submitted] == [True, True]
+    assert hedge_pool.get(group.id) is None
+
+
+def test_execution_maintenance_job_does_not_run_carry_cost(monkeypatch) -> None:
+    from app.workers import scheduler as scheduler_module
+
+    calls = []
+
+    class FakeDb:
+        def rollback(self):
+            return None
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr(scheduler_module, "SessionLocal", lambda: FakeDb())
+    monkeypatch.setattr(scheduler_module, "run_auto_execute", lambda db: calls.append("auto_execute"))
+    monkeypatch.setattr(scheduler_module, "run_auto_close", lambda db: calls.append("auto_close"))
+    monkeypatch.setattr(scheduler_module, "run_execution_reconcile", lambda db: calls.append("reconcile"))
+    monkeypatch.setattr(scheduler_module, "run_carry_cost_sync", lambda db: calls.append("carry_cost"))
+    scheduler_module._running = False
+    scheduler_module._execution_running = False
+
+    scheduler_module.execution_maintenance_job()
+
+    assert calls == ["auto_execute", "auto_close", "reconcile"]

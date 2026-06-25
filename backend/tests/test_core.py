@@ -2915,7 +2915,13 @@ def test_scanner_records_two_direction_current_rows(monkeypatch) -> None:
     monkeypatch.setattr(scanner_module, "mt5_cost_inputs", lambda *args, **kwargs: SimpleNamespace(source="test", commission_rate=0, swap_cost=0))
     monkeypatch.setattr(scanner_module.mt5_tradability_cache, "is_fresh_allowed", lambda *args, **kwargs: (True, "ok"))
 
+    scanner_module.clear_strategy_setting_cache()
+    symbol_module.clear_symbol_mapping_cache()
     scanner_module.run_scan(db)
+    state = scan_state_store.snapshot()
+    assert state["ready"] is True
+    assert {row["direction"] for row in state["direction_spreads"] if row["symbol"] == "DUAL"} == {"long_hyperliquid_short_mt5", "long_mt5_short_hyperliquid"}
+    scanner_module.persist_scan_state(db)
     rows = db.query(SpreadDirectionCurrent).filter(SpreadDirectionCurrent.symbol == "DUAL").all()
     current = db.query(SpreadCurrent).filter(SpreadCurrent.symbol == "DUAL").one()
     opportunity = db.query(ArbitrageOpportunity).filter(ArbitrageOpportunity.symbol == "DUAL", ArbitrageOpportunity.status == "executable").first()

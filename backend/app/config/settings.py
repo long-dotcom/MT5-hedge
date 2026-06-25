@@ -54,6 +54,8 @@ class Settings:
     scanner_interval_seconds: int = 15
     scanner_interval_ms: int = 0
     candidate_interval_seconds: int = 5
+    scan_persist_interval_ms: int = 1000
+    execution_maintenance_interval_ms: int = 1000
     spread_history_interval_seconds: int = 5
     spread_bucket_seconds: int = 5
     signal_stats_cache_ttl_ms: int = 10000

@@ -8,7 +8,7 @@ from app.db.session import SessionLocal
 from app.execution.auto_closer import run_auto_close
 from app.execution.carry_costs import run_carry_cost_sync
 from app.execution.reconciler import run_execution_reconcile
-from app.market.scanner import run_scan
+from app.market.scanner import persist_scan_state, run_scan
 from app.market.mt5_schedule import sync_mt5_session_templates
 from app.market.mt5_tradability import refresh_mt5_tradability_cache
 from app.strategy.statistical_signal import refresh_signal_stats_cache
@@ -41,6 +41,7 @@ def on_startup() -> None:
         _startup_step(db, "refresh_signal_stats_cache", lambda: refresh_signal_stats_cache(db))
         _startup_step(db, "refresh_mt5_tradability_cache", lambda: refresh_mt5_tradability_cache(db))
         _startup_step(db, "run_scan", lambda: run_scan(db))
+        _startup_step(db, "persist_scan_state", lambda: persist_scan_state(db))
         _startup_step(db, "run_carry_cost_sync", lambda: run_carry_cost_sync(db, force=True))
         _startup_step(db, "run_auto_close", lambda: run_auto_close(db))
         _startup_step(db, "run_execution_reconcile", lambda: run_execution_reconcile(db))

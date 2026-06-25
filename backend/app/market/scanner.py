@@ -88,6 +88,9 @@ def run_scan(db: Session) -> int:
     strategy = get_strategy_setting(db)
     settings = get_settings()
     try:
+        current_payloads: list[dict] = []
+        direction_payloads_all: list[dict] = []
+        opportunity_payloads: list[dict] = []
         for mapping in enabled_mappings(db):
             symbol_started = perf_counter()
             timings: dict[str, float] = {}
@@ -97,8 +100,7 @@ def run_scan(db: Session) -> int:
                 if not session_state.can_quote:
                     _record_duration(timings, "quote_sync_duration_ms", quote_sync_started)
                     persist_started = perf_counter()
-                    _upsert_current_spread(
-                        db,
+                    current_payloads.append(_current_payload(
                         symbol=mapping.symbol,
                         direction="none",
                         hyperliquid_bid=0,
@@ -114,7 +116,7 @@ def run_scan(db: Session) -> int:
                         annualized_return=0,
                         status="rejected",
                         reason=f"MT5 不可报价/不可交易: {session_state.status}，{session_state.reason}",
-                    )
+                    ))
                     _record_duration(timings, "persist_duration_ms", persist_started)
                     continue
                 synced, sync_reason = quote_synchronizer.synchronized(
@@ -126,8 +128,7 @@ def run_scan(db: Session) -> int:
                 _record_duration(timings, "quote_sync_duration_ms", quote_sync_started)
                 if not synced:
                     persist_started = perf_counter()
-                    _upsert_current_spread(
-                        db,
+                    current_payloads.append(_current_payload(
                         symbol=mapping.symbol,
                         direction="none",
                         hyperliquid_bid=0,
@@ -143,7 +144,7 @@ def run_scan(db: Session) -> int:
                         annualized_return=0,
                         status="rejected",
                         reason=sync_reason,
-                    )
+                    ))
                     _record_duration(timings, "persist_duration_ms", persist_started)
                     continue
                 hl = synced.hyperliquid
@@ -155,8 +156,7 @@ def run_scan(db: Session) -> int:
                 except ValueError as exc:
                     _record_duration(timings, "sizing_duration_ms", sizing_started)
                     persist_started = perf_counter()
-                    _upsert_current_spread(
-                        db,
+                    current_payloads.append(_current_payload(
                         symbol=mapping.symbol,
                         direction="none",
                         hyperliquid_bid=hl.bid,
@@ -176,7 +176,7 @@ def run_scan(db: Session) -> int:
                         annualized_return=0,
                         status="rejected",
                         reason=str(exc),
-                    )
+                    ))
                     _record_duration(timings, "persist_duration_ms", persist_started)
                     continue
                 _record_duration(timings, "sizing_duration_ms", sizing_started)
@@ -278,38 +278,36 @@ def run_scan(db: Session) -> int:
                         annualized_return=annualized_return,
                         status=signal.status,
                         reason=reason,
+                        sampled_at=datetime.now(timezone.utc).replace(tzinfo=None),
+                        hyperliquid_captured_at=hl.local_recv_ts,
+                        mt5_captured_at=mt.local_recv_ts,
+                        hyperliquid_depth_notional=hl.depth_notional,
+                        mt5_depth_notional=mt.depth_notional,
                     )
-                    _upsert_direction_current(db, **payload)
-                    _record_spread_history(db, hyperliquid=hl, mt5=mt, settings=settings, **payload)
-                    if _sync_current_opportunity(
-                        db,
+                    direction_payloads_all.append(payload)
+                    opportunity_payload = _opportunity_payload(
+                        payload,
                         notional=notional,
                         entry_threshold=entry_threshold,
                         exit_target=exit_target,
                         overheat_threshold=statistical_signal.overheat,
                         signal_sample_count=statistical_signal.sample_count,
                         reason=signal.reason,
-                        **{key: payload[key] for key in (
-                            "symbol", "direction", "hyperliquid_bid", "hyperliquid_ask", "mt5_bid", "mt5_ask",
-                            "quantity", "mt5_quantity", "hyperliquid_quantity",
-                            "notional_currency", "fx_rate_to_usd", "gross_spread", "unit_cost",
-                            "unit_net_profit", "total_cost", "net_profit", "annualized_return", "status"
-                        )},
-                    ):
+                    )
+                    if opportunity_payload:
                         created += 1
+                        opportunity_payloads.append(opportunity_payload)
                     direction_payloads.append(payload)
                 _record_duration(timings, "cost_duration_ms", cost_started)
                 _record_duration(timings, "signal_duration_ms", signal_started)
                 _record_duration(timings, "candidate_sync_duration_ms", candidate_started)
                 best_payload = _best_current_payload(direction_payloads)
-                _upsert_current_spread(db, **best_payload)
+                current_payloads.append(best_payload)
                 _record_duration(timings, "persist_duration_ms", persist_started)
             finally:
                 timings["symbol_scan_duration_ms"] = _elapsed_ms(symbol_started)
                 _scan_timings[mapping.symbol.upper()] = timings
-        db.flush()
-        _update_scan_state_store(db)
-        db.commit()
+        _update_scan_state_store(current_payloads, opportunity_payloads, direction_payloads_all)
         return created
     except Exception as exc:
         db.rollback()
@@ -406,6 +404,93 @@ def _elapsed_ms(started: float) -> float:
 
 def _record_duration(timings: dict[str, float], key: str, started: float) -> None:
     timings[key] = _elapsed_ms(started)
+
+
+def _current_payload(**values) -> dict:
+    values.setdefault("entry_spread", values.get("gross_spread", 0.0))
+    values.setdefault("close_spread", values.get("gross_spread", 0.0))
+    values.setdefault("mid_spread", values.get("gross_spread", 0.0))
+    values.setdefault("spread_cost", values.get("close_spread", 0.0) - values.get("entry_spread", 0.0))
+    values.setdefault("mt5_quantity", values.get("quantity", 0.0))
+    values.setdefault("hyperliquid_quantity", values.get("quantity", 0.0))
+    values.setdefault("notional_currency", "USD")
+    values.setdefault("fx_rate_to_usd", 1.0)
+    values.setdefault("sampled_at", datetime.now(timezone.utc).replace(tzinfo=None))
+    return values
+
+
+def _opportunity_payload(
+    payload: dict,
+    *,
+    notional: float,
+    entry_threshold: float,
+    exit_target: float,
+    overheat_threshold: float,
+    signal_sample_count: int,
+    reason: str,
+) -> dict | None:
+    if payload["status"] not in {"candidate", "executable", "executing"}:
+        return None
+    return {
+        **{key: payload[key] for key in (
+            "symbol", "direction", "hyperliquid_bid", "hyperliquid_ask", "mt5_bid", "mt5_ask",
+            "quantity", "mt5_quantity", "hyperliquid_quantity", "notional_currency", "fx_rate_to_usd",
+            "gross_spread", "unit_cost", "unit_net_profit", "total_cost", "net_profit",
+            "annualized_return", "status"
+        )},
+        "notional": notional,
+        "entry_threshold": entry_threshold,
+        "exit_target": exit_target,
+        "overheat_threshold": overheat_threshold,
+        "signal_sample_count": signal_sample_count,
+        "reason": reason,
+        "created_at": payload.get("sampled_at"),
+        "updated_at": payload.get("sampled_at"),
+    }
+
+
+def persist_scan_state(db: Session) -> dict[str, int]:
+    state = scan_state_store.snapshot()
+    if not state["ready"]:
+        return {"spread_direction_current": 0, "spread_current": 0, "opportunities": 0, "history": 0}
+    settings = get_settings()
+    direction_spreads = state.get("direction_spreads", [])
+    current_spreads = state.get("spreads", [])
+    opportunities = state.get("opportunities", [])
+    ids_by_key: dict[tuple[str, str], int] = {}
+
+    for payload in direction_spreads:
+        _upsert_direction_current(db, **_filter_payload(payload, _spread_direction_fields()))
+        _record_spread_history_from_payload(db, payload, settings)
+    for payload in current_spreads:
+        _upsert_current_spread(db, **_filter_payload(payload, _spread_current_fields()))
+    scanned_symbols = {str(row.get("symbol", "")).upper() for row in [*direction_spreads, *current_spreads] if row.get("symbol")}
+    changed_opportunities = _persist_opportunities(db, opportunities, ids_by_key, scanned_symbols)
+    db.commit()
+    scan_state_store.merge_opportunity_ids(ids_by_key)
+    return {
+        "spread_direction_current": len(direction_spreads),
+        "spread_current": len(current_spreads),
+        "opportunities": changed_opportunities,
+        "history": len(direction_spreads),
+    }
+
+
+def _filter_payload(payload: dict, fields: set[str]) -> dict:
+    return {key: payload[key] for key in fields if key in payload}
+
+
+def _spread_current_fields() -> set[str]:
+    return {
+        "symbol", "direction", "hyperliquid_bid", "hyperliquid_ask", "mt5_bid", "mt5_ask",
+        "quantity", "gross_spread", "unit_cost", "unit_net_profit", "total_cost", "net_profit",
+        "annualized_return", "status", "reason", "entry_spread", "close_spread", "mid_spread",
+        "spread_cost", "mt5_quantity", "hyperliquid_quantity", "notional_currency", "fx_rate_to_usd",
+    }
+
+
+def _spread_direction_fields() -> set[str]:
+    return _spread_current_fields() - {"direction"} | {"direction"}
 
 
 def _upsert_current_spread(
@@ -626,6 +711,91 @@ def _record_spread_history(
         )
 
 
+def _record_spread_history_from_payload(db: Session, payload: dict, settings) -> None:
+    now = payload.get("sampled_at") or datetime.now(timezone.utc).replace(tzinfo=None)
+    bucket_seconds = max(settings.spread_bucket_seconds, 1)
+    bucket_start_ts = int(now.timestamp()) // bucket_seconds * bucket_seconds
+    bucket_start = datetime.utcfromtimestamp(bucket_start_ts)
+    symbol = payload["symbol"]
+    direction = payload["direction"]
+    gross_spread = float(payload.get("gross_spread") or 0.0)
+    unit_cost = float(payload.get("unit_cost") or 0.0)
+    unit_net_profit = float(payload.get("unit_net_profit") or 0.0)
+    close_spread = float(payload.get("close_spread") or gross_spread)
+    mid_spread = float(payload.get("mid_spread") or gross_spread)
+    spread_cost = float(payload.get("spread_cost") or 0.0)
+    key = (symbol, direction)
+    accumulator = _bucket_accumulators.get(key)
+    if not accumulator or accumulator.bucket_start != bucket_start:
+        if accumulator:
+            _flush_bucket(db, accumulator)
+        accumulator = BucketAccumulator(
+            symbol=symbol,
+            direction=direction,
+            bucket_start=bucket_start,
+            bucket_seconds=bucket_seconds,
+            open_spread=gross_spread,
+            high_spread=gross_spread,
+            low_spread=gross_spread,
+            close_spread=gross_spread,
+            unit_cost_sum=unit_cost,
+            unit_net_profit_sum=unit_net_profit,
+            spread_sum=gross_spread,
+            close_basis_sum=close_spread,
+            mid_spread_sum=mid_spread,
+            spread_cost_sum=spread_cost,
+            sample_count=1,
+        )
+        _bucket_accumulators[key] = accumulator
+    else:
+        accumulator.high_spread = max(accumulator.high_spread, gross_spread)
+        accumulator.low_spread = min(accumulator.low_spread, gross_spread)
+        accumulator.close_spread = gross_spread
+        accumulator.unit_cost_sum += unit_cost
+        accumulator.unit_net_profit_sum += unit_net_profit
+        accumulator.spread_sum += gross_spread
+        accumulator.close_basis_sum += close_spread
+        accumulator.mid_spread_sum += mid_spread
+        accumulator.spread_cost_sum += spread_cost
+        accumulator.sample_count += 1
+
+    history_interval = max(settings.spread_history_interval_seconds, 1)
+    last_flush = _last_snapshot_flush.get(key, 0.0)
+    if now.timestamp() - last_flush < history_interval:
+        return
+    _flush_bucket(db, accumulator)
+    _last_snapshot_flush[key] = now.timestamp()
+    db.add(MarketSnapshot(platform="hyperliquid", symbol=symbol, bid=payload["hyperliquid_bid"], ask=payload["hyperliquid_ask"], mid=(payload["hyperliquid_bid"] + payload["hyperliquid_ask"]) / 2, depth_notional=float(payload.get("hyperliquid_depth_notional") or 0.0), captured_at=payload.get("hyperliquid_captured_at") or now))
+    db.add(MarketSnapshot(platform="mt5", symbol=symbol, bid=payload["mt5_bid"], ask=payload["mt5_ask"], mid=(payload["mt5_bid"] + payload["mt5_ask"]) / 2, depth_notional=float(payload.get("mt5_depth_notional") or 0.0), captured_at=payload.get("mt5_captured_at") or now))
+    db.add(
+        SpreadSnapshot(
+            symbol=symbol,
+            direction=direction,
+            hyperliquid_bid=payload["hyperliquid_bid"],
+            hyperliquid_ask=payload["hyperliquid_ask"],
+            mt5_bid=payload["mt5_bid"],
+            mt5_ask=payload["mt5_ask"],
+            quantity=payload["quantity"],
+            mt5_quantity=payload.get("mt5_quantity", payload["quantity"]),
+            hyperliquid_quantity=payload.get("hyperliquid_quantity", payload["quantity"]),
+            notional_currency=payload.get("notional_currency", "USD"),
+            fx_rate_to_usd=payload.get("fx_rate_to_usd", 1.0),
+            gross_spread=payload.get("entry_spread", gross_spread),
+            entry_spread=payload.get("entry_spread", gross_spread),
+            close_spread=close_spread,
+            mid_spread=mid_spread,
+            spread_cost=spread_cost,
+            unit_cost=unit_cost,
+            unit_net_profit=unit_net_profit,
+            total_cost=payload.get("total_cost", 0.0),
+            net_profit=payload.get("net_profit", 0.0),
+            annualized_return=payload.get("annualized_return", 0.0),
+            status=payload.get("status", "rejected"),
+            reason=payload.get("reason", ""),
+        )
+    )
+
+
 def _flush_bucket(db: Session, accumulator: BucketAccumulator) -> None:
     row = (
         db.query(SpreadBucket)
@@ -733,6 +903,90 @@ def _sync_current_opportunity(
     return True
 
 
+def _persist_opportunities(
+    db: Session,
+    opportunities: list[dict],
+    ids_by_key: dict[tuple[str, str], int],
+    scanned_symbols: set[str],
+) -> int:
+    active_statuses = ("candidate", "executable", "executing")
+    active_keys = {(str(row.get("symbol", "")).upper(), str(row.get("direction", ""))) for row in opportunities}
+    changed = 0
+    symbols = scanned_symbols or {symbol for symbol, _ in active_keys}
+    if symbols:
+        existing_rows = (
+            db.query(ArbitrageOpportunity)
+            .filter(ArbitrageOpportunity.symbol.in_(symbols), ArbitrageOpportunity.status.in_(active_statuses))
+            .all()
+        )
+    else:
+        existing_rows = db.query(ArbitrageOpportunity).filter(ArbitrageOpportunity.status.in_(active_statuses)).all()
+    existing_by_key = {(row.symbol.upper(), row.direction): row for row in existing_rows}
+
+    for payload in opportunities:
+        key = (str(payload["symbol"]).upper(), str(payload["direction"]))
+        current = existing_by_key.get(key)
+        if not current:
+            current = ArbitrageOpportunity(symbol=payload["symbol"], direction=payload["direction"])
+            db.add(current)
+            changed += 1
+        elif current.status == "executing":
+            ids_by_key[key] = current.id
+            continue
+        before = _opportunity_signature(current)
+        current.notional = payload["notional"]
+        current.quantity = payload["quantity"]
+        current.mt5_quantity = payload["mt5_quantity"]
+        current.hyperliquid_quantity = payload["hyperliquid_quantity"]
+        current.notional_currency = payload["notional_currency"]
+        current.fx_rate_to_usd = payload["fx_rate_to_usd"]
+        current.gross_spread = payload["gross_spread"]
+        current.trigger_hyperliquid_bid = payload["hyperliquid_bid"]
+        current.trigger_hyperliquid_ask = payload["hyperliquid_ask"]
+        current.trigger_mt5_bid = payload["mt5_bid"]
+        current.trigger_mt5_ask = payload["mt5_ask"]
+        current.unit_cost = payload["unit_cost"]
+        current.unit_net_profit = payload["unit_net_profit"]
+        current.total_cost = payload["total_cost"]
+        current.net_profit = payload["net_profit"]
+        current.annualized_return = payload["annualized_return"]
+        current.entry_threshold = payload["entry_threshold"]
+        current.exit_target = payload["exit_target"]
+        current.overheat_threshold = payload["overheat_threshold"]
+        current.signal_sample_count = payload["signal_sample_count"]
+        current.status = payload["status"]
+        current.reject_reason = payload.get("reason", "")
+        if current.id is None:
+            db.flush()
+        if _opportunity_signature(current) != before:
+            changed += 1
+        ids_by_key[key] = current.id
+
+    for key, row in existing_by_key.items():
+        if key in active_keys or row.status == "executing":
+            continue
+        row.status = "rejected"
+        row.reject_reason = "价差回落，不再满足候选条件"
+        changed += 1
+    return changed
+
+
+def _opportunity_signature(row: ArbitrageOpportunity) -> tuple:
+    return (
+        row.status,
+        row.gross_spread,
+        row.unit_cost,
+        row.unit_net_profit,
+        row.total_cost,
+        row.net_profit,
+        row.entry_threshold,
+        row.exit_target,
+        row.overheat_threshold,
+        row.signal_sample_count,
+        row.reject_reason,
+    )
+
+
 def _best_current_payload(payloads: list[dict]) -> dict:
     if not payloads:
         raise ValueError("缺少双向价差结果")
@@ -740,30 +994,34 @@ def _best_current_payload(payloads: list[dict]) -> dict:
     return max(payloads, key=lambda row: (status_rank.get(str(row.get("status")), 0), float(row.get("net_profit") or 0.0)))
 
 
-def _update_scan_state_store(db: Session) -> None:
-    enabled_symbols = {row.symbol for row in enabled_mappings(db)}
-    if not enabled_symbols:
+def _update_scan_state_store(spread_rows: list[dict], opportunity_rows: list[dict], direction_rows: list[dict]) -> None:
+    if not spread_rows and not opportunity_rows and not direction_rows:
         scan_state_store.update([], [])
         return
-    spread_rows = db.query(SpreadCurrent).filter(SpreadCurrent.symbol.in_(enabled_symbols)).order_by(SpreadCurrent.symbol).all()
-    opportunity_rows = (
-        db.query(ArbitrageOpportunity)
-        .filter(ArbitrageOpportunity.symbol.in_(enabled_symbols), ArbitrageOpportunity.status.in_(["candidate", "executable", "executing"]))
-        .order_by(ArbitrageOpportunity.updated_at.desc())
-        .limit(50)
-        .all()
+    spreads = sorted((_spread_state_dict(row) for row in spread_rows), key=lambda row: str(row.get("symbol", "")))
+    opportunities = sorted(
+        (_model_dict(row) for row in opportunity_rows),
+        key=lambda row: row.get("updated_at") or row.get("created_at") or datetime.min,
+        reverse=True,
+    )[:50]
+    directions = sorted(
+        (_spread_state_dict(row) for row in direction_rows),
+        key=lambda row: (str(row.get("symbol", "")), str(row.get("direction", ""))),
     )
     scan_state_store.update(
-        [_spread_state_dict(row) for row in spread_rows],
-        [_model_dict(row) for row in opportunity_rows],
+        spreads,
+        opportunities,
+        directions,
     )
 
 
 def _spread_state_dict(row) -> dict:
     data = _model_dict(row)
-    data.update(_scan_timings.get(str(row.symbol).upper(), {}))
+    data.update(_scan_timings.get(str(data.get("symbol", "")).upper(), {}))
     return data
 
 
 def _model_dict(row) -> dict:
+    if isinstance(row, dict):
+        return dict(row)
     return {column.name: getattr(row, column.name) for column in row.__table__.columns}

@@ -9,7 +9,7 @@ from app.execution.auto_closer import run_auto_close
 from app.execution.auto_executor import run_auto_execute
 from app.execution.carry_costs import run_carry_cost_sync
 from app.execution.reconciler import run_execution_reconcile
-from app.market.scanner import run_scan
+from app.market.scanner import persist_scan_state, run_scan
 from app.market.mt5_schedule import sync_mt5_session_templates
 from app.market.mt5_tradability import refresh_mt5_tradability_cache
 from app.strategy.statistical_signal import refresh_signal_stats_cache
@@ -19,26 +19,65 @@ _timer: Optional[threading.Timer] = None
 _stats_timer: Optional[threading.Timer] = None
 _tradability_timer: Optional[threading.Timer] = None
 _session_template_timer: Optional[threading.Timer] = None
+_scan_persistence_timer: Optional[threading.Timer] = None
+_execution_timer: Optional[threading.Timer] = None
 _running = False
 _stats_refreshing = False
 _tradability_refreshing = False
 _session_template_refreshing = False
+_scan_persisting = False
+_execution_running = False
 
 
 def scanner_job() -> None:
     db = SessionLocal()
     try:
         run_scan(db)
-        run_auto_execute(db)
-        run_carry_cost_sync(db)
-        run_auto_close(db)
-        run_execution_reconcile(db)
     except Exception as exc:
         db.rollback()
         logger.exception(f"扫描任务失败: {exc}")
     finally:
         db.close()
     _schedule_next()
+
+
+def execution_maintenance_job() -> None:
+    global _execution_running
+    if _execution_running:
+        _schedule_next_execution()
+        return
+    _execution_running = True
+    db = SessionLocal()
+    try:
+        run_auto_execute(db)
+        run_carry_cost_sync(db)
+        run_auto_close(db)
+        run_execution_reconcile(db)
+    except Exception as exc:
+        db.rollback()
+        logger.exception(f"执行维护任务失败: {exc}")
+    finally:
+        db.close()
+        _execution_running = False
+    _schedule_next_execution()
+
+
+def scan_persistence_job() -> None:
+    global _scan_persisting
+    if _scan_persisting:
+        _schedule_next_scan_persistence()
+        return
+    _scan_persisting = True
+    db = SessionLocal()
+    try:
+        persist_scan_state(db)
+    except Exception as exc:
+        db.rollback()
+        logger.exception(f"扫描状态持久化失败: {exc}")
+    finally:
+        db.close()
+        _scan_persisting = False
+    _schedule_next_scan_persistence()
 
 
 def signal_stats_job() -> None:
@@ -117,6 +156,28 @@ def _schedule_next_stats() -> None:
     _stats_timer.start()
 
 
+def _schedule_next_scan_persistence() -> None:
+    global _scan_persistence_timer
+    if not _running:
+        return
+    settings = get_settings()
+    interval = max(settings.scan_persist_interval_ms / 1000, 0.1)
+    _scan_persistence_timer = threading.Timer(interval, scan_persistence_job)
+    _scan_persistence_timer.daemon = True
+    _scan_persistence_timer.start()
+
+
+def _schedule_next_execution() -> None:
+    global _execution_timer
+    if not _running:
+        return
+    settings = get_settings()
+    interval = max(settings.execution_maintenance_interval_ms / 1000, 0.2)
+    _execution_timer = threading.Timer(interval, execution_maintenance_job)
+    _execution_timer.daemon = True
+    _execution_timer.start()
+
+
 def _schedule_next_tradability() -> None:
     global _tradability_timer
     if not _running:
@@ -144,6 +205,8 @@ def start_scheduler() -> None:
     if not _running:
         _running = True
         _schedule_next()
+        _schedule_next_scan_persistence()
+        _schedule_next_execution()
         _schedule_next_stats()
         _schedule_next_tradability()
         _schedule_next_session_templates()
@@ -160,3 +223,7 @@ def stop_scheduler() -> None:
         _tradability_timer.cancel()
     if _session_template_timer:
         _session_template_timer.cancel()
+    if _scan_persistence_timer:
+        _scan_persistence_timer.cancel()
+    if _execution_timer:
+        _execution_timer.cancel()

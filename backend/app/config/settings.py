@@ -38,7 +38,10 @@ def _coerce(value: str, default):
 class Settings:
     app_name: str = "MT5 Hedge"
     environment: str = "local"
-    database_url: str = f"sqlite:///{ROOT_DIR / 'data' / 'mt5_hedge.db'}"
+    database_url: str = f"postgresql+psycopg2://postgres:postgres@localhost:5432/mt5_hedge"
+    database_pool_size: int = 10
+    database_max_overflow: int = 20
+    database_pool_recycle: int = 3600
     jwt_secret: str = "change-me-before-live"
     jwt_algorithm: str = "HS256"
     access_token_minutes: int = 720

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from statistics import mean, median, pstdev
 from typing import Iterable
 
@@ -48,7 +48,7 @@ class SpreadPoint:
 def parse_range(range_value: str) -> tuple[str, datetime, int]:
     key = range_value if range_value in RANGE_SECONDS else "1h"
     seconds = RANGE_SECONDS[key]
-    return key, datetime.utcnow() - timedelta(seconds=seconds), seconds
+    return key, datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(seconds=seconds), seconds
 
 
 def load_spread_points(db: Session, symbol: str, direction: str, range_value: str, basis: str = "entry") -> list[SpreadPoint]:

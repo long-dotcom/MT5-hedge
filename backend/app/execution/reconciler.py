@@ -1,5 +1,5 @@
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 
 from sqlalchemy.orm import Session
 
@@ -290,7 +290,7 @@ def _advance_group_state(db: Session, group: HedgeGroup, orders: list[Order]) ->
     if group.status == "opening":
         if all(effects):
             group.status = "open"
-            group.opened_at = group.opened_at or datetime.utcnow()
+            group.opened_at = group.opened_at or datetime.now(timezone.utc).replace(tzinfo=None)
             group.fees += _orders_fee(db, platform_orders.values())
             actual_entry_spread = actual_entry_spread_from_fills(db, group)
             if actual_entry_spread is not None:
@@ -316,7 +316,7 @@ def _advance_group_state(db: Session, group: HedgeGroup, orders: list[Order]) ->
     if group.status == "closing":
         if all(effects):
             group.status = "closed"
-            group.closed_at = group.closed_at or datetime.utcnow()
+            group.closed_at = group.closed_at or datetime.now(timezone.utc).replace(tzinfo=None)
             group.fees += _orders_fee(db, platform_orders.values())
             group.realized_pnl = realized_pnl_from_fills(db, group)
             if group.realized_pnl is None:
@@ -409,7 +409,7 @@ def _complete_hyper_maker_with_mt5_taker(db: Session, group: HedgeGroup, platfor
     db.add(HedgeGroupEvent(hedge_group_id=group.id, event_type="maker_fill_mt5_taker_submitted", detail=detail))
     if _order_has_position_effect(db, mt5_order):
         group.status = "open"
-        group.opened_at = group.opened_at or datetime.utcnow()
+        group.opened_at = group.opened_at or datetime.now(timezone.utc).replace(tzinfo=None)
         group.fees += _orders_fee(db, [hyper_order, mt5_order])
         actual_entry_spread = actual_entry_spread_from_fills(db, group)
         if actual_entry_spread is not None:
@@ -480,12 +480,12 @@ def _complete_hyper_then_mt5_after_fill(db: Session, group: HedgeGroup, platform
         group.status = success_status
         group.fees += _orders_fee(db, [hyper_order, mt5_order])
         if success_status == "open":
-            group.opened_at = group.opened_at or datetime.utcnow()
+            group.opened_at = group.opened_at or datetime.now(timezone.utc).replace(tzinfo=None)
             actual_entry_spread = actual_entry_spread_from_fills(db, group)
             if actual_entry_spread is not None:
                 group.entry_spread = actual_entry_spread
         else:
-            group.closed_at = group.closed_at or datetime.utcnow()
+            group.closed_at = group.closed_at or datetime.now(timezone.utc).replace(tzinfo=None)
             group.realized_pnl = realized_pnl_from_fills(db, group)
             if group.realized_pnl is None:
                 group.realized_pnl = group.unrealized_pnl - group.fees - group.funding - group.swap
@@ -726,7 +726,7 @@ def _order_age_seconds(order: Order) -> float:
     created_at = order.created_at
     if not created_at:
         return 0.0
-    return max((datetime.utcnow() - created_at).total_seconds(), 0.0)
+    return max((datetime.now(timezone.utc).replace(tzinfo=None) - created_at).total_seconds(), 0.0)
 
 
 def _order_fill_quantity(db: Session, order_id: int) -> float:

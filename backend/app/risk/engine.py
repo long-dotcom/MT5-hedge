@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 
 from sqlalchemy.orm import Session
 
@@ -43,7 +43,7 @@ def pre_trade_check(db: Session, symbol: str, notional: float, slippage_bps: flo
             weak_accounts = [row.platform for row in accounts if row.margin_ratio < setting.min_margin_ratio]
             if weak_accounts:
                 return RiskDecision(False, f"账户保证金率低于阈值: {', '.join(weak_accounts)}")
-    age = (datetime.utcnow() - market_time).total_seconds()
+    age = (datetime.now(timezone.utc).replace(tzinfo=None) - market_time).total_seconds()
     if age > setting.max_market_age_seconds:
         return RiskDecision(False, "行情已过期")
     return RiskDecision(True)

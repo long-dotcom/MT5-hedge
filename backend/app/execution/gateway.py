@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Protocol
 
 from app.adapters.base import AdapterOrder, AdapterOrderResult, ExchangeAdapter
@@ -116,7 +116,7 @@ class AdapterExecutionGateway:
                 paper_latency_ms=paper_latency_ms,
             )
         )
-        occurred_at = datetime.utcnow()
+        occurred_at = datetime.now(timezone.utc).replace(tzinfo=None)
         order_event = OrderEvent(
             platform=intent.platform,
             symbol=intent.symbol,

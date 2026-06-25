@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from time import perf_counter
 
 from sqlalchemy.orm import Session
@@ -444,7 +444,7 @@ def _upsert_current_spread(
     row.annualized_return = annualized_return
     row.status = status
     row.reason = reason
-    row.sampled_at = datetime.utcnow()
+    row.sampled_at = datetime.now(timezone.utc).replace(tzinfo=None)
     return row
 
 
@@ -500,7 +500,7 @@ def _upsert_direction_current(
     row.annualized_return = annualized_return
     row.status = status
     row.reason = reason
-    row.sampled_at = datetime.utcnow()
+    row.sampled_at = datetime.now(timezone.utc).replace(tzinfo=None)
     return row
 
 
@@ -534,7 +534,7 @@ def _record_spread_history(
     reason: str,
     settings,
 ) -> None:
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
     bucket_seconds = max(settings.spread_bucket_seconds, 1)
     bucket_start_ts = int(now.timestamp()) // bucket_seconds * bucket_seconds
     bucket_start = datetime.utcfromtimestamp(bucket_start_ts)

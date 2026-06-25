@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 import json
 import threading
 import time
@@ -210,7 +210,7 @@ def _persist_block(db: Session, symbol: str, side: str, mt5_symbol: str, quantit
             "quantity": quantity,
             "message": message,
             "until": until,
-            "blocked_at": datetime.utcnow().isoformat(),
+            "blocked_at": datetime.now(timezone.utc).replace(tzinfo=None).isoformat(),
         },
         ensure_ascii=False,
     )

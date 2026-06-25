@@ -55,10 +55,16 @@ def test_cost_model_positive_total() -> None:
 def test_relative_sqlite_database_url_resolves_from_project_root(monkeypatch) -> None:
     import app.db.session as session_module
 
-    monkeypatch.setattr(session_module, "get_settings", lambda: type("Settings", (), {"database_url": "sqlite:///data/mt5_hedge.db"})())
-    reloaded = reload(session_module)
-    expected = (reloaded.ROOT_DIR / "data" / "mt5_hedge.db").as_posix()
-    assert expected in str(reloaded.engine.url).replace("\\", "/")
+    monkeypatch.setenv("DATABASE_URL", "sqlite:///data/mt5_hedge.db")
+    try:
+        session_module.get_settings.cache_clear()
+        reloaded = reload(session_module)
+        expected = (reloaded.ROOT_DIR / "data" / "mt5_hedge.db").as_posix()
+        assert expected in str(reloaded.engine.url).replace("\\", "/")
+    finally:
+        monkeypatch.delenv("DATABASE_URL", raising=False)
+        session_module.get_settings.cache_clear()
+        reload(session_module)
 
 
 def test_mt5_spread_rebate_reduces_spread_cost() -> None:
@@ -93,7 +99,7 @@ def test_risk_blocks_paused_mode() -> None:
         db.add(RiskSetting(mode="paused"))
         db.add(SymbolMapping(symbol="BTC", hyperliquid_symbol="BTC", mt5_symbol="BTCUSD"))
         db.commit()
-        decision = pre_trade_check(db, "BTC", 1000, 1, datetime.utcnow())
+        decision = pre_trade_check(db, "BTC", 1000, 1, datetime.now(timezone.utc).replace(tzinfo=None))
         assert not decision.allowed
 
 
@@ -962,7 +968,7 @@ def test_live_open_orders_are_not_reduce_only(monkeypatch) -> None:
     monkeypatch.setattr("app.execution.engine.live_execution_readiness", lambda db: {"checks": []})
     monkeypatch.setattr("app.execution.engine.mt5_session_state", lambda mapping: MT5SessionState(mapping.symbol, "normal_trade", "", True, True, True, True, True))
     monkeypatch.setattr("app.execution.engine.mt5_market_order_check", lambda *args, **kwargs: SimpleNamespace(allowed=True, message="ok"))
-    monkeypatch.setattr("app.execution.engine.quote_synchronizer.synchronized", lambda *args, **kwargs: (SimpleNamespace(hyperliquid=SimpleNamespace(local_recv_ts=datetime.utcnow()), time_diff_ms=0), ""))
+    monkeypatch.setattr("app.execution.engine.quote_synchronizer.synchronized", lambda *args, **kwargs: (SimpleNamespace(hyperliquid=SimpleNamespace(local_recv_ts=datetime.now(timezone.utc).replace(tzinfo=None)), time_diff_ms=0), ""))
     monkeypatch.setattr("app.execution.engine.pre_trade_check", lambda *args, **kwargs: SimpleNamespace(allowed=True, reason=""))
 
     group = open_hedge_group(db, opportunity.id)
@@ -1025,7 +1031,7 @@ def test_paper_open_uses_hyperliquid_sim_and_mt5_demo_adapters(monkeypatch) -> N
     monkeypatch.setattr("app.execution.engine.mt5_session_state", lambda mapping: MT5SessionState(mapping.symbol, "normal_trade", "", True, True, True, True, True))
     monkeypatch.setattr("app.execution.engine.mt5_market_order_check", lambda *args, **kwargs: SimpleNamespace(allowed=True, message="ok"))
     monkeypatch.setattr("app.execution.engine.build_execution_gateway", lambda adapter: FakeGateway(adapter))
-    monkeypatch.setattr("app.execution.engine.quote_synchronizer.synchronized", lambda *args, **kwargs: (SimpleNamespace(hyperliquid=SimpleNamespace(local_recv_ts=datetime.utcnow()), time_diff_ms=0), ""))
+    monkeypatch.setattr("app.execution.engine.quote_synchronizer.synchronized", lambda *args, **kwargs: (SimpleNamespace(hyperliquid=SimpleNamespace(local_recv_ts=datetime.now(timezone.utc).replace(tzinfo=None)), time_diff_ms=0), ""))
     monkeypatch.setattr("app.execution.engine.pre_trade_check", lambda *args, **kwargs: SimpleNamespace(allowed=True, reason=""))
     monkeypatch.setattr("app.execution.engine.get_settings", lambda: SimpleNamespace(hyperliquid_paper_live_order_enabled=False, paper_live_parallel_execution=False, strict_quote_sync_ms=500, quote_stale_ms=1500, default_slippage_bps=0))
     monkeypatch.setattr("app.execution.engine.get_settings", lambda: SimpleNamespace(hyperliquid_paper_live_order_enabled=False, strict_quote_sync_ms=500, quote_stale_ms=1500, default_slippage_bps=0))
@@ -1215,7 +1221,7 @@ def test_open_quarantines_mt5_side_after_order_send_10044(monkeypatch) -> None:
     monkeypatch.setattr("app.execution.engine.mt5_session_state", lambda mapping: MT5SessionState(mapping.symbol, "normal_trade", "", True, True, True, True, True))
     monkeypatch.setattr("app.execution.engine.mt5_market_order_check", lambda *args, **kwargs: SimpleNamespace(allowed=True, message="Done"))
     monkeypatch.setattr("app.execution.engine.build_execution_gateway", lambda adapter: FakeGateway(adapter))
-    monkeypatch.setattr("app.execution.engine.quote_synchronizer.synchronized", lambda *args, **kwargs: (SimpleNamespace(hyperliquid=SimpleNamespace(local_recv_ts=datetime.utcnow()), time_diff_ms=0), ""))
+    monkeypatch.setattr("app.execution.engine.quote_synchronizer.synchronized", lambda *args, **kwargs: (SimpleNamespace(hyperliquid=SimpleNamespace(local_recv_ts=datetime.now(timezone.utc).replace(tzinfo=None)), time_diff_ms=0), ""))
     monkeypatch.setattr("app.execution.engine.pre_trade_check", lambda *args, **kwargs: SimpleNamespace(allowed=True, reason=""))
     monkeypatch.setattr("app.execution.engine.get_settings", lambda: SimpleNamespace(hyperliquid_paper_live_order_enabled=False, paper_live_parallel_execution=False, strict_quote_sync_ms=500, quote_stale_ms=1500, default_slippage_bps=0))
 
@@ -1271,7 +1277,7 @@ def test_paper_open_records_actual_entry_spread_from_fills(monkeypatch) -> None:
     monkeypatch.setattr("app.execution.engine.mt5_session_state", lambda mapping: MT5SessionState(mapping.symbol, "normal_trade", "", True, True, True, True, True))
     monkeypatch.setattr("app.execution.engine.mt5_market_order_check", lambda *args, **kwargs: SimpleNamespace(allowed=True, message="ok"))
     monkeypatch.setattr("app.execution.engine.build_execution_gateway", lambda adapter: FakeGateway(adapter))
-    monkeypatch.setattr("app.execution.engine.quote_synchronizer.synchronized", lambda *args, **kwargs: (SimpleNamespace(hyperliquid=SimpleNamespace(local_recv_ts=datetime.utcnow()), time_diff_ms=0), ""))
+    monkeypatch.setattr("app.execution.engine.quote_synchronizer.synchronized", lambda *args, **kwargs: (SimpleNamespace(hyperliquid=SimpleNamespace(local_recv_ts=datetime.now(timezone.utc).replace(tzinfo=None)), time_diff_ms=0), ""))
     monkeypatch.setattr("app.execution.engine.pre_trade_check", lambda *args, **kwargs: SimpleNamespace(allowed=True, reason=""))
 
     group = open_hedge_group(db, opportunity.id)
@@ -1324,7 +1330,7 @@ def test_paper_open_waits_for_hyperliquid_fill_before_mt5(monkeypatch) -> None:
     monkeypatch.setattr("app.execution.engine.mt5_session_state", lambda mapping: MT5SessionState(mapping.symbol, "normal_trade", "", True, True, True, True, True))
     monkeypatch.setattr("app.execution.engine.mt5_market_order_check", lambda *args, **kwargs: SimpleNamespace(allowed=True, message="ok"))
     monkeypatch.setattr("app.execution.engine.build_execution_gateway", lambda adapter: FakeGateway(adapter))
-    monkeypatch.setattr("app.execution.engine.quote_synchronizer.synchronized", lambda *args, **kwargs: (SimpleNamespace(hyperliquid=SimpleNamespace(local_recv_ts=datetime.utcnow()), time_diff_ms=0), ""))
+    monkeypatch.setattr("app.execution.engine.quote_synchronizer.synchronized", lambda *args, **kwargs: (SimpleNamespace(hyperliquid=SimpleNamespace(local_recv_ts=datetime.now(timezone.utc).replace(tzinfo=None)), time_diff_ms=0), ""))
     monkeypatch.setattr("app.execution.engine.pre_trade_check", lambda *args, **kwargs: SimpleNamespace(allowed=True, reason=""))
     monkeypatch.setattr("app.execution.engine.get_settings", lambda: SimpleNamespace(hyperliquid_paper_live_order_enabled=False, paper_live_parallel_execution=False, strict_quote_sync_ms=500, quote_stale_ms=1500, default_slippage_bps=0))
 
@@ -1365,7 +1371,7 @@ def test_open_refreshes_execution_quotes_after_strict_sync_failure(monkeypatch) 
     db.add(opportunity)
     db.commit()
     synced = SimpleNamespace(
-        hyperliquid=SimpleNamespace(ask=100.0, bid=99.0, local_recv_ts=datetime.utcnow()),
+        hyperliquid=SimpleNamespace(ask=100.0, bid=99.0, local_recv_ts=datetime.now(timezone.utc).replace(tzinfo=None)),
         mt5=SimpleNamespace(ask=121.0, bid=120.0),
         time_diff_ms=300,
     )
@@ -1437,7 +1443,7 @@ def test_paper_live_parallel_submits_hyperliquid_and_mt5_without_waiting(monkeyp
     monkeypatch.setattr("app.execution.engine.mt5_session_state", lambda mapping: MT5SessionState(mapping.symbol, "normal_trade", "", True, True, True, True, True))
     monkeypatch.setattr("app.execution.engine.mt5_market_order_check", lambda *args, **kwargs: SimpleNamespace(allowed=True, message="ok"))
     monkeypatch.setattr("app.execution.engine.build_execution_gateway", lambda adapter: FakeGateway(adapter))
-    monkeypatch.setattr("app.execution.engine.quote_synchronizer.synchronized", lambda *args, **kwargs: (SimpleNamespace(hyperliquid=SimpleNamespace(local_recv_ts=datetime.utcnow()), time_diff_ms=0), ""))
+    monkeypatch.setattr("app.execution.engine.quote_synchronizer.synchronized", lambda *args, **kwargs: (SimpleNamespace(hyperliquid=SimpleNamespace(local_recv_ts=datetime.now(timezone.utc).replace(tzinfo=None)), time_diff_ms=0), ""))
     monkeypatch.setattr("app.execution.engine.pre_trade_check", lambda *args, **kwargs: SimpleNamespace(allowed=True, reason=""))
     monkeypatch.setattr("app.execution.engine.get_settings", lambda: SimpleNamespace(hyperliquid_paper_live_order_enabled=True, paper_live_parallel_execution=True, strict_quote_sync_ms=500, quote_stale_ms=1500, default_slippage_bps=0))
 
@@ -1475,7 +1481,7 @@ def test_open_rejects_when_refreshed_quotes_no_longer_meet_entry(monkeypatch) ->
     db.add(opportunity)
     db.commit()
     synced = SimpleNamespace(
-        hyperliquid=SimpleNamespace(ask=100.0, bid=99.0, local_recv_ts=datetime.utcnow()),
+        hyperliquid=SimpleNamespace(ask=100.0, bid=99.0, local_recv_ts=datetime.now(timezone.utc).replace(tzinfo=None)),
         mt5=SimpleNamespace(ask=106.0, bid=105.0),
         time_diff_ms=10,
     )
@@ -1785,7 +1791,7 @@ def test_reconcile_taker_close_hyper_fill_submits_mt5_reduce_only_leg(monkeypatc
         mt5_quantity=0.1,
         open_cost=0.2,
         unrealized_pnl=2.0,
-        opened_at=datetime.utcnow(),
+        opened_at=datetime.now(timezone.utc).replace(tzinfo=None),
     )
     db.add(group)
     db.flush()
@@ -1962,7 +1968,7 @@ def test_reconcile_closing_single_fill_auto_reverses_and_restores_open(monkeypat
 
 def test_reconcile_unreconstructable_pending_order_escalates_manual(monkeypatch) -> None:
     db, group = _pending_reconcile_test_db("opening")
-    old_time = datetime.utcnow() - timedelta(seconds=30)
+    old_time = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(seconds=30)
     for order in db.query(Order).filter(Order.hedge_group_id == group.id).all():
         order.created_at = old_time
     db.commit()
@@ -2049,8 +2055,8 @@ def test_reconcile_residual_positions_marks_closed_group_manual() -> None:
         open_cost=1.0,
         fees=0.2,
         unrealized_pnl=0.0,
-        opened_at=datetime.utcnow(),
-        closed_at=datetime.utcnow(),
+        opened_at=datetime.now(timezone.utc).replace(tzinfo=None),
+        closed_at=datetime.now(timezone.utc).replace(tzinfo=None),
     )
     db.add(group)
     db.flush()
@@ -2105,8 +2111,8 @@ def test_hyperliquid_live_position_sync_triggers_residual_reconcile(monkeypatch)
         execution_mode="live",
         notional=1000,
         quantity=1.0,
-        opened_at=datetime.utcnow(),
-        closed_at=datetime.utcnow(),
+        opened_at=datetime.now(timezone.utc).replace(tzinfo=None),
+        closed_at=datetime.now(timezone.utc).replace(tzinfo=None),
     )
     db.add(group)
     db.commit()
@@ -2155,7 +2161,7 @@ def test_reconcile_orphan_positions_ignores_position_with_live_group() -> None:
             quantity=1.0,
             hyperliquid_quantity=1.0,
             mt5_quantity=0.1,
-            opened_at=datetime.utcnow(),
+            opened_at=datetime.now(timezone.utc).replace(tzinfo=None),
         )
     )
     db.add(Position(platform="hyperliquid", symbol="OIL", side="long", quantity=1.0, entry_price=76, mark_price=77))
@@ -2241,7 +2247,7 @@ def test_close_adopted_single_leg_group_only_closes_existing_leg(monkeypatch) ->
         quantity=0.2,
         hyperliquid_quantity=0.0,
         mt5_quantity=0.2,
-        opened_at=datetime.utcnow(),
+        opened_at=datetime.now(timezone.utc).replace(tzinfo=None),
     )
     db.add(group)
     db.commit()
@@ -2290,7 +2296,7 @@ def test_paper_close_realized_pnl_uses_actual_close_fills(monkeypatch) -> None:
         open_cost=999.0,
         fees=0.2,
         unrealized_pnl=999.0,
-        opened_at=datetime.utcnow(),
+        opened_at=datetime.now(timezone.utc).replace(tzinfo=None),
     )
     db.add(group)
     db.commit()
@@ -2335,7 +2341,7 @@ def _pending_reconcile_test_db(status: str):
         open_cost=1.0,
         fees=0.2,
         unrealized_pnl=5.0,
-        opened_at=datetime.utcnow() if status == "closing" else None,
+        opened_at=datetime.now(timezone.utc).replace(tzinfo=None) if status == "closing" else None,
     )
     db.add(group)
     db.flush()
@@ -2389,7 +2395,7 @@ def _live_close_test_db(auto_close_live_enabled: bool = False, live_trading_enab
         exit_target=2.0,
         fees=0.2,
         unrealized_pnl=5.0,
-        opened_at=datetime.utcnow(),
+        opened_at=datetime.now(timezone.utc).replace(tzinfo=None),
     )
     db.add(group)
     db.commit()
@@ -2453,7 +2459,7 @@ def test_hedge_groups_api_returns_realtime_spreads() -> None:
 
 
 def test_pipeline_pool_payload_uses_stable_stage_symbol_id_order() -> None:
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
     groups = [
         HedgeGroup(id=5, symbol="ZINC", direction="long_mt5_short_hyperliquid", status="manual_intervention", execution_mode="paper", notional=1, quantity=1),
         HedgeGroup(id=3, symbol="OIL", direction="long_mt5_short_hyperliquid", status="open", execution_mode="paper", notional=1, quantity=1),
@@ -2521,7 +2527,7 @@ def test_spread_and_opportunity_apis_prefer_memory_scan_state() -> None:
                 "symbol": "ETH",
                 "direction": "long_hyperliquid_short_mt5",
                 "status": "candidate",
-                "created_at": datetime.utcnow(),
+                "created_at": datetime.now(timezone.utc).replace(tzinfo=None),
             }
         ],
     )
@@ -2576,7 +2582,7 @@ def test_delete_symbol_mapping_clears_current_scan_state() -> None:
 
 
 def test_spread_analytics_detects_mean_reversion_shape() -> None:
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
     values = [1.0 + (0.4 * (0.92 ** index)) for index in range(160)]
     points = [
         SpreadPoint(created_at=now + timedelta(seconds=index * 10), spread=value, total_cost=0.1, net_profit=value - 0.1)
@@ -2589,7 +2595,7 @@ def test_spread_analytics_detects_mean_reversion_shape() -> None:
 
 
 def test_spread_series_downsamples_large_window() -> None:
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
     points = [
         SpreadPoint(created_at=now + timedelta(seconds=index), spread=float(index), total_cost=0.1, net_profit=0.0)
         for index in range(3600)
@@ -2603,7 +2609,7 @@ def test_spread_analytics_uses_raw_snapshots_through_4h() -> None:
     engine = create_engine("sqlite:///:memory:", future=True)
     Base.metadata.create_all(engine)
     Session = sessionmaker(bind=engine, future=True)
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
     with Session() as db:
         from app.db.models import SpreadBucket, SpreadSnapshot
 
@@ -2652,7 +2658,7 @@ def test_spread_analytics_uses_buckets_for_24h_and_7d() -> None:
     engine = create_engine("sqlite:///:memory:", future=True)
     Base.metadata.create_all(engine)
     Session = sessionmaker(bind=engine, future=True)
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
     with Session() as db:
         from app.db.models import SpreadBucket, SpreadSnapshot
 
@@ -2714,7 +2720,7 @@ def test_load_spread_points_supports_close_and_mid_basis() -> None:
     engine = create_engine("sqlite:///:memory:", future=True)
     Base.metadata.create_all(engine)
     Session = sessionmaker(bind=engine, future=True)
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
     with Session() as db:
         from app.db.models import SpreadSnapshot
 
@@ -2753,7 +2759,7 @@ def test_statistical_exit_target_uses_close_spread_distribution() -> None:
     engine = create_engine("sqlite:///:memory:", future=True)
     Base.metadata.create_all(engine)
     Session = sessionmaker(bind=engine, future=True)
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
     with Session() as db:
         from app.db.models import SpreadBucket
 
@@ -2807,7 +2813,7 @@ def test_auto_close_fallback_uses_symbol_max_close_spread_without_samples(monkey
     engine = create_engine("sqlite:///:memory:", future=True)
     Base.metadata.create_all(engine)
     Session = sessionmaker(bind=engine, future=True)
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
     with Session() as db:
         strategy = StrategySetting(statistical_min_samples=20, auto_close_min_profit=0)
         mapping = SymbolMapping(symbol="JP225", hyperliquid_symbol="xyz:JP225", mt5_symbol="JP225", max_close_spread=10)
@@ -2858,13 +2864,13 @@ def test_auto_close_final_check_uses_current_symbol_max_close_spread(monkeypatch
             entry_spread=0.14,
             exit_target=0.047,
             fees=0.18,
-            opened_at=datetime.utcnow(),
+            opened_at=datetime.now(timezone.utc).replace(tzinfo=None),
         )
         db.add_all([strategy, mapping, group])
         db.commit()
         synced = SimpleNamespace(
-            hyperliquid=SimpleNamespace(bid=157.58, ask=157.59, local_recv_ts=datetime.utcnow()),
-            mt5=SimpleNamespace(bid=157.59, ask=157.65, local_recv_ts=datetime.utcnow()),
+            hyperliquid=SimpleNamespace(bid=157.58, ask=157.59, local_recv_ts=datetime.now(timezone.utc).replace(tzinfo=None)),
+            mt5=SimpleNamespace(bid=157.59, ask=157.65, local_recv_ts=datetime.now(timezone.utc).replace(tzinfo=None)),
             time_diff_ms=0,
         )
         monkeypatch.setattr("app.execution.engine.quote_synchronizer.synchronized", lambda *args, **kwargs: (synced, ""))
@@ -2887,8 +2893,8 @@ def test_scanner_records_two_direction_current_rows(monkeypatch) -> None:
     quote_cache.put("hyperliquid", "DUAL", bid=99, ask=101, depth_notional=100000, source="test")
     quote_cache.put("mt5", "DUAL", bid=110, ask=111, depth_notional=100000, source="test")
     synced = SimpleNamespace(
-        hyperliquid=SimpleNamespace(bid=99, ask=101, mid=100, depth_notional=100000, local_recv_ts=datetime.utcnow()),
-        mt5=SimpleNamespace(bid=110, ask=111, mid=110.5, depth_notional=100000, local_recv_ts=datetime.utcnow()),
+        hyperliquid=SimpleNamespace(bid=99, ask=101, mid=100, depth_notional=100000, local_recv_ts=datetime.now(timezone.utc).replace(tzinfo=None)),
+        mt5=SimpleNamespace(bid=110, ask=111, mid=110.5, depth_notional=100000, local_recv_ts=datetime.now(timezone.utc).replace(tzinfo=None)),
         time_diff_ms=0,
     )
     monkeypatch.setattr(scanner_module.quote_synchronizer, "synchronized", lambda *args, **kwargs: (synced, ""))
@@ -2925,7 +2931,7 @@ def test_statistical_signal_uses_reachable_entry() -> None:
     engine = create_engine("sqlite:///:memory:", future=True)
     Base.metadata.create_all(engine)
     Session = sessionmaker(bind=engine, future=True)
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
     with Session() as db:
         strategy = StrategySetting(
             signal_mode="statistical",
@@ -2967,7 +2973,7 @@ def test_statistical_signal_blocks_entry_when_samples_are_insufficient() -> None
     engine = create_engine("sqlite:///:memory:", future=True)
     Base.metadata.create_all(engine)
     Session = sessionmaker(bind=engine, future=True)
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
     with Session() as db:
         strategy = StrategySetting(
             signal_mode="statistical",
@@ -3017,7 +3023,7 @@ def test_statistical_signal_reuses_stats_cache(monkeypatch) -> None:
         statistical_min_samples=20,
         min_total_profit=0,
     )
-    points = [SpreadPoint(datetime.utcnow() + timedelta(seconds=index), 100 + index, 20, 80 + index) for index in range(30)]
+    points = [SpreadPoint(datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(seconds=index), 100 + index, 20, 80 + index) for index in range(30)]
     calls = {"count": 0}
 
     def fake_load_points(db, symbol, direction, range_value):
@@ -3052,7 +3058,7 @@ def test_statistical_signal_reads_background_refreshed_stats(monkeypatch) -> Non
     db.add(strategy)
     db.add(SymbolMapping(symbol="JP225", hyperliquid_symbol="xyz:JP225", mt5_symbol="JP225", enabled=True))
     db.commit()
-    points = [SpreadPoint(datetime.utcnow() + timedelta(seconds=index), 100 + index, 20, 80 + index) for index in range(30)]
+    points = [SpreadPoint(datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(seconds=index), 100 + index, 20, 80 + index) for index in range(30)]
     calls = {"count": 0}
 
     def fake_load_points(db, symbol, direction, range_value):
@@ -3080,7 +3086,7 @@ def test_statistical_exit_target_uses_low_percentile_and_profit_buffer() -> None
     engine = create_engine("sqlite:///:memory:", future=True)
     Base.metadata.create_all(engine)
     Session = sessionmaker(bind=engine, future=True)
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
     with Session() as db:
         strategy = StrategySetting(
             signal_mode="statistical",
@@ -3122,7 +3128,7 @@ def test_statistical_exit_target_rejects_oversized_unit_buffer() -> None:
     engine = create_engine("sqlite:///:memory:", future=True)
     Base.metadata.create_all(engine)
     Session = sessionmaker(bind=engine, future=True)
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
     with Session() as db:
         strategy = StrategySetting(
             signal_mode="statistical",
@@ -3179,7 +3185,7 @@ def test_auto_close_uses_saved_exit_target() -> None:
             open_cost=10,
             entry_spread=250,
             exit_target=170,
-            opened_at=datetime.utcnow(),
+            opened_at=datetime.now(timezone.utc).replace(tzinfo=None),
         )
         db.add(group)
         db.commit()
@@ -3210,7 +3216,7 @@ def test_auto_close_allows_zero_axis_close_without_exit_target() -> None:
             entry_spread=0.847,
             exit_target=0.0,
             fees=0.45,
-            opened_at=datetime.utcnow(),
+            opened_at=datetime.now(timezone.utc).replace(tzinfo=None),
         )
         db.add(group)
         db.commit()
@@ -3243,7 +3249,7 @@ def test_auto_close_zero_axis_still_requires_min_profit() -> None:
             entry_spread=0.847,
             exit_target=0.0,
             fees=0.45,
-            opened_at=datetime.utcnow(),
+            opened_at=datetime.now(timezone.utc).replace(tzinfo=None),
         )
         db.add(group)
         db.commit()
@@ -3266,7 +3272,7 @@ def test_paper_hyperliquid_funding_cost_uses_actual_rates(monkeypatch) -> None:
         quantity=1,
         mt5_quantity=1,
         hyperliquid_quantity=1,
-        opened_at=datetime.utcnow() - timedelta(hours=2),
+        opened_at=datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(hours=2),
     )
     mapping = SymbolMapping(symbol="JP225", hyperliquid_symbol="xyz:JP225", mt5_symbol="JP225")
 
@@ -3294,7 +3300,7 @@ def test_mt5_swap_cost_uses_position_swap_sign(monkeypatch) -> None:
         quantity=1,
         mt5_quantity=0.5,
         hyperliquid_quantity=1,
-        opened_at=datetime.utcnow() - timedelta(days=1),
+        opened_at=datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=1),
     )
     db.add(group)
     db.commit()

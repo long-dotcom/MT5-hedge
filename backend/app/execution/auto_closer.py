@@ -1,6 +1,6 @@
 import time
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from sqlalchemy.orm import Session
 
@@ -143,7 +143,7 @@ def _mapping_max_close_spread(db: Session, symbol: str) -> float:
 def _hold_expired(group: HedgeGroup, strategy: StrategySetting) -> bool:
     if not group.opened_at:
         return False
-    return datetime.utcnow() - group.opened_at >= timedelta(minutes=max(strategy.max_holding_minutes, 1))
+    return datetime.now(timezone.utc).replace(tzinfo=None) - group.opened_at >= timedelta(minutes=max(strategy.max_holding_minutes, 1))
 
 
 def _live_auto_close_allowed(db: Session) -> bool:

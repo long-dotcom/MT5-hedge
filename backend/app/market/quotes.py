@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import threading
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Literal
 
 
@@ -62,7 +62,7 @@ class QuoteCache:
                 ask=float(ask),
                 depth_notional=float(depth_notional),
                 exchange_ts=exchange_ts,
-                local_recv_ts=datetime.utcnow(),
+                local_recv_ts=datetime.now(timezone.utc).replace(tzinfo=None),
                 source=source,
                 sequence=self._sequence,
             )
@@ -105,7 +105,7 @@ class QuoteSynchronizer:
         mt5 = self.cache.latest("mt5", symbol)
         if not hl or not mt5:
             return None, "缺少实时行情"
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
         hl_age = (now - hl.local_recv_ts).total_seconds() * 1000
         mt5_age = (now - mt5.local_recv_ts).total_seconds() * 1000
         max_age = max(hl_age, mt5_age)

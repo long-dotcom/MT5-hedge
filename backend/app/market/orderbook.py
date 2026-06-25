@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import threading
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 
@@ -55,7 +55,7 @@ class OrderBookCache:
             bids=tuple(BookLevel(float(price), float(size)) for price, size in bids[: self.max_levels] if float(price) > 0 and float(size) > 0),
             asks=tuple(BookLevel(float(price), float(size)) for price, size in asks[: self.max_levels] if float(price) > 0 and float(size) > 0),
             source=source,
-            local_recv_ts=datetime.utcnow(),
+            local_recv_ts=datetime.now(timezone.utc).replace(tzinfo=None),
             exchange_ts=exchange_ts,
         )
         with self._lock:

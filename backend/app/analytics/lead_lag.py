@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from statistics import mean
 
 from app.market.quotes import Quote, quote_cache
@@ -33,7 +33,7 @@ def lead_lag_report(
     max_lag_ms: int = 2000,
 ) -> dict[str, object]:
     symbol = symbol.upper()
-    since = datetime.utcnow() - timedelta(seconds=max(window_seconds, 10))
+    since = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(seconds=max(window_seconds, 10))
     hl = [quote for quote in quote_cache.history("hyperliquid", symbol) if quote.local_recv_ts >= since]
     mt5 = [quote for quote in quote_cache.history("mt5", symbol) if quote.local_recv_ts >= since]
     events = _events_for_direction(symbol, "hyperliquid", "mt5", hl, mt5, threshold_bps, min_move, follow_ratio, max_lag_ms)

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 from app.db.models import HedgeGroup
@@ -18,7 +18,7 @@ def hedge_group_spreads(group: HedgeGroup) -> dict[str, Any]:
             "quote_time_diff_ms": None,
             "quote_age_ms": None,
         }
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
     spreads = spreads_for_direction(group.direction, hl.bid, hl.ask, mt5.bid, mt5.ask)
     return {
         "current_entry_spread": spreads.entry_spread,

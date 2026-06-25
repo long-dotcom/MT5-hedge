@@ -1,6 +1,6 @@
 import json
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from urllib import request
 
 from sqlalchemy.orm import Session
@@ -172,7 +172,7 @@ def _deal_swap(db: Session, mt5, group: HedgeGroup) -> float | None:
 
 def _group_window_ms(group: HedgeGroup) -> tuple[int, int]:
     start = group.opened_at or group.created_at
-    end = group.closed_at or datetime.utcnow()
+    end = group.closed_at or datetime.now(timezone.utc).replace(tzinfo=None)
     return int(start.timestamp() * 1000), int((end + timedelta(seconds=1)).timestamp() * 1000)
 
 

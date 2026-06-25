@@ -4,8 +4,7 @@ import asyncio
 import json
 import threading
 import time
-from datetime import datetime
-from datetime import timezone
+from datetime import datetime, timezone
 from typing import Any
 
 from loguru import logger

@@ -1,5 +1,5 @@
 from copy import deepcopy
-from datetime import datetime
+from datetime import datetime, timezone
 from threading import Lock
 from typing import Any
 
@@ -15,7 +15,7 @@ class ScanStateStore:
         with self._lock:
             self._spreads = deepcopy(spreads)
             self._opportunities = deepcopy(opportunities)
-            self._updated_at = datetime.utcnow()
+            self._updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
 
     def remove_symbols(self, symbols: set[str]) -> None:
         if not symbols:
@@ -24,7 +24,7 @@ class ScanStateStore:
         with self._lock:
             self._spreads = [row for row in self._spreads if str(row.get("symbol", "")).upper() not in normalized]
             self._opportunities = [row for row in self._opportunities if str(row.get("symbol", "")).upper() not in normalized]
-            self._updated_at = datetime.utcnow()
+            self._updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
 
     def snapshot(self) -> dict[str, Any]:
         with self._lock:

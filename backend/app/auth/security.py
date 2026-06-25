@@ -3,7 +3,7 @@ import hmac
 import base64
 import json
 import os
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from app.config.settings import get_settings
@@ -28,7 +28,7 @@ def verify_password(password: str, password_hash: str) -> bool:
 
 
 def create_access_token(subject: str, extra: dict[str, Any] | None = None) -> str:
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
     payload: dict[str, Any] = {
         "sub": subject,
         "iat": int(now.timestamp()),
@@ -52,7 +52,7 @@ def decode_access_token(token: str) -> dict[str, Any]:
     if not hmac.compare_digest(signature, expected):
         raise ValueError("token 签名无效")
     payload = json.loads(_unb64(encoded_payload))
-    if int(payload.get("exp", 0)) < int(datetime.utcnow().timestamp()):
+    if int(payload.get("exp", 0)) < int(datetime.now(timezone.utc).replace(tzinfo=None).timestamp()):
         raise ValueError("token 已过期")
     return payload
 

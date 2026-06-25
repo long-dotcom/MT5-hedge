@@ -4,9 +4,18 @@ from sqlalchemy.orm import Session
 from app.auth.security import hash_password
 from app.config.settings import get_settings
 from app.db.models import Base, RiskSetting, StrategySetting, SymbolMapping, SystemSetting, User
-from app.db.session import engine
+from app.db.session import engine, IS_POSTGRESQL, IS_SQLITE
 from app.accounts.sync import ensure_initial_account_snapshots
 from app.market.symbols import seed_symbol_mappings_from_file
+
+
+def _dialect_type(ddl: str) -> str:
+    """Translate SQLite-style DDL fragment to the current database dialect."""
+    if IS_POSTGRESQL:
+        ddl = ddl.replace("DATETIME", "TIMESTAMP")
+        ddl = ddl.replace("BOOLEAN DEFAULT 0", "BOOLEAN DEFAULT FALSE")
+        ddl = ddl.replace("BOOLEAN DEFAULT 1", "BOOLEAN DEFAULT TRUE")
+    return ddl
 
 
 def init_db() -> None:
@@ -60,7 +69,7 @@ def ensure_schema_columns() -> None:
     with engine.begin() as conn:
         for name, ddl in columns.items():
             if name not in existing:
-                conn.execute(text(f"ALTER TABLE symbol_mappings ADD COLUMN {name} {ddl}"))
+                conn.execute(text(f"ALTER TABLE symbol_mappings ADD COLUMN {name} {_dialect_type(ddl)}"))
     if "orders" in inspector.get_table_names():
         existing_orders = {column["name"] for column in inspector.get_columns("orders")}
         order_columns = {
@@ -71,7 +80,7 @@ def ensure_schema_columns() -> None:
         with engine.begin() as conn:
             for name, ddl in order_columns.items():
                 if name not in existing_orders:
-                    conn.execute(text(f"ALTER TABLE orders ADD COLUMN {name} {ddl}"))
+                    conn.execute(text(f"ALTER TABLE orders ADD COLUMN {name} {_dialect_type(ddl)}"))
     if "risk_settings" in inspector.get_table_names():
         existing_risk = {column["name"] for column in inspector.get_columns("risk_settings")}
         risk_columns = {
@@ -81,7 +90,7 @@ def ensure_schema_columns() -> None:
         with engine.begin() as conn:
             for name, ddl in risk_columns.items():
                 if name not in existing_risk:
-                    conn.execute(text(f"ALTER TABLE risk_settings ADD COLUMN {name} {ddl}"))
+                    conn.execute(text(f"ALTER TABLE risk_settings ADD COLUMN {name} {_dialect_type(ddl)}"))
     if "account_snapshots" in inspector.get_table_names():
         existing_accounts = {column["name"] for column in inspector.get_columns("account_snapshots")}
         account_columns = {
@@ -96,7 +105,7 @@ def ensure_schema_columns() -> None:
         with engine.begin() as conn:
             for name, ddl in account_columns.items():
                 if name not in existing_accounts:
-                    conn.execute(text(f"ALTER TABLE account_snapshots ADD COLUMN {name} {ddl}"))
+                    conn.execute(text(f"ALTER TABLE account_snapshots ADD COLUMN {name} {_dialect_type(ddl)}"))
             conn.execute(
                 text(
                     """
@@ -143,7 +152,7 @@ def ensure_schema_columns() -> None:
         with engine.begin() as conn:
             for name, ddl in strategy_columns.items():
                 if name not in existing_strategy:
-                    conn.execute(text(f"ALTER TABLE strategy_settings ADD COLUMN {name} {ddl}"))
+                    conn.execute(text(f"ALTER TABLE strategy_settings ADD COLUMN {name} {_dialect_type(ddl)}"))
     if "spread_snapshots" in inspector.get_table_names():
         existing_spreads = {column["name"] for column in inspector.get_columns("spread_snapshots")}
         spread_columns = {
@@ -162,7 +171,7 @@ def ensure_schema_columns() -> None:
         with engine.begin() as conn:
             for name, ddl in spread_columns.items():
                 if name not in existing_spreads:
-                    conn.execute(text(f"ALTER TABLE spread_snapshots ADD COLUMN {name} {ddl}"))
+                    conn.execute(text(f"ALTER TABLE spread_snapshots ADD COLUMN {name} {_dialect_type(ddl)}"))
             conn.execute(
                 text(
                     """
@@ -194,7 +203,7 @@ def ensure_schema_columns() -> None:
         with engine.begin() as conn:
             for name, ddl in opportunity_columns.items():
                 if name not in existing_opportunities:
-                    conn.execute(text(f"ALTER TABLE arbitrage_opportunities ADD COLUMN {name} {ddl}"))
+                    conn.execute(text(f"ALTER TABLE arbitrage_opportunities ADD COLUMN {name} {_dialect_type(ddl)}"))
             conn.execute(
                 text(
                     """
@@ -220,7 +229,7 @@ def ensure_schema_columns() -> None:
         with engine.begin() as conn:
             for name, ddl in current_columns.items():
                 if name not in existing_current:
-                    conn.execute(text(f"ALTER TABLE spread_current ADD COLUMN {name} {ddl}"))
+                    conn.execute(text(f"ALTER TABLE spread_current ADD COLUMN {name} {_dialect_type(ddl)}"))
             conn.execute(
                 text(
                     """
@@ -245,7 +254,7 @@ def ensure_schema_columns() -> None:
         with engine.begin() as conn:
             for name, ddl in bucket_columns.items():
                 if name not in existing_buckets:
-                    conn.execute(text(f"ALTER TABLE spread_buckets ADD COLUMN {name} {ddl}"))
+                    conn.execute(text(f"ALTER TABLE spread_buckets ADD COLUMN {name} {_dialect_type(ddl)}"))
             conn.execute(
                 text(
                     """
@@ -276,7 +285,7 @@ def ensure_schema_columns() -> None:
         with engine.begin() as conn:
             for name, ddl in group_columns.items():
                 if name not in existing_groups:
-                    conn.execute(text(f"ALTER TABLE hedge_groups ADD COLUMN {name} {ddl}"))
+                    conn.execute(text(f"ALTER TABLE hedge_groups ADD COLUMN {name} {_dialect_type(ddl)}"))
 
 
 def seed_defaults(db: Session) -> None:

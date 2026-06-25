@@ -1,7 +1,12 @@
-from datetime import datetime
+from datetime import UTC, datetime
 
-from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, String, Text
+from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Index, Integer, String, Text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
+
+
+def utc_now() -> datetime:
+    """Return current UTC time as a naive datetime for DB compatibility."""
+    return datetime.now(UTC).replace(tzinfo=None)
 
 
 class Base(DeclarativeBase):
@@ -9,8 +14,8 @@ class Base(DeclarativeBase):
 
 
 class TimestampMixin:
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
-    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, onupdate=utc_now)
 
 
 class User(Base, TimestampMixin):
@@ -192,7 +197,7 @@ class MarketSnapshot(Base, TimestampMixin):
     ask: Mapped[float] = mapped_column(Float)
     mid: Mapped[float] = mapped_column(Float)
     depth_notional: Mapped[float] = mapped_column(Float, default=0.0)
-    captured_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    captured_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now)
 
 
 class SpreadCurrent(Base, TimestampMixin):
@@ -222,7 +227,7 @@ class SpreadCurrent(Base, TimestampMixin):
     annualized_return: Mapped[float] = mapped_column(Float)
     status: Mapped[str] = mapped_column(String(32))
     reason: Mapped[str] = mapped_column(Text, default="")
-    sampled_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    sampled_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now)
 
 
 class SpreadDirectionCurrent(Base, TimestampMixin):
@@ -252,7 +257,7 @@ class SpreadDirectionCurrent(Base, TimestampMixin):
     annualized_return: Mapped[float] = mapped_column(Float, default=0.0)
     status: Mapped[str] = mapped_column(String(32), default="candidate")
     reason: Mapped[str] = mapped_column(Text, default="")
-    sampled_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    sampled_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now)
 
 
 class SpreadBucket(Base, TimestampMixin):
@@ -453,3 +458,21 @@ class WorkerRun(Base, TimestampMixin):
     status: Mapped[str] = mapped_column(String(32))
     duration_ms: Mapped[int] = mapped_column(Integer, default=0)
     error_message: Mapped[str] = mapped_column(Text, default="")
+
+
+# ---------------------------------------------------------------------------
+# Composite indexes for common query patterns (PostgreSQL-friendly)
+# ---------------------------------------------------------------------------
+
+Index("ix_hedge_groups_symbol_status", HedgeGroup.symbol, HedgeGroup.status)
+Index("ix_hedge_groups_status_opened", HedgeGroup.status, HedgeGroup.opened_at)
+Index("ix_hedge_group_events_group_id", HedgeGroupEvent.hedge_group_id)
+Index("ix_orders_group_platform", Order.hedge_group_id, Order.platform)
+Index("ix_fills_order_platform", Fill.order_id, Fill.platform)
+Index("ix_spread_snapshots_symbol_created", SpreadSnapshot.symbol, SpreadSnapshot.created_at)
+Index("ix_spread_buckets_symbol_dir_start", SpreadBucket.symbol, SpreadBucket.direction, SpreadBucket.bucket_start)
+Index("ix_system_logs_created_at", SystemLog.created_at)
+Index("ix_arbitrage_opps_symbol_status", ArbitrageOpportunity.symbol, ArbitrageOpportunity.status)
+Index("ix_market_snapshots_symbol_platform", MarketSnapshot.symbol, MarketSnapshot.platform)
+Index("ix_positions_platform_symbol", Position.platform, Position.symbol)
+Index("ix_risk_events_created_at", RiskEvent.created_at)

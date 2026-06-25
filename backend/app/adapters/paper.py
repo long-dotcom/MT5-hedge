@@ -1,7 +1,7 @@
 import hashlib
 import random
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Callable
 
 from app.adapters.base import Account, AdapterOrder, AdapterOrderResult, Ticker
@@ -35,7 +35,7 @@ class PaperAdapter:
 
     def get_ticker(self, symbol: str) -> Ticker:
         base = {"BTC": 65000.0, "ETH": 3400.0, "SOL": 145.0}.get(symbol.upper().replace("USD", ""), 100.0)
-        seed = int(hashlib.sha256(f"{self.platform}:{symbol}:{datetime.utcnow().minute}".encode()).hexdigest()[:8], 16)
+        seed = int(hashlib.sha256(f"{self.platform}:{symbol}:{datetime.now(timezone.utc).replace(tzinfo=None).minute}".encode()).hexdigest()[:8], 16)
         rng = random.Random(seed)
         drift_bps = rng.uniform(-10, 10) + self.price_bias_bps
         mid = base * (1 + drift_bps / 10_000)
@@ -45,7 +45,7 @@ class PaperAdapter:
             bid=round(mid - spread / 2, 4),
             ask=round(mid + spread / 2, 4),
             depth_notional=100_000.0,
-            timestamp=datetime.utcnow(),
+            timestamp=datetime.now(timezone.utc).replace(tzinfo=None),
         )
 
     def get_orderbook(self, symbol: str, depth: int = 5) -> dict:

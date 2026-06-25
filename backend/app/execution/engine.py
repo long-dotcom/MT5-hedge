@@ -1,7 +1,7 @@
 import math
 import random
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
+from datetime import datetime, timezone
 from types import SimpleNamespace
 
 from sqlalchemy.orm import Session
@@ -143,7 +143,7 @@ def open_hedge_group(db: Session, opportunity_id: int, source: str = "system") -
 
     if all(_has_position_effect(result) for result in results):
         group.status = "open"
-        group.opened_at = datetime.utcnow()
+        group.opened_at = datetime.now(timezone.utc).replace(tzinfo=None)
         group.fees = sum(result.fee for result in results)
         actual_entry_spread = actual_entry_spread_from_fills(db, group)
         if actual_entry_spread is not None:
@@ -641,7 +641,7 @@ def close_hedge_group(db: Session, group_id: int, reason: str, *, validate_final
         return _execute_close_hedge_group(db, group, reason, live=True, simulated=False, estimated_realized_pnl=None, success_event_type="closed", pending_event_type="close_pending", failed_event_type="close_failed", validate_final_close=validate_final_close)
 
     group.status = "closed"
-    group.closed_at = datetime.utcnow()
+    group.closed_at = datetime.now(timezone.utc).replace(tzinfo=None)
     group.realized_pnl = group.unrealized_pnl - group.fees - group.funding - group.swap
     group.close_reason = reason
     db.add(HedgeGroupEvent(hedge_group_id=group.id, event_type="closed", detail=reason))
@@ -749,7 +749,7 @@ def _execute_close_hedge_group(
 
     if all(_has_position_effect(result) for result in results):
         group.status = "closed"
-        group.closed_at = datetime.utcnow()
+        group.closed_at = datetime.now(timezone.utc).replace(tzinfo=None)
         group.fees += sum(result.fee for result in results)
         realized_from_fills = realized_pnl_from_fills(db, group)
         if realized_from_fills is not None:

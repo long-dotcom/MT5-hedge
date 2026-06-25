@@ -58,7 +58,7 @@ def apply_mt5_session_template(mapping: SymbolMapping, template: str | None = No
     mapping.mt5_close_only_sessions_json = _json(defaults["close_only"])
     mapping.mt5_quote_only_sessions_json = _json(defaults["quote_only"])
     mapping.mt5_session_source = "exness_template"
-    mapping.mt5_session_last_synced_at = datetime.utcnow()
+    mapping.mt5_session_last_synced_at = datetime.now(timezone.utc).replace(tzinfo=None)
     return mapping
 
 

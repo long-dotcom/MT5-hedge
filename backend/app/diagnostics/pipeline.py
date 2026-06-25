@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 from sqlalchemy import desc
@@ -27,7 +27,7 @@ ACTIVE_OPPORTUNITY_STATUSES = {"candidate", "executable", "executing"}
 
 
 def build_pipeline_diagnostics(db: Session) -> dict[str, Any]:
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
     settings = get_settings()
     mappings = db.query(SymbolMapping).filter(SymbolMapping.enabled.is_(True)).order_by(SymbolMapping.symbol).all()
     current_by_symbol = _current_spreads(db, mappings)

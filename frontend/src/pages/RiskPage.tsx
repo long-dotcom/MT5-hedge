@@ -2,14 +2,18 @@ import { ThunderboltOutlined } from '@ant-design/icons';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { Button, Card, Descriptions, Space, Table, Tag, Typography, message } from 'antd';
 import type { ColumnsType } from 'antd/es/table';
+import { useState } from 'react';
 import { api } from '../api/client';
 import { fmtLocalTime, fmtMoney, fmtPct, riskModeLabel, riskModeColor } from '../utils/format';
+
+const EVENT_PAGE_SIZE = 10;
 
 export function RiskPage() {
   const queryClient = useQueryClient();
   const [messageApi, contextHolder] = message.useMessage();
+  const [eventPage, setEventPage] = useState(1);
   const status = useQuery({ queryKey: ['risk-status'], queryFn: async () => (await api.get('/risk/status')).data });
-  const events = useQuery({ queryKey: ['risk-events'], queryFn: async () => (await api.get('/risk/events')).data });
+  const events = useQuery({ queryKey: ['risk-events', eventPage], queryFn: async () => (await api.get('/risk/events', { params: { page: eventPage, page_size: EVENT_PAGE_SIZE } })).data });
   const stop = useMutation({
     mutationFn: async () => (await api.post('/risk/emergency-stop')).data,
     onSuccess: () => {
@@ -47,7 +51,13 @@ export function RiskPage() {
         </Descriptions>
       </Card>
       <Card title="风控事件">
-        <Table rowKey="id" columns={columns} dataSource={events.data?.items || []} loading={events.isLoading} pagination={{ pageSize: 10, total: events.data?.total || 0 }} />
+        <Table
+          rowKey="id"
+          columns={columns}
+          dataSource={events.data?.items || []}
+          loading={events.isLoading}
+          pagination={{ current: eventPage, pageSize: EVENT_PAGE_SIZE, total: events.data?.total || 0, onChange: setEventPage }}
+        />
       </Card>
     </Space>
   );

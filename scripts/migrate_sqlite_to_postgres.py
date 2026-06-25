@@ -11,6 +11,7 @@ from typing import Any
 
 from sqlalchemy import MetaData, Table, create_engine, inspect, text
 from sqlalchemy.engine import Engine
+from sqlalchemy.engine.url import make_url
 from sqlalchemy.sql.sqltypes import Boolean, DateTime
 
 
@@ -41,6 +42,10 @@ def resolve_database_url(cli_url: str | None) -> str:
     if not url:
         raise SystemExit("DATABASE_URL is missing. Pass --target-url or configure .env first.")
     return url
+
+
+def display_database_url(url: str) -> str:
+    return make_url(url).render_as_string(hide_password=True)
 
 
 def parse_datetime(value: Any) -> Any:
@@ -101,7 +106,53 @@ def count_pg_rows(engine: Engine, table_name: str) -> int:
         return int(conn.execute(text(f'select count(*) from "{table_name}"')).scalar() or 0)
 
 
+def quote_identifier(value: str) -> str:
+    return '"' + value.replace('"', '""') + '"'
+
+
+def ensure_postgres_database(target_url: str) -> None:
+    url = make_url(target_url)
+    database_name = url.database
+    if not database_name:
+        raise SystemExit("Target PostgreSQL URL must include a database name.")
+
+    maintenance_url = url.set(database="postgres")
+    try:
+        engine = create_engine(maintenance_url, future=True, isolation_level="AUTOCOMMIT")
+        with engine.connect() as conn:
+            exists = conn.execute(text("select 1 from pg_database where datname = :name"), {"name": database_name}).scalar()
+            if exists:
+                return
+            conn.execute(text(f"create database {quote_identifier(database_name)}"))
+            print(f"Created PostgreSQL database: {database_name}")
+    except Exception as exc:
+        fallback_url = url.set(database="template1")
+        engine = create_engine(fallback_url, future=True, isolation_level="AUTOCOMMIT")
+        with engine.connect() as conn:
+            exists = conn.execute(text("select 1 from pg_database where datname = :name"), {"name": database_name}).scalar()
+            if exists:
+                return
+            conn.execute(text(f"create database {quote_identifier(database_name)}"))
+            print(f"Created PostgreSQL database: {database_name}")
+
+
+def postgres_database_exists(target_url: str) -> bool:
+    url = make_url(target_url)
+    database_name = url.database
+    if not database_name:
+        raise SystemExit("Target PostgreSQL URL must include a database name.")
+    for maintenance_db in ("postgres", "template1"):
+        try:
+            engine = create_engine(url.set(database=maintenance_db), future=True)
+            with engine.connect() as conn:
+                return bool(conn.execute(text("select 1 from pg_database where datname = :name"), {"name": database_name}).scalar())
+        except Exception:
+            continue
+    raise SystemExit("Cannot connect to PostgreSQL maintenance database postgres/template1.")
+
+
 def init_postgres_schema(target_url: str) -> None:
+    ensure_postgres_database(target_url)
     os.environ["DATABASE_URL"] = target_url
     sys.path.insert(0, str(ROOT_DIR / "backend"))
     from app.db.init_db import init_db
@@ -165,7 +216,7 @@ def migrate(source: Path, target_url: str, replace: bool, dry_run: bool) -> None
         raise SystemExit("PostgreSQL schema has no application tables. Check DATABASE_URL and init_db.")
 
     print(f"Source SQLite: {source}")
-    print(f"Target PostgreSQL: {target_url}")
+    print(f"Target PostgreSQL: {display_database_url(target_url)}")
     print("")
 
     print("Planned row counts:")
@@ -223,6 +274,27 @@ def migrate(source: Path, target_url: str, replace: bool, dry_run: bool) -> None
     print("Migration complete.")
 
 
+def dry_run_source_only(source: Path, target_url: str, reason: str) -> None:
+    if not source.exists():
+        raise SystemExit(f"SQLite source not found: {source}")
+    sqlite = sqlite3.connect(source)
+    source_tables = sorted(sqlite_tables(sqlite))
+    print(f"Source SQLite: {source}")
+    print(f"Target PostgreSQL: {display_database_url(target_url)}")
+    print(f"Target inspection skipped: {reason}")
+    print("")
+    print("SQLite row counts:")
+    total_source_rows = 0
+    for table_name in source_tables:
+        count = count_sqlite_rows(sqlite, table_name)
+        total_source_rows += count
+        print(f"  {table_name}: {count}")
+    print("")
+    print(f"Source total rows: {total_source_rows}")
+    print("Dry run only; no data changed.")
+    sqlite.close()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Migrate MT5 Hedge data from SQLite to PostgreSQL.")
     parser.add_argument("--source", default=str(DEFAULT_SQLITE_PATH), help="SQLite database path.")
@@ -248,7 +320,12 @@ def main() -> None:
         backup_dir = backup_sqlite(source, Path(args.backup_dir).expanduser().resolve())
         print(f"SQLite backup written to: {backup_dir}")
 
-    init_postgres_schema(target_url)
+    if args.dry_run:
+        if not postgres_database_exists(target_url):
+            dry_run_source_only(source, target_url, "target database does not exist")
+            return
+    else:
+        init_postgres_schema(target_url)
     migrate(source, target_url, args.replace, args.dry_run)
 
 

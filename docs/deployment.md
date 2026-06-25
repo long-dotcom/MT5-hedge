@@ -230,13 +230,15 @@ git pull origin master
 .\scripts\migrate_sqlite_to_postgres.ps1 -DryRun
 ```
 
-dry-run 会读取默认源库 `data\mt5_hedge.db`，打印各表行数，不会修改 PostgreSQL。确认行数正常后执行正式迁移：
+dry-run 会读取默认源库 `data\mt5_hedge.db`，打印各表行数；如果目标 PostgreSQL 数据库已存在，也会读取目标当前行数。`-DryRun` 不会创建数据库、不会建表、不会写入默认数据。确认行数正常后执行正式迁移：
 
 ```powershell
 .\scripts\migrate_sqlite_to_postgres.ps1 -Replace -Yes
 ```
 
 `-Replace` 会清空 PostgreSQL 当前业务表并导入 SQLite 全量数据；脚本会先把 SQLite 源库复制到 `data\migration-backups\时间戳\sqlite-before-postgres-migration.db`。迁移完成后会自动修复 PostgreSQL 自增序列，避免新订单、新对冲组 ID 冲突。
+
+如果 `.env` 中的 PostgreSQL 数据库还不存在，正式迁移脚本会先按 `DATABASE_URL` 里的库名自动创建数据库，然后再执行建表和迁移。脚本会优先连接同一 PostgreSQL 服务上的 `postgres` 维护库，失败时再尝试 `template1`。
 
 如果服务器旧 SQLite 不在默认位置，可以指定源库：
 

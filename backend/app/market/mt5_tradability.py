@@ -7,6 +7,7 @@ import threading
 import time
 
 from sqlalchemy.orm import Session
+from sqlalchemy.exc import OperationalError
 
 from app.adapters.mt5 import MT5OrderCheck, mt5_market_order_check
 from app.config.settings import get_settings
@@ -136,7 +137,10 @@ class MT5TradabilityCache:
         for key in stale_keys:
             db.query(SystemSetting).filter(SystemSetting.key == key).delete()
         if stale_keys:
-            db.commit()
+            try:
+                db.commit()
+            except OperationalError:
+                db.rollback()
 
     def snapshot(self) -> list[dict]:
         with self._lock:

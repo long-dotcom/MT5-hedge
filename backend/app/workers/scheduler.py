@@ -34,6 +34,7 @@ def scanner_job() -> None:
         run_auto_close(db)
         run_execution_reconcile(db)
     except Exception as exc:
+        db.rollback()
         logger.exception(f"扫描任务失败: {exc}")
     finally:
         db.close()
@@ -50,6 +51,7 @@ def signal_stats_job() -> None:
     try:
         refresh_signal_stats_cache(db)
     except Exception as exc:
+        db.rollback()
         logger.exception(f"统计线刷新任务失败: {exc}")
     finally:
         db.close()
@@ -67,6 +69,7 @@ def mt5_tradability_job() -> None:
     try:
         refresh_mt5_tradability_cache(db)
     except Exception as exc:
+        db.rollback()
         logger.exception(f"MT5 交易能力刷新任务失败: {exc}")
     finally:
         db.close()
@@ -84,6 +87,7 @@ def mt5_session_template_job() -> None:
     try:
         sync_mt5_session_templates(db, only_auto=True)
     except Exception as exc:
+        db.rollback()
         logger.exception(f"MT5 交易时段模板刷新任务失败: {exc}")
     finally:
         db.close()

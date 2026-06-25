@@ -296,11 +296,14 @@ def run_scan(db: Session) -> int:
         return created
     except Exception as exc:
         db.rollback()
-        db.add(WorkerRun(worker_name="spread_scanner", status="failed", duration_ms=int((perf_counter() - started) * 1000), error_message=str(exc)))
-        db.add(SystemLog(level="error", category="scanner", message="价差扫描失败", context=str(exc)))
-        prune_table_by_id(db, WorkerRun)
-        prune_table_by_id(db, SystemLog)
-        db.commit()
+        try:
+            db.add(WorkerRun(worker_name="spread_scanner", status="failed", duration_ms=int((perf_counter() - started) * 1000), error_message=str(exc)))
+            db.add(SystemLog(level="error", category="scanner", message="价差扫描失败", context=str(exc)))
+            prune_table_by_id(db, WorkerRun)
+            prune_table_by_id(db, SystemLog)
+            db.commit()
+        except Exception:
+            db.rollback()
         raise
 
 

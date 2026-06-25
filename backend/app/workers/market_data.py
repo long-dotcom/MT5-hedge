@@ -9,6 +9,7 @@ from datetime import timezone
 from typing import Any
 
 from loguru import logger
+from sqlalchemy.exc import OperationalError
 
 from app.adapters.hyperliquid import HyperliquidAdapter
 from app.adapters.mt5 import MT5Adapter
@@ -46,6 +47,10 @@ class MarketDataManager:
             db = SessionLocal()
             try:
                 symbols = [item.symbol for item in enabled_mappings(db)]
+            except OperationalError as exc:
+                logger.warning(f"启动等待行情时读取品种映射失败，继续等待: {exc}")
+                db.rollback()
+                symbols = []
             finally:
                 db.close()
             if symbols and all(quote_cache.latest("hyperliquid", symbol) and quote_cache.latest("mt5", symbol) for symbol in symbols):
@@ -66,14 +71,22 @@ class MarketDataManager:
             db = SessionLocal()
             try:
                 mappings = enabled_mappings(db)
+            except OperationalError as exc:
+                logger.warning(f"读取品种映射失败，下一轮重试: {exc}")
+                db.rollback()
+                time.sleep(interval)
+                continue
             finally:
                 db.close()
             for mapping in mappings:
-                hl = hyperliquid.get_ticker(mapping.hyperliquid_symbol)
-                mt = mt5.get_ticker(mapping.mt5_symbol)
-                _put_synthetic_l2(mapping.symbol, hl.bid, hl.ask, hl.depth_notional, "paper")
-                quote_cache.put("hyperliquid", mapping.symbol, hl.bid, hl.ask, hl.depth_notional, "paper", hl.timestamp)
-                quote_cache.put("mt5", mapping.symbol, mt.bid, mt.ask, mt.depth_notional, "paper", mt.timestamp)
+                try:
+                    hl = hyperliquid.get_ticker(mapping.hyperliquid_symbol)
+                    mt = mt5.get_ticker(mapping.mt5_symbol)
+                    _put_synthetic_l2(mapping.symbol, hl.bid, hl.ask, hl.depth_notional, "paper")
+                    quote_cache.put("hyperliquid", mapping.symbol, hl.bid, hl.ask, hl.depth_notional, "paper", hl.timestamp)
+                    quote_cache.put("mt5", mapping.symbol, mt.bid, mt.ask, mt.depth_notional, "paper", mt.timestamp)
+                except Exception as exc:
+                    logger.warning(f"Paper 行情更新失败: {mapping.symbol}; {exc}")
             time.sleep(interval)
 
     def _mt5_polling_loop(self) -> None:
@@ -92,15 +105,23 @@ class MarketDataManager:
                 db = SessionLocal()
                 try:
                     mappings = enabled_mappings(db)
+                except OperationalError as exc:
+                    logger.warning(f"MT5 行情线程读取品种映射失败，下一轮重试: {exc}")
+                    db.rollback()
+                    time.sleep(interval)
+                    continue
                 finally:
                     db.close()
                 for mapping in mappings:
-                    mt5.symbol_select(mapping.mt5_symbol, True)
-                    tick = mt5.symbol_info_tick(mapping.mt5_symbol)
-                    if not tick:
-                        continue
-                    exchange_ts = datetime.utcfromtimestamp(getattr(tick, "time_msc", 0) / 1000) if getattr(tick, "time_msc", 0) else None
-                    quote_cache.put("mt5", mapping.symbol, tick.bid, tick.ask, 0.0, "mt5_symbol_info_tick", exchange_ts)
+                    try:
+                        mt5.symbol_select(mapping.mt5_symbol, True)
+                        tick = mt5.symbol_info_tick(mapping.mt5_symbol)
+                        if not tick:
+                            continue
+                        exchange_ts = datetime.utcfromtimestamp(getattr(tick, "time_msc", 0) / 1000) if getattr(tick, "time_msc", 0) else None
+                        quote_cache.put("mt5", mapping.symbol, tick.bid, tick.ask, 0.0, "mt5_symbol_info_tick", exchange_ts)
+                    except Exception as exc:
+                        logger.warning(f"MT5 行情更新失败: {mapping.symbol} {mapping.mt5_symbol}; {exc}")
                 time.sleep(interval)
         finally:
             mt5.shutdown()
@@ -165,7 +186,10 @@ class MarketDataManager:
                             continue
                         if self._stop.is_set():
                             break
-                        self._handle_hyperliquid_message(json.loads(raw), by_hl_symbol, source)
+                        try:
+                            self._handle_hyperliquid_message(json.loads(raw), by_hl_symbol, source)
+                        except Exception as exc:
+                            logger.warning(f"Hyperliquid WS 消息处理失败: {exc}")
             except Exception as exc:
                 logger.error(f"Hyperliquid WS 断开，准备重连: {exc}")
                 await asyncio.sleep(2)
@@ -175,6 +199,13 @@ class MarketDataManager:
         try:
             mappings = enabled_mappings(db)
             return hyperliquid_symbol_map(mappings, hip3_only=hip3_only)
+        except OperationalError as exc:
+            db.rollback()
+            logger.warning(f"Hyperliquid WS 读取品种映射失败，保持现有订阅: {exc}")
+            return {}
+        except Exception as exc:
+            logger.warning(f"Hyperliquid WS 构建品种映射失败: {exc}")
+            return {}
         finally:
             db.close()
 

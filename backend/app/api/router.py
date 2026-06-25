@@ -45,14 +45,16 @@ from app.execution.carry_costs import run_carry_cost_sync
 from app.execution.engine import close_hedge_group, open_hedge_group
 from app.execution.readiness import live_execution_readiness, paper_execution_readiness
 from app.execution.reconciler import run_execution_reconcile
-from app.market.scanner import run_scan
+from app.market.scanner import clear_strategy_setting_cache, run_scan
 from app.market.scan_state import scan_state_store
 from app.market.quotes import quote_cache
 from app.market.hedge_spreads import hedge_group_spreads
 from app.market.mt5_sessions import as_session_dict, mt5_session_state
 from app.market.mt5_schedule import apply_mt5_session_template, mt5_session_templates
+from app.market.symbols import clear_symbol_mapping_cache
 from app.config.settings import get_settings
 from app.schemas import AdoptPositionIn, CloseHedgeGroupIn, HyperliquidProbeTestIn, LiveTradingIn, LoginRequest, RiskModeIn, RiskSettingsIn, StrategySettingsIn, SymbolMappingIn, TokenResponse
+from app.strategy.statistical_signal import clear_signal_stats_cache
 
 
 router = APIRouter(prefix="/api")
@@ -636,6 +638,8 @@ def put_strategy(payload: StrategySettingsIn, user: User = Depends(require_admin
     db.add(row)
     audit(db, user.id, "update_strategy", "settings")
     db.commit()
+    clear_strategy_setting_cache()
+    clear_signal_stats_cache()
     return as_dict(row)
 
 
@@ -683,6 +687,8 @@ def put_symbol_mappings(payload: list[SymbolMappingIn], user: User = Depends(req
     _clear_scan_results_for_symbols(db, stale_symbols)
     audit(db, user.id, "update_symbol_mappings", "settings")
     db.commit()
+    clear_symbol_mapping_cache()
+    clear_signal_stats_cache()
     return [as_dict(row) for row in db.query(SymbolMapping).order_by(SymbolMapping.symbol).all()]
 
 
@@ -694,6 +700,8 @@ def create_symbol_mapping(payload: SymbolMappingIn, user: User = Depends(require
     db.add(row)
     audit(db, user.id, "create_symbol_mapping", "settings", payload.symbol)
     db.commit()
+    clear_symbol_mapping_cache()
+    clear_signal_stats_cache()
     db.refresh(row)
     return as_dict(row)
 
@@ -715,6 +723,8 @@ def update_symbol_mapping(mapping_id: int, payload: SymbolMappingIn, user: User 
     _clear_scan_results_for_symbols(db, stale_symbols)
     audit(db, user.id, "update_symbol_mapping", "settings", payload.symbol)
     db.commit()
+    clear_symbol_mapping_cache()
+    clear_signal_stats_cache()
     db.refresh(row)
     return as_dict(row)
 
@@ -729,6 +739,8 @@ def delete_symbol_mapping(mapping_id: int, user: User = Depends(require_admin), 
     _clear_scan_results_for_symbols(db, {symbol})
     audit(db, user.id, "delete_symbol_mapping", "settings", symbol)
     db.commit()
+    clear_symbol_mapping_cache()
+    clear_signal_stats_cache()
     return {"status": "ok"}
 
 
@@ -791,6 +803,8 @@ def sync_symbol_mapping_from_broker(mapping_id: int, user: User = Depends(requir
     row.min_tick = tick_size
     audit(db, user.id, "sync_symbol_mapping_from_broker", "settings", row.symbol)
     db.commit()
+    clear_symbol_mapping_cache()
+    clear_signal_stats_cache()
     db.refresh(row)
     return {
         **as_dict(row),
@@ -821,6 +835,7 @@ def sync_symbol_mapping_sessions(mapping_id: int, user: User = Depends(require_a
     db.add(row)
     audit(db, user.id, "sync_symbol_mapping_sessions", "settings", row.symbol)
     db.commit()
+    clear_symbol_mapping_cache()
     db.refresh(row)
     return as_dict(row)
 

@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from time import perf_counter
+from time import monotonic, perf_counter
+from types import SimpleNamespace
 
 from sqlalchemy.orm import Session
 
@@ -54,16 +55,31 @@ class PositionSizing:
 _bucket_accumulators: dict[tuple[str, str], BucketAccumulator] = {}
 _last_snapshot_flush: dict[tuple[str, str], float] = {}
 _scan_timings: dict[str, dict[str, float]] = {}
+_strategy_cache: tuple[int, float, SimpleNamespace | None] = (0, 0.0, None)
+_STRATEGY_CACHE_TTL_SECONDS = 2.0
 
 
-def get_strategy_setting(db: Session) -> StrategySetting:
+def clear_strategy_setting_cache() -> None:
+    global _strategy_cache
+    _strategy_cache = (0, 0.0, None)
+
+
+def get_strategy_setting(db: Session) -> SimpleNamespace:
+    global _strategy_cache
+    now = monotonic()
+    bind_id = id(db.get_bind())
+    cached_bind_id, cached_at, cached = _strategy_cache
+    if cached and cached_bind_id == bind_id and now - cached_at < _STRATEGY_CACHE_TTL_SECONDS:
+        return cached
     setting = db.query(StrategySetting).first()
     if not setting:
         setting = StrategySetting()
         db.add(setting)
         db.commit()
         db.refresh(setting)
-    return setting
+    cached = SimpleNamespace(**{column.name: getattr(setting, column.name) for column in setting.__table__.columns})
+    _strategy_cache = (bind_id, now, cached)
+    return cached
 
 
 def run_scan(db: Session) -> int:

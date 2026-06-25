@@ -3854,3 +3854,46 @@ symbols:
         assert btc.hyperliquid_symbol == "BTC-PERP"
         assert btc.min_order_size == 0.5
         assert eth.min_order_size == 2.34
+
+
+def test_enabled_mappings_cache_requires_explicit_clear() -> None:
+    engine = create_engine("sqlite:///:memory:", future=True)
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine, future=True)
+    with Session() as db:
+        symbol_module.clear_symbol_mapping_cache()
+        db.add(SymbolMapping(symbol="BTC", hyperliquid_symbol="BTC", mt5_symbol="BTCUSD", enabled=True))
+        db.commit()
+
+        first = symbol_module.enabled_mappings(db)
+        db.add(SymbolMapping(symbol="ETH", hyperliquid_symbol="ETH", mt5_symbol="ETHUSD", enabled=True))
+        db.commit()
+        cached = symbol_module.enabled_mappings(db)
+        symbol_module.clear_symbol_mapping_cache()
+        refreshed = symbol_module.enabled_mappings(db)
+
+        assert [row.symbol for row in first] == ["BTC"]
+        assert [row.symbol for row in cached] == ["BTC"]
+        assert [row.symbol for row in refreshed] == ["BTC", "ETH"]
+
+
+def test_strategy_setting_cache_requires_explicit_clear() -> None:
+    engine = create_engine("sqlite:///:memory:", future=True)
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine, future=True)
+    with Session() as db:
+        scanner_module.clear_strategy_setting_cache()
+        db.add(StrategySetting(min_total_profit=1.0))
+        db.commit()
+
+        first = scanner_module.get_strategy_setting(db)
+        row = db.query(StrategySetting).first()
+        row.min_total_profit = 2.0
+        db.commit()
+        cached = scanner_module.get_strategy_setting(db)
+        scanner_module.clear_strategy_setting_cache()
+        refreshed = scanner_module.get_strategy_setting(db)
+
+        assert first.min_total_profit == 1.0
+        assert cached.min_total_profit == 1.0
+        assert refreshed.min_total_profit == 2.0

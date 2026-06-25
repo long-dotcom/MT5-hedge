@@ -1,10 +1,15 @@
 from pathlib import Path
+from time import monotonic
+from types import SimpleNamespace
 
 import yaml
 from sqlalchemy.orm import Session
 
 from app.config.settings import get_settings
 from app.db.models import SymbolMapping
+
+_mapping_cache: tuple[int, float, list[SimpleNamespace]] = (0, 0.0, [])
+_MAPPING_CACHE_TTL_SECONDS = 2.0
 
 
 def load_symbol_mapping_file() -> list[dict]:
@@ -66,5 +71,23 @@ def seed_symbol_mappings_from_file(db: Session) -> int:
     return seeded
 
 
-def enabled_mappings(db: Session) -> list[SymbolMapping]:
-    return db.query(SymbolMapping).filter(SymbolMapping.enabled.is_(True)).order_by(SymbolMapping.symbol).all()
+def clear_symbol_mapping_cache() -> None:
+    global _mapping_cache
+    _mapping_cache = (0, 0.0, [])
+
+
+def enabled_mappings(db: Session) -> list[SimpleNamespace]:
+    global _mapping_cache
+    now = monotonic()
+    bind_id = id(db.get_bind())
+    cached_bind_id, cached_at, cached = _mapping_cache
+    if cached and cached_bind_id == bind_id and now - cached_at < _MAPPING_CACHE_TTL_SECONDS:
+        return cached
+    rows = db.query(SymbolMapping).filter(SymbolMapping.enabled.is_(True)).order_by(SymbolMapping.symbol).all()
+    cached = [_snapshot_mapping(row) for row in rows]
+    _mapping_cache = (bind_id, now, cached)
+    return cached
+
+
+def _snapshot_mapping(row: SymbolMapping) -> SimpleNamespace:
+    return SimpleNamespace(**{column.name: getattr(row, column.name) for column in row.__table__.columns})

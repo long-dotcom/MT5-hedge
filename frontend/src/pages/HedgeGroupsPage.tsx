@@ -44,11 +44,29 @@ function fmtCarryCost(value?: number) {
   return fmtMoney(-Number(value));
 }
 
+function hasTriggerPrices(row: any) {
+  return ['trigger_hyperliquid_bid', 'trigger_hyperliquid_ask', 'trigger_mt5_bid', 'trigger_mt5_ask'].some((key) => Number(row[key] || 0) !== 0);
+}
+
+function triggerPriceSummary(row: any) {
+  if (!hasTriggerPrices(row)) return '-';
+  return (
+    <Space direction="vertical" size={0} style={{ lineHeight: 1.25 }}>
+      <Typography.Text style={{ fontSize: 12 }}>HL {fmtAdaptive(row.trigger_hyperliquid_bid, 2, 8)} / {fmtAdaptive(row.trigger_hyperliquid_ask, 2, 8)}</Typography.Text>
+      <Typography.Text style={{ fontSize: 12 }}>MT5 {fmtAdaptive(row.trigger_mt5_bid, 2, 8)} / {fmtAdaptive(row.trigger_mt5_ask, 2, 8)}</Typography.Text>
+    </Space>
+  );
+}
+
 function detailItems(row: any) {
   return [
     { key: 'mt5_quantity', label: 'MT5 数量', children: fmtAdaptive(row.mt5_quantity, 2, 6) },
     { key: 'hyperliquid_quantity', label: 'HL 数量', children: fmtAdaptive(row.hyperliquid_quantity, 4, 8) },
     { key: 'trigger_spread', label: '触发价差', children: fmtSpread(row.trigger_spread) },
+    { key: 'trigger_hl_bid', label: '触发 HL Bid', children: hasTriggerPrices(row) ? fmtAdaptive(row.trigger_hyperliquid_bid, 2, 8) : '-' },
+    { key: 'trigger_hl_ask', label: '触发 HL Ask', children: hasTriggerPrices(row) ? fmtAdaptive(row.trigger_hyperliquid_ask, 2, 8) : '-' },
+    { key: 'trigger_mt5_bid', label: '触发 MT5 Bid', children: hasTriggerPrices(row) ? fmtAdaptive(row.trigger_mt5_bid, 2, 8) : '-' },
+    { key: 'trigger_mt5_ask', label: '触发 MT5 Ask', children: hasTriggerPrices(row) ? fmtAdaptive(row.trigger_mt5_ask, 2, 8) : '-' },
     { key: 'entry_spread', label: '真实开仓价差', children: fmtSpread(row.entry_spread) },
     { key: 'current_entry_spread', label: '当前重新入场价差', children: row.current_entry_spread == null ? '-' : fmtSpread(row.current_entry_spread) },
     { key: 'current_close_spread', label: '当前平仓价差', children: row.current_close_spread == null ? '-' : fmtSpread(row.current_close_spread) },
@@ -101,6 +119,7 @@ export function HedgeGroupsPage() {
     { title: '名义价值', dataIndex: 'notional', width: 112, align: 'right', render: fmtMoney },
     { title: '数量', dataIndex: 'quantity', width: 92, align: 'right', render: (v) => fmtAdaptive(v, 2, 6) },
     { title: '触发价差', dataIndex: 'trigger_spread', width: 112, align: 'right', render: fmtSpread },
+    { title: '触发价格', width: 188, render: (_, row) => triggerPriceSummary(row) },
     { title: '真实开仓价差', dataIndex: 'entry_spread', width: 132, align: 'right', render: fmtSpread },
     { title: '当前平仓价差', dataIndex: 'current_close_spread', width: 132, align: 'right', render: (v) => (v == null ? '-' : fmtSpread(v)) },
     { title: 'HL资金费', dataIndex: 'funding', width: 124, align: 'right', render: fmtCarryCost },
@@ -121,7 +140,7 @@ export function HedgeGroupsPage() {
           columns={columns}
           dataSource={query.data?.items || []}
           loading={query.isLoading}
-          scroll={{ x: 1560 }}
+          scroll={{ x: 1740 }}
           pagination={{ current: page, pageSize: 20, total: query.data?.total || 0, onChange: setPage }}
           expandable={{
             expandedRowRender: (row) => <Descriptions size="small" column={{ xs: 1, sm: 2, lg: 4 }} items={detailItems(row)} />,

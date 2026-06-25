@@ -906,6 +906,10 @@ def test_live_open_blocks_when_readiness_has_blockers(monkeypatch) -> None:
         hyperliquid_quantity=1.0,
         mt5_quantity=0.1,
         gross_spread=10,
+        trigger_hyperliquid_bid=99.0,
+        trigger_hyperliquid_ask=101.0,
+        trigger_mt5_bid=110.0,
+        trigger_mt5_ask=111.0,
         unit_cost=1,
         unit_net_profit=9,
         entry_threshold=8,
@@ -942,6 +946,10 @@ def test_live_open_orders_are_not_reduce_only(monkeypatch) -> None:
         hyperliquid_quantity=1.0,
         mt5_quantity=0.1,
         gross_spread=10,
+        trigger_hyperliquid_bid=99.0,
+        trigger_hyperliquid_ask=101.0,
+        trigger_mt5_bid=110.0,
+        trigger_mt5_ask=111.0,
         unit_cost=1,
         unit_net_profit=9,
         entry_threshold=8,
@@ -974,6 +982,10 @@ def test_live_open_orders_are_not_reduce_only(monkeypatch) -> None:
     group = open_hedge_group(db, opportunity.id)
 
     assert group.status == "open"
+    assert group.trigger_hyperliquid_bid == 99.0
+    assert group.trigger_hyperliquid_ask == 101.0
+    assert group.trigger_mt5_bid == 110.0
+    assert group.trigger_mt5_ask == 111.0
     assert [intent.reduce_only for intent in submitted] == [False, False]
     assert {order.reduce_only for order in db.query(Order).filter(Order.hedge_group_id == group.id).all()} == {False}
 
@@ -2906,10 +2918,16 @@ def test_scanner_records_two_direction_current_rows(monkeypatch) -> None:
     scanner_module.run_scan(db)
     rows = db.query(SpreadDirectionCurrent).filter(SpreadDirectionCurrent.symbol == "DUAL").all()
     current = db.query(SpreadCurrent).filter(SpreadCurrent.symbol == "DUAL").one()
+    opportunity = db.query(ArbitrageOpportunity).filter(ArbitrageOpportunity.symbol == "DUAL", ArbitrageOpportunity.status == "executable").first()
 
     assert {row.direction for row in rows} == {"long_hyperliquid_short_mt5", "long_mt5_short_hyperliquid"}
     assert current.entry_spread == current.gross_spread
     assert current.close_spread != current.entry_spread
+    assert opportunity is not None
+    assert opportunity.trigger_hyperliquid_bid == 99
+    assert opportunity.trigger_hyperliquid_ask == 101
+    assert opportunity.trigger_mt5_bid == 110
+    assert opportunity.trigger_mt5_ask == 111
 
 
 def test_funding_day_bucket_and_positive_bias() -> None:

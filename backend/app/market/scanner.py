@@ -274,7 +274,8 @@ def run_scan(db: Session) -> int:
                         signal_sample_count=statistical_signal.sample_count,
                         reason=signal.reason,
                         **{key: payload[key] for key in (
-                            "symbol", "direction", "quantity", "mt5_quantity", "hyperliquid_quantity",
+                            "symbol", "direction", "hyperliquid_bid", "hyperliquid_ask", "mt5_bid", "mt5_ask",
+                            "quantity", "mt5_quantity", "hyperliquid_quantity",
                             "notional_currency", "fx_rate_to_usd", "gross_spread", "unit_cost",
                             "unit_net_profit", "total_cost", "net_profit", "annualized_return", "status"
                         )},
@@ -648,6 +649,10 @@ def _sync_current_opportunity(
     *,
     symbol: str,
     direction: str,
+    hyperliquid_bid: float,
+    hyperliquid_ask: float,
+    mt5_bid: float,
+    mt5_ask: float,
     notional: float,
     quantity: float,
     mt5_quantity: float,
@@ -694,6 +699,10 @@ def _sync_current_opportunity(
     current.notional_currency = notional_currency
     current.fx_rate_to_usd = fx_rate_to_usd
     current.gross_spread = gross_spread
+    current.trigger_hyperliquid_bid = hyperliquid_bid
+    current.trigger_hyperliquid_ask = hyperliquid_ask
+    current.trigger_mt5_bid = mt5_bid
+    current.trigger_mt5_ask = mt5_ask
     current.unit_cost = unit_cost
     current.unit_net_profit = unit_net_profit
     current.total_cost = total_cost

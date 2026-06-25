@@ -29,7 +29,7 @@
 - `GET /api/analytics/spread-series?symbol=BTC&direction=long_mt5_short_hyperliquid&range=1h&basis=entry`：查看后端降采样后的价差曲线，支持 `15m/1h/4h/24h/7d`；`15m/1h/4h` 优先用原始快照统计，`24h/7d` 优先用聚合桶。
 - `GET /api/analytics/funding-series?symbol=JP225&range=7d&bucket=day`：查看单个品种历史资金费率曲线和统计，后端会按品种映射自动查询 Hyperliquid/HIP-3 合约，支持 `24h/7d/30d/90d` 和 `raw/hour/day` 聚合。
 - `GET /api/analytics/lead-lag?symbol=JP225&window_seconds=300&threshold_bps=3&max_lag_ms=2000`：查看最近报价领先/滞后分析，用内存报价历史判断 HL 与 MT5 谁先跳动、另一边是否跟随、滞后毫秒和滞后期间最大 mid 差。
-- `GET /api/opportunities?page=1&page_size=20`：查看当前仍满足条件的候选机会；价差回落后对应机会会从当前池移除；展示口径使用 `gross_spread`、`unit_cost`、`unit_net_profit`，其中 `gross_spread` 为入场价差兼容别名。
+- `GET /api/opportunities?page=1&page_size=20`：查看当前仍满足条件的候选机会；价差回落后对应机会会从当前池移除；展示口径使用 `gross_spread`、`unit_cost`、`unit_net_profit`，其中 `gross_spread` 为入场价差兼容别名。候选机会还会保存触发时盘口 `trigger_hyperliquid_bid`、`trigger_hyperliquid_ask`、`trigger_mt5_bid`、`trigger_mt5_ask`。
 - `GET /api/opportunities/{id}`：查看单个机会。
 - `POST /api/opportunities/{id}/execute`：按当前执行模式创建对冲组。
 
@@ -39,7 +39,7 @@
 - `GET /api/hedge-groups/{id}`：查看对冲组详情、事件和订单。
 - `POST /api/hedge-groups/{id}/close`：手动平仓。
 - `POST /api/hedge-groups/{id}/mark-manual`：标记为需要人工处理。
-- Paper 自动平仓由后台调度器执行，不需要前端点击；对冲组会返回 `trigger_spread`、`entry_spread`、`entry_threshold`、`exit_target`、`overheat_threshold`、`fees`、`funding`、`swap` 和 `close_reason`。其中 `trigger_spread` 是机会触发时的入场价差，`entry_spread` 是双边成交后按 fill 均价回写的真实开仓价差，`entry_threshold` 是统计入场线和品种“最小买入价差”的较高值，`exit_target` 是统计退出线和品种“最大卖出价差”合成后的最终平仓线。`funding` 和 `swap` 按成本口径返回：正数表示付出，负数表示收到，前端对冲组页会分别显示 HL 资金费和 MT5 隔夜费。
+- Paper 自动平仓由后台调度器执行，不需要前端点击；对冲组会返回 `trigger_spread`、`trigger_hyperliquid_bid`、`trigger_hyperliquid_ask`、`trigger_mt5_bid`、`trigger_mt5_ask`、`entry_spread`、`entry_threshold`、`exit_target`、`overheat_threshold`、`fees`、`funding`、`swap` 和 `close_reason`。其中 `trigger_spread` 是机会触发时的入场价差，四个 `trigger_*` 价格是该价差对应的 HL/MT5 bid/ask 盘口，`entry_spread` 是双边成交后按 fill 均价回写的真实开仓价差，`entry_threshold` 是统计入场线和品种“最小买入价差”的较高值，`exit_target` 是统计退出线和品种“最大卖出价差”合成后的最终平仓线。`funding` 和 `swap` 按成本口径返回：正数表示付出，负数表示收到，前端对冲组页会分别显示 HL 资金费和 MT5 隔夜费。
 
 ## 账户、仓位、订单
 

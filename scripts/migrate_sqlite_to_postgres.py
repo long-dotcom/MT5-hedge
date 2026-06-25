@@ -19,6 +19,20 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 DEFAULT_SQLITE_PATH = ROOT_DIR / "data" / "mt5_hedge.db"
 DEFAULT_BACKUP_DIR = ROOT_DIR / "data" / "migration-backups"
 CHUNK_SIZE = 10_000
+LEGACY_NULL_DEFAULTS: dict[str, dict[str, Any]] = {
+    "arbitrage_opportunities": {
+        "trigger_hyperliquid_bid": 0.0,
+        "trigger_hyperliquid_ask": 0.0,
+        "trigger_mt5_bid": 0.0,
+        "trigger_mt5_ask": 0.0,
+    },
+    "hedge_groups": {
+        "trigger_hyperliquid_bid": 0.0,
+        "trigger_hyperliquid_ask": 0.0,
+        "trigger_mt5_bid": 0.0,
+        "trigger_mt5_ask": 0.0,
+    },
+}
 
 
 def load_env_file(path: Path) -> dict[str, str]:
@@ -70,6 +84,8 @@ def convert_row(row: sqlite3.Row, table: Table, columns: list[str]) -> dict[str,
     converted: dict[str, Any] = {}
     for name in columns:
         value = row[name]
+        if value is None:
+            value = LEGACY_NULL_DEFAULTS.get(table.name, {}).get(name)
         col_type = table.c[name].type
         if isinstance(col_type, Boolean) and value is not None:
             value = bool(value)

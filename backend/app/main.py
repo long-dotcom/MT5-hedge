@@ -1,5 +1,6 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from loguru import logger
 
 from app.api.router import router
 from app.db.init_db import init_db
@@ -36,13 +37,13 @@ def on_startup() -> None:
     # 中文注释：启动时先执行一次扫描，让前端首次打开就能看到样例数据。
     db = SessionLocal()
     try:
-        sync_mt5_session_templates(db, only_auto=True)
-        refresh_signal_stats_cache(db)
-        refresh_mt5_tradability_cache(db)
-        run_scan(db)
-        run_carry_cost_sync(db, force=True)
-        run_auto_close(db)
-        run_execution_reconcile(db)
+        _startup_step(db, "sync_mt5_session_templates", lambda: sync_mt5_session_templates(db, only_auto=True))
+        _startup_step(db, "refresh_signal_stats_cache", lambda: refresh_signal_stats_cache(db))
+        _startup_step(db, "refresh_mt5_tradability_cache", lambda: refresh_mt5_tradability_cache(db))
+        _startup_step(db, "run_scan", lambda: run_scan(db))
+        _startup_step(db, "run_carry_cost_sync", lambda: run_carry_cost_sync(db, force=True))
+        _startup_step(db, "run_auto_close", lambda: run_auto_close(db))
+        _startup_step(db, "run_execution_reconcile", lambda: run_execution_reconcile(db))
     finally:
         db.close()
     start_scheduler()
@@ -57,3 +58,11 @@ def on_shutdown() -> None:
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+def _startup_step(db, name: str, func) -> None:
+    try:
+        func()
+    except Exception as exc:
+        db.rollback()
+        logger.exception(f"启动任务失败，已跳过: {name}; {exc}")

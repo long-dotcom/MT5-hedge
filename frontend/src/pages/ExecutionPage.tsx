@@ -99,7 +99,7 @@ export function ExecutionPage() {
                   columns={orderColumns}
                   dataSource={orders.data?.items || []}
                   loading={orders.isLoading}
-                  scroll={{ x: 990 }}
+                  scroll={{ x: 990, y: 'calc(100vh - 340px)' }}
                   pagination={{ current: orderPage, pageSize: 20, total: orders.data?.total || 0, onChange: setOrderPage }}
                   expandable={{
                     expandedRowRender: (row) => <Descriptions size="small" column={{ xs: 1, sm: 2, lg: 3 }} items={orderDetailItems(row)} />,
@@ -117,7 +117,7 @@ export function ExecutionPage() {
                   columns={fillColumns}
                   dataSource={fills.data?.items || []}
                   loading={fills.isLoading}
-                  scroll={{ x: 980 }}
+                  scroll={{ x: 980, y: 'calc(100vh - 340px)' }}
                   pagination={{ current: fillPage, pageSize: 20, total: fills.data?.total || 0, onChange: setFillPage }}
                 />
               )

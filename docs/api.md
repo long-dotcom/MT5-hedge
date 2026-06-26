@@ -19,7 +19,7 @@
 ## 行情与机会
 
 - `POST /api/markets/scan`：手动触发一次价差扫描。
-- `GET /api/stream?channel=pipeline&token=<access_token>`：页面级 SSE 推送。`channel=pipeline` 只推送链路监控所需的诊断快照，前端仅在打开链路监控页时订阅；`channel=dashboard` 只推送仪表盘摘要和权益曲线；`channel=hedge-groups&page=1&page_size=20` 只推送对冲组列表当前页；`channel=positions` 只推送仓位页当前仓位列表；`channel=accounts` 只推送账户页最新账户快照；`channel=execution&page=1&fill_page=1&page_size=20` 只推送执行记录页当前订单页和成交页；`channel=logs&page=1&alert_page=1&page_size=20` 只推送日志中心当前日志页和告警页；`channel=risk&page=1&page_size=10` 只推送风控页状态和当前风险事件页；`channel=lead-lag&symbol=JP225&window_seconds=300&threshold_bps=3&min_move=0&max_lag_ms=2000` 只推送报价领先滞后页当前筛选参数的报告。未指定 `channel` 时保留兼容的全量 snapshot 行为。
+- `GET /api/stream?channel=pipeline&token=<access_token>`：页面级 SSE 推送。`channel=pipeline` 只推送链路监控所需的诊断快照，前端仅在打开链路监控页时订阅；`channel=dashboard` 只推送仪表盘摘要和权益曲线；`channel=hedge-groups&page=1&page_size=20` 只推送对冲组列表当前页；`channel=positions` 只推送仓位页当前仓位列表；`channel=accounts` 只推送账户快照；`channel=execution&page=1&fill_page=1&page_size=20` 只推送执行记录页当前订单页和成交页；`channel=logs&page=1&alert_page=1&page_size=20` 只推送日志中心当前日志页和告警页；`channel=risk&page=1&page_size=10` 只推送风控页状态和当前风险事件页；`channel=lead-lag&symbol=JP225&window_seconds=300&threshold_bps=3&min_move=0&max_lag_ms=2000` 只推送报价时差分析页当前筛选参数的报告。未指定 `channel` 时保留兼容的全量 snapshot 行为。
 - `GET /api/markets/symbols`：查看手动品种映射。
 - `GET /api/markets/quotes`：查看实时行情缓存中的最新报价、来源和本地接收时间。
 - `GET /api/markets/trading-sessions`：查看每个品种的 MT5 交易时段状态和动作级权限。
@@ -28,7 +28,7 @@
 - `GET /api/analytics/spread-summary?symbol=BTC&direction=long_mt5_short_hyperliquid&range=1h&basis=entry`：查看价差均值、标准差、Z-Score、分位数、半衰期和回归概率；`basis` 支持 `entry/close/mid`，默认 `entry`。
 - `GET /api/analytics/spread-series?symbol=BTC&direction=long_mt5_short_hyperliquid&range=1h&basis=entry`：查看后端降采样后的价差曲线，支持 `15m/1h/4h/24h/7d`；`15m/1h/4h` 优先用原始快照统计，`24h/7d` 优先用聚合桶。
 - `GET /api/analytics/funding-series?symbol=JP225&range=7d&bucket=day`：查看单个品种历史资金费率曲线和统计，后端会按品种映射自动查询 Hyperliquid/HIP-3 合约，支持 `24h/7d/30d/90d` 和 `raw/hour/day` 聚合。
-- `GET /api/analytics/lead-lag?symbol=JP225&window_seconds=300&threshold_bps=3&max_lag_ms=2000`：查看最近报价领先/滞后分析，用内存报价历史判断 HL 与 MT5 谁先跳动、另一边是否跟随、滞后毫秒和滞后期间最大 mid 差。报价领先滞后页打开后会使用 `channel=lead-lag` 页面级 SSE 持续接收当前筛选条件的报告，不再使用前端轮询。
+- `GET /api/analytics/lead-lag?symbol=JP225&window_seconds=300&threshold_bps=3&max_lag_ms=2000`：查看最近报价时差分析，用内存报价历史判断 HL 与 MT5 谁先跳动、另一边是否跟随、滞后毫秒和滞后期间最大 mid 差。报价时差分析页打开后会使用 `channel=lead-lag` 页面级 SSE 持续接收当前筛选条件的报告，不再使用前端轮询。
 - `GET /api/opportunities?page=1&page_size=20`：查看当前仍满足条件的候选机会；价差回落后对应机会会从当前池移除；展示口径使用 `gross_spread`、`unit_cost`、`unit_net_profit`，其中 `gross_spread` 为入场价差兼容别名。候选机会还会保存触发时盘口 `trigger_hyperliquid_bid`、`trigger_hyperliquid_ask`、`trigger_mt5_bid`、`trigger_mt5_ask`。
 - `GET /api/opportunities/{id}`：查看单个机会。
 - `POST /api/opportunities/{id}/execute`：按当前执行模式创建对冲组。
@@ -43,7 +43,7 @@
 
 ## 账户、仓位、订单
 
-- `GET /api/accounts`：同步并返回 Hyperliquid、MT5 两个平台的最新账户状态；Hyperliquid 会分开展示 Perp 权益、Spot USDC、可提取和可用保证金，读取失败时回退 Paper 账户。账户页首屏调用该接口做主动同步，随后使用 `channel=accounts` 页面级 SSE 读取最新账户快照，避免全局推送触发不必要的账户数据传输。
+- `GET /api/accounts`：同步并返回 Hyperliquid、MT5 两个平台的最新账户状态；Hyperliquid 会分开展示 Perp 权益、Spot USDC、可提取和可用保证金，读取失败时回退 Paper 账户。仪表盘账户区首屏调用该接口做主动同步；旧 `/accounts` 路由保留用于直接访问。
 - `GET /api/accounts/snapshots`：账户快照分页。
 - `GET /api/positions`：当前仓位；仓位页打开后会使用 `channel=positions` 页面级 SSE 持续接收更新。
 - `POST /api/positions/{id}/adopt`：管理员将已同步的 Hyperliquid/MT5 外部仓位接管为 `live/manual_intervention` 对冲组；用于处理 readiness 发现的孤儿仓位。请求体可传 `reason`，必要时可传内部 `symbol`。

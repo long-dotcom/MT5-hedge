@@ -50,7 +50,7 @@ export function PositionsPage() {
         <Typography.Title level={3} style={{ margin: 0 }}>仓位</Typography.Title>
         <Typography.Text type={streamStatus.online ? 'success' : 'secondary'}>{streamStatus.online ? '页面级推送运行中' : '等待页面级推送'}</Typography.Text>
       </Space>
-      <Card>{query.data?.length ? <Table rowKey="id" columns={columns} dataSource={query.data} scroll={{ x: 900 }} pagination={{ pageSize: 10 }} /> : <Empty description="暂无仓位" />}</Card>
+      <Card>{query.data?.length ? <Table rowKey="id" columns={columns} dataSource={query.data} scroll={{ x: 900, y: 'calc(100vh - 250px)' }} pagination={{ pageSize: 10 }} /> : <Empty description="暂无仓位" />}</Card>
     </Space>
   );
 }

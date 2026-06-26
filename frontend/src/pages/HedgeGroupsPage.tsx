@@ -145,7 +145,7 @@ export function HedgeGroupsPage() {
           columns={columns}
           dataSource={query.data?.items || []}
           loading={query.isLoading}
-          scroll={{ x: 1740 }}
+          scroll={{ x: 1740, y: 'calc(100vh - 310px)' }}
           pagination={{ current: page, pageSize: 20, total: query.data?.total || 0, onChange: setPage }}
           expandable={{
             expandedRowRender: (row) => <Descriptions size="small" column={{ xs: 1, sm: 2, lg: 4 }} items={detailItems(row)} />,

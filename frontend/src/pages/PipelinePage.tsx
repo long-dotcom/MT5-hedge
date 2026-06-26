@@ -1,5 +1,5 @@
 import { useQuery } from '@tanstack/react-query';
-import { Alert, Space } from 'antd';
+import { Alert } from 'antd';
 import { api } from '../api/client';
 import { usePageStream } from '../hooks/useLiveStream';
 import { PipelineDashboardV2 } from './pipeline/PipelineDashboardV2';
@@ -15,9 +15,9 @@ export function PipelinePage() {
 
   const data = query.data;
   return (
-    <Space direction="vertical" size={16} className="full-width pipeline-page">
+    <div className="full-width pipeline-page">
       {query.isError && <Alert type="error" showIcon message="链路诊断加载失败" />}
       {data && <PipelineDashboardV2 data={toV2DashboardData(data, streamStatus)} />}
-    </Space>
+    </div>
   );
 }

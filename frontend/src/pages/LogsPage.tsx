@@ -7,6 +7,10 @@ import { usePageStream } from '../hooks/useLiveStream';
 import { fmtLocalTime } from '../utils/format';
 
 const PAGE_SIZE = 20;
+const cellText = (value: any) => {
+  if (value === null || value === undefined) return '';
+  return typeof value === 'string' ? value : JSON.stringify(value);
+};
 
 export function LogsPage() {
   const queryClient = useQueryClient();
@@ -20,19 +24,19 @@ export function LogsPage() {
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ['alerts'] })
   });
   const logColumns: ColumnsType<any> = [
-    { title: '等级', dataIndex: 'level', render: (v) => <Tag>{v}</Tag> },
-    { title: '分类', dataIndex: 'category' },
-    { title: '消息', dataIndex: 'message', ellipsis: true },
-    { title: '上下文', dataIndex: 'context', ellipsis: true },
+    { title: '等级', dataIndex: 'level', width: 92, render: (v) => <Tag>{v}</Tag> },
+    { title: '分类', dataIndex: 'category', width: 140 },
+    { title: '消息', dataIndex: 'message', width: 420, ellipsis: true, render: (v) => <Typography.Text className="table-cell-ellipsis" title={cellText(v)}>{cellText(v)}</Typography.Text> },
+    { title: '上下文', dataIndex: 'context', width: 360, ellipsis: true, render: (v) => <Typography.Text className="table-cell-ellipsis" title={cellText(v)}>{cellText(v)}</Typography.Text> },
     { title: '时间', dataIndex: 'created_at', width: 190, render: fmtLocalTime }
   ];
   const alertColumns: ColumnsType<any> = [
-    { title: '等级', dataIndex: 'level', render: (v) => <Tag color={v === 'critical' ? 'red' : 'gold'}>{v}</Tag> },
-    { title: '标题', dataIndex: 'title' },
-    { title: '内容', dataIndex: 'message', ellipsis: true },
-    { title: '确认', dataIndex: 'acknowledged', render: (v) => (v ? '已确认' : '未确认') },
+    { title: '等级', dataIndex: 'level', width: 92, render: (v) => <Tag color={v === 'critical' ? 'red' : 'gold'}>{v}</Tag> },
+    { title: '标题', dataIndex: 'title', width: 260, ellipsis: true, render: (v) => <Typography.Text className="table-cell-ellipsis" title={cellText(v)}>{cellText(v)}</Typography.Text> },
+    { title: '内容', dataIndex: 'message', width: 560, ellipsis: true, render: (v) => <Typography.Text className="table-cell-ellipsis" title={cellText(v)}>{cellText(v)}</Typography.Text> },
+    { title: '确认', dataIndex: 'acknowledged', width: 90, render: (v) => (v ? '已确认' : '未确认') },
     { title: '时间', dataIndex: 'created_at', width: 190, render: fmtLocalTime },
-    { title: '操作', render: (_, row) => <Button size="small" disabled={row.acknowledged} onClick={() => ack.mutate(row.id)}>确认</Button> }
+    { title: '操作', width: 90, render: (_, row) => <Button size="small" disabled={row.acknowledged} onClick={() => ack.mutate(row.id)}>确认</Button> }
   ];
   return (
     <Space direction="vertical" size={16} className="full-width">
@@ -52,6 +56,9 @@ export function LogsPage() {
                   columns={logColumns}
                   dataSource={logs.data?.items || []}
                   loading={logs.isLoading}
+                  className="logs-table"
+                  scroll={{ x: 1202, y: 'calc(100vh - 340px)' }}
+                  tableLayout="fixed"
                   pagination={{ current: logPage, pageSize: PAGE_SIZE, total: logs.data?.total || 0, onChange: setLogPage }}
                 />
               )
@@ -65,6 +72,9 @@ export function LogsPage() {
                   columns={alertColumns}
                   dataSource={alerts.data?.items || []}
                   loading={alerts.isLoading}
+                  className="logs-table"
+                  scroll={{ x: 1302, y: 'calc(100vh - 340px)' }}
+                  tableLayout="fixed"
                   pagination={{ current: alertPage, pageSize: PAGE_SIZE, total: alerts.data?.total || 0, onChange: setAlertPage }}
                 />
               )

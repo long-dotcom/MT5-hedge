@@ -3,6 +3,7 @@ import { Button, Card, Space, Table, Tabs, Tag, Typography } from 'antd';
 import type { ColumnsType } from 'antd/es/table';
 import { useState } from 'react';
 import { api } from '../api/client';
+import { usePageStream } from '../hooks/useLiveStream';
 import { fmtLocalTime } from '../utils/format';
 
 const PAGE_SIZE = 20;
@@ -11,6 +12,7 @@ export function LogsPage() {
   const queryClient = useQueryClient();
   const [logPage, setLogPage] = useState(1);
   const [alertPage, setAlertPage] = useState(1);
+  const streamStatus = usePageStream('logs', { page: logPage, alertPage, pageSize: PAGE_SIZE });
   const logs = useQuery({ queryKey: ['logs', logPage], queryFn: async () => (await api.get('/logs', { params: { page: logPage, page_size: PAGE_SIZE } })).data });
   const alerts = useQuery({ queryKey: ['alerts', alertPage], queryFn: async () => (await api.get('/alerts', { params: { page: alertPage, page_size: PAGE_SIZE } })).data });
   const ack = useMutation({
@@ -34,7 +36,10 @@ export function LogsPage() {
   ];
   return (
     <Space direction="vertical" size={16} className="full-width">
-      <Typography.Title level={3}>日志中心</Typography.Title>
+      <Space className="full-width" align="center" style={{ justifyContent: 'space-between' }}>
+        <Typography.Title level={3} style={{ margin: 0 }}>日志中心</Typography.Title>
+        <Typography.Text type={streamStatus.online ? 'success' : 'secondary'}>{streamStatus.online ? '页面级推送运行中' : '等待页面级推送'}</Typography.Text>
+      </Space>
       <Card>
         <Tabs
           items={[

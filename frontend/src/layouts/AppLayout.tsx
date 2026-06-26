@@ -18,7 +18,6 @@ import {
 import { Button, Layout, Menu, Space, Typography } from 'antd';
 import { useState } from 'react';
 import { Outlet, useLocation, useNavigate } from 'react-router-dom';
-import { useLiveStream } from '../hooks/useLiveStream';
 
 const { Header, Sider, Content } = Layout;
 
@@ -41,7 +40,6 @@ export function AppLayout() {
   const navigate = useNavigate();
   const location = useLocation();
   const [collapsed, setCollapsed] = useState(false);
-  useLiveStream();
   const logout = () => {
     localStorage.removeItem('token');
     localStorage.removeItem('user');

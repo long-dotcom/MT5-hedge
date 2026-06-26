@@ -1,5 +1,6 @@
 import type { HedgePoolItem, PipelineDiagnostics, PipelineNode, PipelineStatus, SymbolPipeline } from './types';
 import type { V2DashboardData, V2HedgeGroup, V2HedgeStatus, V2NodeStatus, V2PipelineSymbol } from './v2Types';
+import type { StreamStatus } from '../../hooks/useLiveStream';
 
 function toNodeStatus(status?: PipelineStatus): V2NodeStatus {
   if (status === 'flowing' || status === 'pass') return 'active';
@@ -96,15 +97,15 @@ function laneCount(data: PipelineDiagnostics, key: string): number {
   return data.pool.lanes.find((lane) => lane.key === key)?.count || 0;
 }
 
-export function toV2DashboardData(data: PipelineDiagnostics): V2DashboardData {
+export function toV2DashboardData(data: PipelineDiagnostics, streamStatus?: StreamStatus): V2DashboardData {
   const hedgeGroups = data.pool.items.map(toHedgeGroup).sort(sortHedgeGroups);
   const floatingPnl = hedgeGroups.reduce((sum, item) => sum + Number(item.pnl || 0), 0);
   const usedMargin = data.pool.items.reduce((sum, item) => sum + Number(item.notional || 0), 0);
   return {
     sseStatus: {
-      online: true,
-      latency: 0.8,
-      lastPush: 0.8,
+      online: streamStatus?.online ?? false,
+      latency: streamStatus?.latencySeconds ?? 0,
+      lastPush: streamStatus?.lastPushSeconds ?? 0,
       enabledSymbols: data.summary.enabled_symbols,
       normalFlow: data.summary.flowing,
       blockedFlow: data.summary.blocked,

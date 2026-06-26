@@ -52,6 +52,14 @@ class PositionSizing:
     fx_source: str
 
 
+@dataclass(frozen=True)
+class GateResult:
+    status: str
+    reason: str
+    gate: str
+    blocker: str = ""
+
+
 _bucket_accumulators: dict[tuple[str, str], BucketAccumulator] = {}
 _last_snapshot_flush: dict[tuple[str, str], float] = {}
 _scan_timings: dict[str, dict[str, float]] = {}
@@ -116,6 +124,8 @@ def run_scan(db: Session) -> int:
                         annualized_return=0,
                         status="rejected",
                         reason=f"MT5 不可报价/不可交易: {session_state.status}，{session_state.reason}",
+                        gate="market",
+                        blocker="market",
                     ))
                     _record_duration(timings, "persist_duration_ms", persist_started)
                     continue
@@ -144,6 +154,8 @@ def run_scan(db: Session) -> int:
                         annualized_return=0,
                         status="rejected",
                         reason=sync_reason,
+                        gate="quote",
+                        blocker="quote",
                     ))
                     _record_duration(timings, "persist_duration_ms", persist_started)
                     continue
@@ -176,6 +188,8 @@ def run_scan(db: Session) -> int:
                         annualized_return=0,
                         status="rejected",
                         reason=str(exc),
+                        gate="market",
+                        blocker="sizing",
                     ))
                     _record_duration(timings, "persist_duration_ms", persist_started)
                     continue
@@ -232,28 +246,21 @@ def run_scan(db: Session) -> int:
                         net_profit,
                         annualized_return,
                     )
-                    signal = statistical_signal.result
                     entry_threshold = _effective_entry_threshold(mapping, statistical_signal.reachable_entry)
                     exit_target = _effective_exit_target(mapping, statistical_signal.exit_target)
-                    min_entry_spread = float(mapping.min_entry_spread or 0.0)
-                    if min_entry_spread > 0 and gross_spread < min_entry_spread and signal.status in {"candidate", "executable"}:
-                        signal.status = "candidate"
-                        signal.reason = f"未达到品种最小买入价差: {gross_spread:.2f} < {min_entry_spread:.2f}"
-                    if signal.status in {"candidate", "executable"}:
-                        liquidity_reason = _hyperliquid_liquidity_reason(mapping.symbol, hyperliquid_side, sizing.hyperliquid_quantity, notional, hl.depth_notional)
-                        if liquidity_reason:
-                            signal.status = "candidate"
-                            signal.reason = liquidity_reason
-                    mt5_open_allowed, mt5_open_reason = mt5_action_allowed(session_state, direction, "open")
-                    if not mt5_open_allowed:
-                        signal.status = "rejected"
-                        signal.reason = mt5_open_reason
-                    else:
-                        tradability_allowed, tradability_reason = mt5_tradability_cache.is_fresh_allowed(mapping.symbol, mt5_side)
-                        if not tradability_allowed:
-                            signal.status = "rejected"
-                            signal.reason = f"MT5 交易能力未确认: {tradability_reason}"
-                    reason = signal.reason or f"loose_sync={synced.time_diff_ms:.0f}ms; mt5_session={session_state.status}"
+                    signal_gate = _signal_gate(mapping, statistical_signal.result, gross_spread)
+                    risk_tags = _risk_tags(gross_spread, statistical_signal)
+                    liquidity_gate = _liquidity_gate(
+                        mapping.symbol,
+                        hyperliquid_side,
+                        sizing.hyperliquid_quantity,
+                        notional,
+                        hl.depth_notional,
+                        signal_gate.status,
+                    )
+                    market_gate = _direction_market_gate(session_state, mapping.symbol, direction, mt5_side)
+                    final_gate = _combine_gates(signal_gate, liquidity_gate, market_gate)
+                    reason = final_gate.reason or f"loose_sync={synced.time_diff_ms:.0f}ms; mt5_session={session_state.status}"
                     payload = dict(
                         symbol=mapping.symbol,
                         direction=direction,
@@ -276,8 +283,11 @@ def run_scan(db: Session) -> int:
                         total_cost=cost.total,
                         net_profit=net_profit,
                         annualized_return=annualized_return,
-                        status=signal.status,
+                        status=final_gate.status,
                         reason=reason,
+                        gate=final_gate.gate,
+                        blocker=final_gate.blocker,
+                        risk_tags=risk_tags,
                         sampled_at=datetime.now(timezone.utc).replace(tzinfo=None),
                         hyperliquid_captured_at=hl.local_recv_ts,
                         mt5_captured_at=mt.local_recv_ts,
@@ -292,7 +302,7 @@ def run_scan(db: Session) -> int:
                         exit_target=exit_target,
                         overheat_threshold=statistical_signal.overheat,
                         signal_sample_count=statistical_signal.sample_count,
-                        reason=signal.reason,
+                        reason=reason,
                     )
                     if opportunity_payload:
                         created += 1
@@ -371,6 +381,62 @@ def _hl_fee_rate(order_type: str, hl_costs) -> float:
     return hl_costs.maker_fee_rate if order_type == "limit" else hl_costs.taker_fee_rate
 
 
+def _signal_gate(mapping: SymbolMapping, signal, gross_spread: float) -> GateResult:
+    status = str(signal.status)
+    reason = str(signal.reason or "")
+    if status not in {"candidate", "executable"}:
+        return GateResult(status, reason, "signal", "signal")
+    min_entry_spread = float(mapping.min_entry_spread or 0.0)
+    if min_entry_spread > 0 and gross_spread < min_entry_spread:
+        return GateResult("candidate", f"未达到品种最小买入价差: {gross_spread:.2f} < {min_entry_spread:.2f}", "signal", "signal")
+    return GateResult(status, reason, "signal", "" if status == "executable" else "signal")
+
+
+def _risk_tags(gross_spread: float, statistical_signal) -> list[dict[str, float | str]]:
+    tags: list[dict[str, float | str]] = []
+    overheat = float(getattr(statistical_signal, "overheat", 0.0) or 0.0)
+    if overheat > 0 and gross_spread > overheat:
+        tags.append({
+            "type": "overheat",
+            "message": f"价差超过过热线 {overheat:.2f}",
+            "value": gross_spread,
+            "threshold": overheat,
+        })
+    return tags
+
+
+def _liquidity_gate(symbol: str, side: str, quantity: float, notional: float, top_depth_notional: float, current_status: str) -> GateResult:
+    if current_status not in {"candidate", "executable"}:
+        return GateResult("pass", "", "liquidity")
+    liquidity_reason = _hyperliquid_liquidity_reason(symbol, side, quantity, notional, top_depth_notional)
+    if liquidity_reason:
+        return GateResult("candidate", liquidity_reason, "liquidity", "liquidity")
+    return GateResult("pass", "", "liquidity")
+
+
+def _direction_market_gate(session_state, symbol: str, direction: str, mt5_side: str) -> GateResult:
+    mt5_open_allowed, mt5_open_reason = mt5_action_allowed(session_state, direction, "open")
+    if not mt5_open_allowed:
+        return GateResult("rejected", mt5_open_reason, "market", "market")
+    tradability_allowed, tradability_reason = mt5_tradability_cache.is_fresh_allowed(symbol, mt5_side)
+    if not tradability_allowed:
+        return GateResult("rejected", f"MT5 交易能力未确认: {tradability_reason}", "market", "market")
+    return GateResult("pass", "", "market")
+
+
+def _combine_gates(signal_gate: GateResult, liquidity_gate: GateResult, market_gate: GateResult) -> GateResult:
+    for gate in (market_gate,):
+        if gate.status == "rejected":
+            return gate
+    if signal_gate.status == "rejected":
+        return signal_gate
+    if liquidity_gate.status == "candidate":
+        return liquidity_gate
+    if signal_gate.status == "candidate":
+        return signal_gate
+    return GateResult("executable", signal_gate.reason, "signal")
+
+
 def _hyperliquid_liquidity_reason(symbol: str, side: str, quantity: float, notional: float, top_depth_notional: float) -> str:
     book = order_book_cache.latest("hyperliquid", symbol)
     if book:
@@ -391,9 +457,9 @@ def _effective_entry_threshold(mapping: SymbolMapping, statistical_threshold: fl
 def _effective_exit_target(mapping: SymbolMapping, statistical_target: float) -> float:
     max_close_spread = float(getattr(mapping, "max_close_spread", 0.0) or 0.0)
     statistical = float(statistical_target or 0.0)
-    if max_close_spread <= 0:
+    if max_close_spread == 0:
         return statistical
-    if statistical <= 0:
+    if statistical == 0:
         return max_close_spread
     return min(statistical, max_close_spread)
 
@@ -444,6 +510,9 @@ def _opportunity_payload(
         "overheat_threshold": overheat_threshold,
         "signal_sample_count": signal_sample_count,
         "reason": reason,
+        "gate": payload.get("gate", ""),
+        "blocker": payload.get("blocker", ""),
+        "risk_tags": payload.get("risk_tags", []),
         "created_at": payload.get("sampled_at"),
         "updated_at": payload.get("sampled_at"),
     }

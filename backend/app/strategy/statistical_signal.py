@@ -72,8 +72,6 @@ def evaluate_entry_signal(
         result = SignalResult("rejected", f"价差 {current_spread:.2f} 未覆盖成本保护线 {stats.cost_guard:.2f}")
     elif current_spread < stats.reachable_entry:
         result = SignalResult("candidate", f"价差 {current_spread:.2f} 未达到可达入场线 {stats.reachable_entry:.2f}")
-    elif stats.overheat > 0 and current_spread > stats.overheat:
-        result = SignalResult("candidate", f"价差 {current_spread:.2f} 超过过热线 {stats.overheat:.2f}，等待确认")
     elif unit_edge < _strategy_float(strategy, "min_unit_edge", 0.0):
         result = SignalResult("candidate", f"每份边际 {unit_edge:.2f} 低于最小边际 {_strategy_float(strategy, 'min_unit_edge', 0.0):.2f}")
     elif total_net_profit < _strategy_float(strategy, "min_total_profit", 0.0):

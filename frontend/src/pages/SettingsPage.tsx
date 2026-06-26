@@ -362,7 +362,7 @@ export function SettingsPage() {
           <Form.Item name="contract_multiplier" label="合约乘数"><InputNumber min={0} step={0.01} /></Form.Item>
           <Form.Item name="min_order_size" label="最终最小量"><InputNumber min={0} step={0.001} disabled /></Form.Item>
           <Form.Item name="min_entry_spread" label="最小买入价差"><InputNumber min={0} step={0.01} /></Form.Item>
-          <Form.Item name="max_close_spread" label="最大卖出价差"><InputNumber min={0} step={0.01} /></Form.Item>
+          <Form.Item name="max_close_spread" label="最大卖出价差"><InputNumber step={0.01} /></Form.Item>
           <Form.Item name="mt5_min_lot" label="MT5 最小手数"><InputNumber min={0} step={0.01} disabled /></Form.Item>
           <Form.Item name="mt5_volume_step" label="MT5 手数步进"><InputNumber min={0} step={0.01} disabled /></Form.Item>
           <Form.Item name="mt5_contract_size" label="MT5 合约大小"><InputNumber min={0} step={0.01} disabled /></Form.Item>

@@ -14,7 +14,7 @@ from app.analytics.funding import FundingPoint, bucket_funding_points, summarize
 from app.analytics.lead_lag import lead_lag_report
 from app.market import scanner as scanner_module
 from app.market import symbols as symbol_module
-from app.db.models import Alert, ArbitrageOpportunity, AuditLog, Base, Fill, HedgeGroup, HedgeGroupEvent, Order, Position, RiskSetting, SpreadCurrent, SpreadDirectionCurrent, StrategySetting, SymbolMapping, SystemLog, SystemSetting, User
+from app.db.models import AccountSnapshot, Alert, ArbitrageOpportunity, AuditLog, Base, Fill, HedgeGroup, HedgeGroupEvent, Order, Position, RiskEvent, RiskSetting, SpreadCurrent, SpreadDirectionCurrent, StrategySetting, SymbolMapping, SystemLog, SystemSetting, User
 from app.execution.auto_closer import evaluate_auto_close, run_auto_close
 from app.execution.auto_executor import run_auto_execute
 from app.execution.carry_costs import _mt5_swap_cost, _paper_hyperliquid_funding_cost
@@ -2477,6 +2477,211 @@ def test_hedge_groups_api_returns_realtime_spreads() -> None:
     assert item["quote_age_ms"] >= 0
 
 
+def test_hedge_groups_api_returns_runtime_unrealized_pnl() -> None:
+    engine = create_engine("sqlite:///:memory:", future=True)
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine, future=True)
+    db = Session()
+    user = User(username="admin", password_hash="x", role="admin")
+    db.add(user)
+    group = HedgeGroup(
+        symbol="GROUP-PNL",
+        direction="long_hyperliquid_short_mt5",
+        status="open",
+        execution_mode="paper",
+        notional=1000,
+        quantity=1,
+        hyperliquid_quantity=2,
+        mt5_quantity=2,
+        entry_spread=20,
+        unrealized_pnl=0,
+    )
+    db.add(group)
+    db.commit()
+    hedge_pool.load_from_db(db)
+    quote_cache.put("hyperliquid", "GROUP-PNL", bid=100, ask=101, depth_notional=1000, source="test")
+    quote_cache.put("mt5", "GROUP-PNL", bid=115, ask=116, depth_notional=1000, source="test")
+
+    result = api_router.hedge_groups(user, db, page=1, page_size=20)
+
+    item = result["items"][0]
+    assert item["current_close_spread"] == 16
+    assert item["unrealized_pnl"] == 8
+
+
+def test_hedge_groups_stream_channel_returns_only_current_page() -> None:
+    engine = create_engine("sqlite:///:memory:", future=True)
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine, future=True)
+    db = Session()
+    db.add_all(
+        [
+            HedgeGroup(symbol="HG1", direction="long_hyperliquid_short_mt5", status="open", execution_mode="paper", notional=100, quantity=1),
+            HedgeGroup(symbol="HG2", direction="long_hyperliquid_short_mt5", status="open", execution_mode="paper", notional=100, quantity=1),
+        ]
+    )
+    db.commit()
+
+    event = api_router._stream_snapshot(db, channel="hedge-groups", page=1, page_size=1)
+
+    assert set(event) == {"hedge_groups"}
+    assert event["hedge_groups"]["total"] == 2
+    assert event["hedge_groups"]["page"] == 1
+    assert len(event["hedge_groups"]["items"]) == 1
+
+
+def test_positions_stream_channel_returns_only_positions() -> None:
+    engine = create_engine("sqlite:///:memory:", future=True)
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine, future=True)
+    db = Session()
+    db.add(Position(platform="mt5", symbol="USOIL", side="short", quantity=0.2, entry_price=76, mark_price=77, unrealized_pnl=-2.5))
+    db.commit()
+
+    event = api_router._stream_snapshot(db, channel="positions")
+
+    assert set(event) == {"positions"}
+    assert len(event["positions"]) == 1
+    assert event["positions"][0]["symbol"] == "USOIL"
+    assert event["positions"][0]["unrealized_pnl"] == -2.5
+
+
+def test_accounts_stream_channel_returns_only_latest_accounts() -> None:
+    engine = create_engine("sqlite:///:memory:", future=True)
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine, future=True)
+    db = Session()
+    db.add_all(
+        [
+            AccountSnapshot(platform="hyperliquid", equity=100, available_balance=90, margin_used=10, margin_ratio=10),
+            AccountSnapshot(platform="mt5", equity=200, available_balance=180, margin_used=20, margin_ratio=10),
+        ]
+    )
+    db.commit()
+
+    event = api_router._stream_snapshot(db, channel="accounts")
+
+    assert set(event) == {"accounts"}
+    assert {item["platform"] for item in event["accounts"]} == {"hyperliquid", "mt5"}
+    assert sum(item["equity"] for item in event["accounts"]) == 300
+
+
+def test_execution_stream_channel_returns_current_order_and_fill_pages() -> None:
+    engine = create_engine("sqlite:///:memory:", future=True)
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine, future=True)
+    db = Session()
+    order = Order(platform="hyperliquid", symbol="OIL", side="buy", quantity=1, status="filled")
+    db.add(order)
+    db.flush()
+    db.add(Fill(order_id=order.id, platform="hyperliquid", symbol="OIL", side="buy", quantity=1, price=80, fee=0.1))
+    db.commit()
+
+    event = api_router._stream_snapshot(db, channel="execution", page=1, fill_page=1, page_size=20)
+
+    assert set(event) == {"orders", "fills"}
+    assert event["orders"]["total"] == 1
+    assert event["orders"]["items"][0]["symbol"] == "OIL"
+    assert event["fills"]["total"] == 1
+    assert event["fills"]["items"][0]["price"] == 80
+
+
+def test_dashboard_summary_uses_runtime_unrealized_pnl() -> None:
+    engine = create_engine("sqlite:///:memory:", future=True)
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine, future=True)
+    db = Session()
+    db.add(AccountSnapshot(platform="hyperliquid", equity=100, available_balance=90, margin_used=10, margin_ratio=10))
+    group = HedgeGroup(
+        symbol="DASH-PNL",
+        direction="long_hyperliquid_short_mt5",
+        status="open",
+        execution_mode="paper",
+        notional=1000,
+        quantity=1,
+        hyperliquid_quantity=2,
+        mt5_quantity=2,
+        entry_spread=20,
+        unrealized_pnl=0,
+    )
+    closed = HedgeGroup(symbol="DASH-CLOSED", direction="long_hyperliquid_short_mt5", status="closed", execution_mode="paper", notional=100, quantity=1, realized_pnl=3)
+    db.add_all([group, closed])
+    db.commit()
+    hedge_pool.load_from_db(db)
+    quote_cache.put("hyperliquid", "DASH-PNL", bid=100, ask=101, depth_notional=1000, source="test")
+    quote_cache.put("mt5", "DASH-PNL", bid=115, ask=116, depth_notional=1000, source="test")
+
+    result = api_router.dashboard_summary(User(username="admin", password_hash="x", role="admin"), db)
+
+    assert result["equity"] == 100
+    assert result["realized_pnl"] == 3
+    assert result["unrealized_pnl"] == 8
+    assert result["today_pnl"] == 11
+
+
+def test_dashboard_stream_channel_returns_summary_and_curve() -> None:
+    engine = create_engine("sqlite:///:memory:", future=True)
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine, future=True)
+    db = Session()
+    db.add(AccountSnapshot(platform="mt5", equity=200, available_balance=180, margin_used=20, margin_ratio=10))
+    db.commit()
+
+    event = api_router._stream_snapshot(db, channel="dashboard")
+
+    assert set(event) == {"dashboard_summary", "equity_curve"}
+    assert event["dashboard_summary"]["equity"] == 200
+    assert len(event["equity_curve"]) == 1
+
+
+def test_logs_stream_channel_returns_current_log_and_alert_pages() -> None:
+    engine = create_engine("sqlite:///:memory:", future=True)
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine, future=True)
+    db = Session()
+    db.add(SystemLog(level="info", category="test", message="hello"))
+    db.add(Alert(level="critical", title="risk", message="check"))
+    db.commit()
+
+    event = api_router._stream_snapshot(db, channel="logs", page=1, alert_page=1, page_size=20)
+
+    assert set(event) == {"logs", "alerts"}
+    assert event["logs"]["total"] == 1
+    assert event["logs"]["items"][0]["message"] == "hello"
+    assert event["alerts"]["total"] == 1
+    assert event["alerts"]["items"][0]["title"] == "risk"
+
+
+def test_risk_stream_channel_returns_status_and_current_event_page() -> None:
+    engine = create_engine("sqlite:///:memory:", future=True)
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine, future=True)
+    db = Session()
+    db.add(RiskSetting(mode="paused"))
+    db.add(RiskEvent(level="warning", rule="latency", message="slow", symbol="OIL"))
+    db.commit()
+
+    event = api_router._stream_snapshot(db, channel="risk", page=1, page_size=10)
+
+    assert set(event) == {"risk_status", "risk_events"}
+    assert event["risk_status"]["mode"] == "paused"
+    assert event["risk_events"]["total"] == 1
+    assert event["risk_events"]["items"][0]["rule"] == "latency"
+
+
+def test_lead_lag_stream_channel_returns_only_report() -> None:
+    engine = create_engine("sqlite:///:memory:", future=True)
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine, future=True)
+    db = Session()
+
+    event = api_router._stream_snapshot(db, channel="lead-lag", symbol="JP225", window_seconds=60, threshold_bps=3, min_move=0, max_lag_ms=2000)
+
+    assert set(event) == {"lead_lag"}
+    assert event["lead_lag"]["symbol"] == "JP225"
+    assert "summary" in event["lead_lag"]
+
+
 def test_pipeline_pool_payload_uses_stable_stage_symbol_id_order() -> None:
     now = datetime.now(timezone.utc).replace(tzinfo=None)
     groups = [
@@ -2496,6 +2701,30 @@ def test_pipeline_pool_payload_uses_stable_stage_symbol_id_order() -> None:
         ("closing", "BTC", 4),
         ("manual", "ZINC", 5),
     ]
+
+
+def test_pipeline_pool_payload_calculates_runtime_unrealized_pnl() -> None:
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    group = HedgeGroup(
+        id=9,
+        symbol="POOL-PNL",
+        direction="long_hyperliquid_short_mt5",
+        status="open",
+        execution_mode="paper",
+        notional=1000,
+        quantity=1,
+        hyperliquid_quantity=2,
+        mt5_quantity=2,
+        entry_spread=20,
+        unrealized_pnl=0,
+    )
+    quote_cache.put("hyperliquid", "POOL-PNL", bid=100, ask=101, depth_notional=1000, source="test")
+    quote_cache.put("mt5", "POOL-PNL", bid=115, ask=116, depth_notional=1000, source="test")
+
+    item = _pool_payload([group], now)["items"][0]
+
+    assert item["current_close_spread"] == 16
+    assert item["unrealized_pnl"] == 8
 
 
 def test_xyz_growth_mode_uses_effective_fee_multiplier() -> None:
@@ -2828,6 +3057,23 @@ def test_symbol_spread_limits_tighten_statistical_thresholds() -> None:
     assert scanner_module._effective_exit_target(mapping, 0) == 12
 
 
+def test_symbol_negative_close_spread_limit_tightens_exit_target() -> None:
+    mapping = SymbolMapping(symbol="SPCX", hyperliquid_symbol="xyz:SPCX", mt5_symbol="SPCX", max_close_spread=-0.11)
+
+    assert scanner_module._effective_exit_target(mapping, 0.047) == pytest.approx(-0.11)
+    assert scanner_module._effective_exit_target(mapping, 0) == pytest.approx(-0.11)
+
+
+def test_scanner_gate_combination_keeps_blockers_separate_from_signal() -> None:
+    signal_gate = scanner_module.GateResult("executable", "signal ok", "signal")
+    liquidity_gate = scanner_module.GateResult("candidate", "depth low", "liquidity", "liquidity")
+    market_gate = scanner_module.GateResult("rejected", "mt5 blocked", "market", "market")
+
+    assert scanner_module._combine_gates(signal_gate, liquidity_gate, market_gate) == market_gate
+    assert scanner_module._combine_gates(signal_gate, liquidity_gate, scanner_module.GateResult("pass", "", "market")) == liquidity_gate
+    assert scanner_module._combine_gates(signal_gate, scanner_module.GateResult("pass", "", "liquidity"), scanner_module.GateResult("pass", "", "market")).status == "executable"
+
+
 def test_auto_close_fallback_uses_symbol_max_close_spread_without_samples(monkeypatch) -> None:
     engine = create_engine("sqlite:///:memory:", future=True)
     Base.metadata.create_all(engine)
@@ -2998,6 +3244,63 @@ def test_statistical_signal_uses_reachable_entry() -> None:
         signal = evaluate_entry_signal(db, strategy, "JP225", "long_hyperliquid_short_mt5", 126, 20, 106, 1, 1)
         assert signal.result.status == "executable"
         assert signal.reachable_entry > 0
+
+
+def test_overheat_marks_risk_without_blocking_executable_entry() -> None:
+    engine = create_engine("sqlite:///:memory:", future=True)
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine, future=True)
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    with Session() as db:
+        strategy = StrategySetting(
+            signal_mode="statistical",
+            statistical_lookback_range="1h",
+            statistical_min_samples=20,
+            reachable_entry_percentile=0.85,
+            reachable_entry_zscore=1.0,
+            cost_guard_percentile=0.90,
+            min_total_profit=0.5,
+        )
+        db.add(strategy)
+        db.add(SymbolMapping(symbol="JP225", hyperliquid_symbol="xyz:JP225", mt5_symbol="JP225", min_entry_spread=200))
+        from app.db.models import SpreadBucket
+
+        for index in range(30):
+            spread = 100 + index
+            db.add(
+                SpreadBucket(
+                    symbol="JP225",
+                    direction="long_hyperliquid_short_mt5",
+                    bucket_start=now + timedelta(seconds=index),
+                    bucket_seconds=5,
+                    open_spread=spread,
+                    high_spread=spread,
+                    low_spread=spread,
+                    close_spread=spread,
+                    avg_spread=spread,
+                    avg_unit_cost=20,
+                    avg_unit_net_profit=spread - 20,
+                    sample_count=1,
+                )
+            )
+        db.commit()
+
+        signal = evaluate_entry_signal(db, strategy, "JP225", "long_hyperliquid_short_mt5", 263.1, 20, 243.1, 9.14, 1)
+
+    mapping = SimpleNamespace(min_entry_spread=200)
+    assert scanner_module._effective_entry_threshold(mapping, signal.reachable_entry) == 200
+    assert signal.overheat < 200
+    assert signal.result.status == "executable"
+    assert "超过过热线" not in signal.result.reason
+    tags = scanner_module._risk_tags(263.1, signal)
+    assert tags == [
+        {
+            "type": "overheat",
+            "message": f"价差超过过热线 {signal.overheat:.2f}",
+            "value": 263.1,
+            "threshold": signal.overheat,
+        }
+    ]
 
 
 def test_statistical_signal_blocks_entry_when_samples_are_insufficient() -> None:
@@ -3943,6 +4246,37 @@ def test_hedge_pool_loads_and_cas_groups() -> None:
         closed = hedge_pool.mark_closed(group.id, realized_pnl=9, fees_delta=0.1, reason="done")
         assert closed is not None
         assert hedge_pool.get(group.id) is None
+
+
+def test_hedge_pool_load_preserves_runtime_unrealized_pnl() -> None:
+    engine = create_engine("sqlite:///:memory:", future=True)
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine, future=True)
+    with Session() as db:
+        group = HedgeGroup(
+            symbol="POOL-PRESERVE",
+            direction="long_hyperliquid_short_mt5",
+            status="open",
+            execution_mode="paper",
+            notional=1000,
+            quantity=1,
+            mt5_quantity=1,
+            hyperliquid_quantity=1,
+            entry_spread=20,
+            unrealized_pnl=0,
+        )
+        db.add(group)
+        db.commit()
+        hedge_pool.load_from_db(db)
+        snapshot = hedge_pool.get(group.id)
+        assert snapshot is not None
+        hedge_pool.upsert_group(snapshot.with_updates(unrealized_pnl=12.5))
+
+        assert hedge_pool.load_from_db(db) == 1
+
+        reloaded = hedge_pool.get(group.id)
+        assert reloaded is not None
+        assert reloaded.unrealized_pnl == 12.5
 
 
 def test_run_auto_close_uses_pool_without_hedge_group_query(monkeypatch) -> None:

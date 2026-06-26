@@ -8,6 +8,8 @@ from sqlalchemy.orm import Session
 
 from app.config.settings import get_settings
 from app.db.models import ArbitrageOpportunity, HedgeGroup, SpreadCurrent, SymbolMapping
+from app.execution.hedge_pool import HedgeGroupSnapshot, hedge_pool
+from app.execution.pnl import pnl_from_close_spread
 from app.market.hedge_spreads import hedge_group_spreads
 from app.market.mt5_sessions import mt5_session_state
 from app.market.quotes import quote_cache
@@ -93,6 +95,16 @@ def _active_opportunities(db: Session, mappings: list[SymbolMapping]) -> dict[st
 
 
 def _active_groups(db: Session) -> list[HedgeGroup]:
+    pending = (
+        db.query(HedgeGroup)
+        .filter(HedgeGroup.status == "pending_open")
+        .order_by(HedgeGroup.symbol.asc(), HedgeGroup.id.asc())
+        .limit(30)
+        .all()
+    )
+    pool_groups = [group for group in hedge_pool.snapshot_groups() if group.status in ACTIVE_GROUP_STATUSES]
+    if pool_groups:
+        return [*pending, *pool_groups]
     return (
         db.query(HedgeGroup)
         .filter(HedgeGroup.status.in_(ACTIVE_GROUP_STATUSES))
@@ -339,7 +351,7 @@ def _best_opportunity(rows: list[dict[str, Any]]) -> dict[str, Any] | None:
     return sorted(rows, key=lambda row: rank.get(str(row.get("status", "")), 0), reverse=True)[0]
 
 
-def _pool_payload(groups: list[HedgeGroup], now: datetime) -> dict[str, Any]:
+def _pool_payload(groups: list[HedgeGroup | HedgeGroupSnapshot], now: datetime) -> dict[str, Any]:
     items = sorted((_group_payload(group, now) for group in groups), key=_pool_item_sort_key)
     lanes = [
         {"key": "pending", "label": "待执行", "count": _lane_count(items, "pending")},
@@ -360,9 +372,10 @@ def _pool_item_sort_key(item: dict[str, Any]) -> tuple[int, str, int]:
     )
 
 
-def _group_payload(group: HedgeGroup, now: datetime) -> dict[str, Any]:
+def _group_payload(group: HedgeGroup | HedgeGroupSnapshot, now: datetime) -> dict[str, Any]:
     stage = _group_stage(group)
     spreads = hedge_group_spreads(group)
+    unrealized_pnl = _runtime_unrealized_pnl(group, spreads)
     return {
         "id": group.id,
         "symbol": group.symbol,
@@ -381,13 +394,23 @@ def _group_payload(group: HedgeGroup, now: datetime) -> dict[str, Any]:
         "quote_age_ms": spreads["quote_age_ms"],
         "exit_target": group.exit_target,
         "realized_pnl": group.realized_pnl,
-        "unrealized_pnl": group.unrealized_pnl,
+        "unrealized_pnl": unrealized_pnl,
         "close_reason": group.close_reason,
         "age_ms": _age_ms(now, group.updated_at),
     }
 
 
-def _group_stage(group: HedgeGroup) -> str:
+def _runtime_unrealized_pnl(group: HedgeGroup | HedgeGroupSnapshot, spreads: dict[str, Any]) -> float:
+    current_close_spread = spreads.get("current_close_spread")
+    if group.status in {"open", "open_partial"} and current_close_spread is not None:
+        try:
+            return pnl_from_close_spread(group, float(current_close_spread))
+        except (TypeError, ValueError):
+            return float(group.unrealized_pnl or 0.0)
+    return float(group.unrealized_pnl or 0.0)
+
+
+def _group_stage(group: HedgeGroup | HedgeGroupSnapshot) -> str:
     if group.status in {"pending_open"}:
         return "pending"
     if group.status in {"opening"}:
@@ -397,7 +420,9 @@ def _group_stage(group: HedgeGroup) -> str:
     if group.status in {"manual_intervention", "failed"}:
         return "manual"
     if group.status in {"open", "open_partial"}:
-        if group.exit_target and group.entry_spread and group.unrealized_pnl > 0:
+        current = hedge_group_spreads(group).get("current_close_spread")
+        unrealized_pnl = _runtime_unrealized_pnl(group, {"current_close_spread": current})
+        if group.exit_target and group.entry_spread and unrealized_pnl > 0:
             return "ready_to_close"
         return "open"
     return "open"

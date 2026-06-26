@@ -3,6 +3,7 @@ import { Card, Descriptions, Space, Table, Tabs, Tag, Typography } from 'antd';
 import type { ColumnsType } from 'antd/es/table';
 import { useState } from 'react';
 import { api } from '../api/client';
+import { usePageStream } from '../hooks/useLiveStream';
 import { fmtLocalTime, fmtMoney, fmtNum } from '../utils/format';
 
 function platformTag(platform?: string) {
@@ -49,6 +50,7 @@ export function ExecutionPage() {
   const [orderPage, setOrderPage] = useState(1);
   const [fillPage, setFillPage] = useState(1);
   const [activeTab, setActiveTab] = useState('orders');
+  const streamStatus = usePageStream('execution', { page: orderPage, fillPage, pageSize: 20 });
   const orders = useQuery({ queryKey: ['orders', orderPage], queryFn: async () => (await api.get('/orders', { params: { page: orderPage, page_size: 20 } })).data });
   const fills = useQuery({ queryKey: ['fills', fillPage], queryFn: async () => (await api.get('/fills', { params: { page: fillPage, page_size: 20 } })).data });
 
@@ -79,7 +81,10 @@ export function ExecutionPage() {
 
   return (
     <Space direction="vertical" size={16} className="full-width">
-      <Typography.Title level={3}>执行记录</Typography.Title>
+      <Space className="full-width" align="center" style={{ justifyContent: 'space-between' }}>
+        <Typography.Title level={3} style={{ margin: 0 }}>执行记录</Typography.Title>
+        <Typography.Text type={streamStatus.online ? 'success' : 'secondary'}>{streamStatus.online ? '页面级推送运行中' : '等待页面级推送'}</Typography.Text>
+      </Space>
       <Card>
         <Tabs
           activeKey={activeTab}

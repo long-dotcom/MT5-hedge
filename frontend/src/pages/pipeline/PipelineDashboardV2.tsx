@@ -1,4 +1,4 @@
-import { Switch, Typography } from 'antd';
+import { Typography } from 'antd';
 import { fmtAdaptive, fmtSpread } from '../../utils/format';
 import type { V2DashboardData, V2HedgeGroup, V2LifecycleCounts, V2NodeStatus, V2PipelineSymbol } from './v2Types';
 
@@ -234,18 +234,15 @@ function SummaryCardsV2({ data }: { data: V2DashboardData }) {
 
 export function PipelineDashboardV2({
   data,
-  autoRefresh,
-  onAutoRefreshToggle,
 }: {
   data: V2DashboardData;
-  autoRefresh: boolean;
-  onAutoRefreshToggle: () => void;
 }) {
+  const lastPushText = data.sseStatus.online ? `${data.sseStatus.lastPush.toFixed(1)}s 前` : '未连接';
   return (
     <div className="pipeline-v2">
       <div className="v2-topbar">
-        <div className="v2-title"><h1>链路与对冲池</h1><span /><p>SSE 在线</p><em>最后推送：{data.sseStatus.lastPush}s 前</em></div>
-        <div className="v2-actions"><span>自动刷新</span><Switch checked={autoRefresh} onChange={onAutoRefreshToggle} /></div>
+        <div className="v2-title"><h1>链路与对冲池</h1><span /><p>{data.sseStatus.online ? 'SSE 在线' : 'SSE 离线'}</p><em>最后推送：{lastPushText}</em></div>
+        <div className="v2-actions"><span>页面级推送</span><Typography.Text type={data.sseStatus.online ? 'success' : 'secondary'}>{data.sseStatus.online ? '运行中' : '等待连接'}</Typography.Text></div>
       </div>
       <SummaryCardsV2 data={data} />
       <div className="v2-main-grid">

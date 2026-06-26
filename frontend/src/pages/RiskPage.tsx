@@ -4,6 +4,7 @@ import { Button, Card, Descriptions, Space, Table, Tag, Typography, message } fr
 import type { ColumnsType } from 'antd/es/table';
 import { useState } from 'react';
 import { api } from '../api/client';
+import { usePageStream } from '../hooks/useLiveStream';
 import { fmtLocalTime, fmtMoney, fmtPct, riskModeLabel, riskModeColor } from '../utils/format';
 
 const EVENT_PAGE_SIZE = 10;
@@ -12,6 +13,7 @@ export function RiskPage() {
   const queryClient = useQueryClient();
   const [messageApi, contextHolder] = message.useMessage();
   const [eventPage, setEventPage] = useState(1);
+  const streamStatus = usePageStream('risk', { page: eventPage, pageSize: EVENT_PAGE_SIZE });
   const status = useQuery({ queryKey: ['risk-status'], queryFn: async () => (await api.get('/risk/status')).data });
   const events = useQuery({ queryKey: ['risk-events', eventPage], queryFn: async () => (await api.get('/risk/events', { params: { page: eventPage, page_size: EVENT_PAGE_SIZE } })).data });
   const stop = useMutation({
@@ -34,7 +36,10 @@ export function RiskPage() {
       {contextHolder}
       <div className="page-title-row">
         <Typography.Title level={3}>风控中心</Typography.Title>
-        <Button danger icon={<ThunderboltOutlined />} loading={stop.isPending} onClick={() => stop.mutate()}>紧急停止</Button>
+        <Space>
+          <Typography.Text type={streamStatus.online ? 'success' : 'secondary'}>{streamStatus.online ? '页面级推送运行中' : '等待页面级推送'}</Typography.Text>
+          <Button danger icon={<ThunderboltOutlined />} loading={stop.isPending} onClick={() => stop.mutate()}>紧急停止</Button>
+        </Space>
       </div>
       <Card>
         <Descriptions column={4} size="small">

@@ -3,6 +3,7 @@ import { Button, Card, Descriptions, Space, Table, Tag, Typography, message } fr
 import type { ColumnsType } from 'antd/es/table';
 import { useState } from 'react';
 import { api } from '../api/client';
+import { usePageStream } from '../hooks/useLiveStream';
 import { executionModeLabel, fmtAdaptive, fmtMoney, fmtSpread } from '../utils/format';
 
 function statusTag(status: string) {
@@ -87,6 +88,7 @@ function detailItems(row: any) {
 
 export function HedgeGroupsPage() {
   const [page, setPage] = useState(1);
+  const streamStatus = usePageStream('hedge-groups', { page, pageSize: 20 });
   const queryClient = useQueryClient();
   const [messageApi, contextHolder] = message.useMessage();
   const query = useQuery({ queryKey: ['hedge-groups', page], queryFn: async () => (await api.get('/hedge-groups', { params: { page, page_size: 20 } })).data });
@@ -132,7 +134,10 @@ export function HedgeGroupsPage() {
       {contextHolder}
       <Space className="full-width" align="center" style={{ justifyContent: 'space-between' }}>
         <Typography.Title level={3} style={{ margin: 0 }}>对冲组</Typography.Title>
-        <Button loading={reconcile.isPending} onClick={() => reconcile.mutate()}>同步执行状态</Button>
+        <Space>
+          <Typography.Text type={streamStatus.online ? 'success' : 'secondary'}>{streamStatus.online ? '页面级推送运行中' : '等待页面级推送'}</Typography.Text>
+          <Button loading={reconcile.isPending} onClick={() => reconcile.mutate()}>同步执行状态</Button>
+        </Space>
       </Space>
       <Card>
         <Table

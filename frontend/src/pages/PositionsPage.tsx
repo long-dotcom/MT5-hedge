@@ -2,6 +2,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { Button, Card, Empty, Space, Table, Tag, Typography, message } from 'antd';
 import type { ColumnsType } from 'antd/es/table';
 import { api } from '../api/client';
+import { usePageStream } from '../hooks/useLiveStream';
 import { fmtAdaptive, fmtMoney, fmtPnlColor, fmtPnlSigned } from '../utils/format';
 
 function platformTag(platform?: string) {
@@ -18,6 +19,7 @@ function sideTag(side?: string) {
 
 export function PositionsPage() {
   const queryClient = useQueryClient();
+  const streamStatus = usePageStream('positions');
   const [messageApi, contextHolder] = message.useMessage();
   const query = useQuery({ queryKey: ['positions'], queryFn: async () => (await api.get('/positions')).data });
   const adopt = useMutation({
@@ -44,7 +46,10 @@ export function PositionsPage() {
   return (
     <Space direction="vertical" size={16} className="full-width">
       {contextHolder}
-      <Typography.Title level={3}>仓位</Typography.Title>
+      <Space className="full-width" align="center" style={{ justifyContent: 'space-between' }}>
+        <Typography.Title level={3} style={{ margin: 0 }}>仓位</Typography.Title>
+        <Typography.Text type={streamStatus.online ? 'success' : 'secondary'}>{streamStatus.online ? '页面级推送运行中' : '等待页面级推送'}</Typography.Text>
+      </Space>
       <Card>{query.data?.length ? <Table rowKey="id" columns={columns} dataSource={query.data} scroll={{ x: 900 }} pagination={{ pageSize: 10 }} /> : <Empty description="暂无仓位" />}</Card>
     </Space>
   );

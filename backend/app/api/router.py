@@ -45,6 +45,7 @@ from app.execution.carry_costs import run_carry_cost_sync
 from app.execution.auto_closer import close_hedge_group_from_pool
 from app.execution.engine import open_hedge_group
 from app.execution.hedge_pool import HedgeGroupSnapshot, hedge_pool
+from app.execution.pnl import pnl_from_close_spread
 from app.execution.persistence import persist_hedge_pool_events
 from app.execution.readiness import live_execution_readiness, paper_execution_readiness
 from app.execution.reconciler import run_execution_reconcile
@@ -115,18 +116,60 @@ def me(user: User = Depends(get_current_user)) -> dict[str, Any]:
 
 @router.get("/dashboard/summary")
 def dashboard_summary(_: User = Depends(get_current_user), db: Session = Depends(get_db)) -> dict[str, Any]:
+    return _dashboard_summary_payload(db)
+
+
+def _dashboard_summary_payload(db: Session) -> dict[str, Any]:
     latest_accounts = latest_account_snapshots(db)
     equity = sum(row.equity for row in latest_accounts)
     open_groups = db.query(HedgeGroup).filter(HedgeGroup.status.in_(["opening", "open", "open_partial", "closing", "manual_intervention"])).count()
     alerts = db.query(Alert).filter(Alert.acknowledged.is_(False)).count()
     risk = db.query(RiskSetting).first()
-    return {"equity": equity, "today_pnl": 0.0, "realized_pnl": 0.0, "unrealized_pnl": 0.0, "risk_mode": risk.mode if risk else "normal", "open_hedge_groups": open_groups, "unread_alerts": alerts}
+    realized_pnl = sum(float(value or 0.0) for (value,) in db.query(HedgeGroup.realized_pnl).filter(HedgeGroup.status == "closed").all())
+    unrealized_pnl = _runtime_open_unrealized_pnl(db)
+    return {
+        "equity": equity,
+        "today_pnl": realized_pnl + unrealized_pnl,
+        "realized_pnl": realized_pnl,
+        "unrealized_pnl": unrealized_pnl,
+        "risk_mode": risk.mode if risk else "normal",
+        "open_hedge_groups": open_groups,
+        "unread_alerts": alerts,
+    }
 
 
 @router.get("/dashboard/equity-curve")
 def equity_curve(_: User = Depends(get_current_user), db: Session = Depends(get_db)) -> list[dict[str, Any]]:
+    return _equity_curve_payload(db)
+
+
+def _equity_curve_payload(db: Session) -> list[dict[str, Any]]:
     rows = db.query(AccountSnapshot).order_by(AccountSnapshot.created_at).limit(100).all()
     return [{"time": row.created_at.isoformat(), "equity": row.equity, "platform": row.platform} for row in rows]
+
+
+def _runtime_open_unrealized_pnl(db: Session) -> float:
+    groups = (
+        db.query(HedgeGroup)
+        .filter(HedgeGroup.status.in_(["open", "open_partial"]))
+        .order_by(HedgeGroup.id.asc())
+        .all()
+    )
+    active_by_id = {snapshot.id: snapshot for snapshot in hedge_pool.snapshot_groups()}
+    total = 0.0
+    for row in groups:
+        group = active_by_id.get(row.id)
+        group = group if group and group.symbol == row.symbol else row
+        spreads = hedge_group_spreads(group)
+        current_close_spread = spreads.get("current_close_spread")
+        if current_close_spread is None:
+            total += float(group.unrealized_pnl or 0.0)
+            continue
+        try:
+            total += pnl_from_close_spread(group, float(current_close_spread))
+        except (TypeError, ValueError):
+            total += float(group.unrealized_pnl or 0.0)
+    return total
 
 
 @router.get("/dashboard/risk-summary")
@@ -201,7 +244,20 @@ def spreads(_: User = Depends(get_current_user), db: Session = Depends(get_db), 
 
 
 @router.get("/stream")
-async def stream(token: str) -> StreamingResponse:
+async def stream(
+    token: str,
+    channel: str = "all",
+    page: int = 1,
+    page_size: int = 20,
+    fill_page: int = 1,
+    alert_page: int = 1,
+    symbol: str = "JP225",
+    window_seconds: int = 300,
+    threshold_bps: float = 3.0,
+    min_move: float = 0.0,
+    follow_ratio: float = 0.5,
+    max_lag_ms: int = 2000,
+) -> StreamingResponse:
     try:
         payload = decode_access_token(token)
     except Exception as exc:
@@ -219,7 +275,20 @@ async def stream(token: str) -> StreamingResponse:
         while True:
             session = SessionLocal()
             try:
-                event = _stream_snapshot(session)
+                event = _stream_snapshot(
+                    session,
+                    channel=channel,
+                    page=page,
+                    page_size=page_size,
+                    fill_page=fill_page,
+                    alert_page=alert_page,
+                    symbol=symbol,
+                    window_seconds=window_seconds,
+                    threshold_bps=threshold_bps,
+                    min_move=min_move,
+                    follow_ratio=follow_ratio,
+                    max_lag_ms=max_lag_ms,
+                )
                 yield f"event: snapshot\ndata: {json.dumps(event, default=json_default, separators=(',', ':'))}\n\n"
             finally:
                 session.close()
@@ -228,7 +297,40 @@ async def stream(token: str) -> StreamingResponse:
     return StreamingResponse(event_generator(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
-def _stream_snapshot(db: Session) -> dict[str, Any]:
+def _stream_snapshot(
+    db: Session,
+    *,
+    channel: str = "all",
+    page: int = 1,
+    page_size: int = 20,
+    fill_page: int = 1,
+    alert_page: int = 1,
+    symbol: str = "JP225",
+    window_seconds: int = 300,
+    threshold_bps: float = 3.0,
+    min_move: float = 0.0,
+    follow_ratio: float = 0.5,
+    max_lag_ms: int = 2000,
+) -> dict[str, Any]:
+    if channel == "pipeline":
+        return {"pipeline": build_pipeline_diagnostics(db)}
+    if channel == "hedge-groups":
+        return {"hedge_groups": _hedge_groups_payload(db, page=page, page_size=page_size)}
+    if channel == "positions":
+        return {"positions": _positions_payload(db)}
+    if channel == "accounts":
+        return {"accounts": _latest_accounts_payload(db)}
+    if channel == "execution":
+        return {"orders": _orders_payload(db, page=page, page_size=page_size), "fills": _fills_payload(db, page=fill_page, page_size=page_size)}
+    if channel == "dashboard":
+        return {"dashboard_summary": _dashboard_summary_payload(db), "equity_curve": _equity_curve_payload(db)}
+    if channel == "logs":
+        return {"logs": _logs_payload(db, page=page, page_size=page_size), "alerts": _alerts_payload(db, page=alert_page, page_size=page_size)}
+    if channel == "risk":
+        return {"risk_status": _risk_status_payload(db), "risk_events": _risk_events_payload(db, page=page, page_size=page_size)}
+    if channel == "lead-lag":
+        return {"lead_lag": _lead_lag_payload(symbol, window_seconds, threshold_bps, min_move, follow_ratio, max_lag_ms)}
+
     state = scan_state_store.snapshot()
     enabled_symbols = _enabled_symbol_names(db)
     if state["ready"]:
@@ -317,6 +419,10 @@ def lead_lag(
     follow_ratio: float = 0.5,
     max_lag_ms: int = 2000,
 ) -> dict[str, Any]:
+    return _lead_lag_payload(symbol, window_seconds, threshold_bps, min_move, follow_ratio, max_lag_ms)
+
+
+def _lead_lag_payload(symbol: str, window_seconds: int, threshold_bps: float, min_move: float, follow_ratio: float, max_lag_ms: int) -> dict[str, Any]:
     return lead_lag_report(symbol, window_seconds, threshold_bps, min_move, follow_ratio, max_lag_ms)
 
 
@@ -353,10 +459,19 @@ def execute_opportunity(opportunity_id: int, user: User = Depends(require_admin)
 
 @router.get("/hedge-groups")
 def hedge_groups(_: User = Depends(get_current_user), db: Session = Depends(get_db), page: int = 1, page_size: int = 20) -> dict[str, Any]:
+    return _hedge_groups_payload(db, page=page, page_size=page_size)
+
+
+def _hedge_groups_payload(db: Session, page: int = 1, page_size: int = 20) -> dict[str, Any]:
     query = db.query(HedgeGroup)
     total = query.count()
     rows = query.order_by(desc(HedgeGroup.created_at)).offset((page - 1) * page_size).limit(page_size).all()
-    return {"total": total, "items": [_hedge_group_payload(row) for row in rows]}
+    active_by_id = {snapshot.id: snapshot for snapshot in hedge_pool.snapshot_groups()}
+    items = []
+    for row in rows:
+        snapshot = active_by_id.get(row.id)
+        items.append(_hedge_group_payload(snapshot if snapshot and snapshot.symbol == row.symbol else row))
+    return {"total": total, "page": page, "page_size": page_size, "items": items}
 
 
 @router.get("/hedge-groups/{group_id}")
@@ -370,9 +485,16 @@ def hedge_group_detail(group_id: int, _: User = Depends(get_current_user), db: S
     return data
 
 
-def _hedge_group_payload(group: HedgeGroup) -> dict[str, Any]:
+def _hedge_group_payload(group: HedgeGroup | HedgeGroupSnapshot) -> dict[str, Any]:
     data = as_dict(group)
-    data.update(hedge_group_spreads(group))
+    spreads = hedge_group_spreads(group)
+    data.update(spreads)
+    current_close_spread = spreads.get("current_close_spread")
+    if group.status in {"open", "open_partial"} and current_close_spread is not None:
+        try:
+            data["unrealized_pnl"] = pnl_from_close_spread(group, float(current_close_spread))
+        except (TypeError, ValueError):
+            pass
     return data
 
 
@@ -406,6 +528,10 @@ def accounts(_: User = Depends(get_current_user), db: Session = Depends(get_db))
     return [as_dict(row) for row in rows]
 
 
+def _latest_accounts_payload(db: Session) -> list[dict[str, Any]]:
+    return [as_dict(row) for row in latest_account_snapshots(db)]
+
+
 @router.get("/accounts/snapshots")
 def account_snapshots(_: User = Depends(get_current_user), db: Session = Depends(get_db), page: int = 1, page_size: int = 20) -> dict[str, Any]:
     query = db.query(AccountSnapshot)
@@ -416,6 +542,10 @@ def account_snapshots(_: User = Depends(get_current_user), db: Session = Depends
 
 @router.get("/positions")
 def positions(_: User = Depends(get_current_user), db: Session = Depends(get_db)) -> list[dict[str, Any]]:
+    return _positions_payload(db)
+
+
+def _positions_payload(db: Session) -> list[dict[str, Any]]:
     return [as_dict(row) for row in db.query(Position).order_by(desc(Position.created_at)).all()]
 
 
@@ -581,32 +711,48 @@ def hyperliquid_probe_test(payload: HyperliquidProbeTestIn, user: User = Depends
 
 @router.get("/orders")
 def orders(_: User = Depends(get_current_user), db: Session = Depends(get_db), page: int = 1, page_size: int = 20) -> dict[str, Any]:
+    return _orders_payload(db, page=page, page_size=page_size)
+
+
+def _orders_payload(db: Session, page: int = 1, page_size: int = 20) -> dict[str, Any]:
     query = db.query(Order)
     total = query.count()
     rows = query.order_by(desc(Order.created_at)).offset((page - 1) * page_size).limit(page_size).all()
-    return {"total": total, "items": [as_dict(row) for row in rows]}
+    return {"total": total, "page": page, "page_size": page_size, "items": [as_dict(row) for row in rows]}
 
 
 @router.get("/fills")
 def fills(_: User = Depends(get_current_user), db: Session = Depends(get_db), page: int = 1, page_size: int = 20) -> dict[str, Any]:
+    return _fills_payload(db, page=page, page_size=page_size)
+
+
+def _fills_payload(db: Session, page: int = 1, page_size: int = 20) -> dict[str, Any]:
     query = db.query(Fill)
     total = query.count()
     rows = query.order_by(desc(Fill.created_at)).offset((page - 1) * page_size).limit(page_size).all()
-    return {"total": total, "items": [as_dict(row) for row in rows]}
+    return {"total": total, "page": page, "page_size": page_size, "items": [as_dict(row) for row in rows]}
 
 
 @router.get("/risk/status")
 def risk_status(_: User = Depends(get_current_user), db: Session = Depends(get_db)) -> dict[str, Any]:
+    return _risk_status_payload(db)
+
+
+def _risk_status_payload(db: Session) -> dict[str, Any]:
     risk = db.query(RiskSetting).first()
     return as_dict(risk) if risk else {}
 
 
 @router.get("/risk/events")
 def risk_events(_: User = Depends(get_current_user), db: Session = Depends(get_db), page: int = 1, page_size: int = 20) -> dict[str, Any]:
+    return _risk_events_payload(db, page=page, page_size=page_size)
+
+
+def _risk_events_payload(db: Session, page: int = 1, page_size: int = 20) -> dict[str, Any]:
     query = db.query(RiskEvent)
     total = query.count()
     rows = query.order_by(desc(RiskEvent.created_at)).offset((page - 1) * page_size).limit(page_size).all()
-    return {"total": total, "items": [as_dict(row) for row in rows]}
+    return {"total": total, "page": page, "page_size": page_size, "items": [as_dict(row) for row in rows]}
 
 
 @router.post("/risk/mode")
@@ -889,6 +1035,10 @@ def put_live_trading(payload: LiveTradingIn, user: User = Depends(require_admin)
 
 @router.get("/logs")
 def logs(_: User = Depends(get_current_user), db: Session = Depends(get_db), page: int = 1, page_size: int = 20, level: str = "", keyword: str = "") -> dict[str, Any]:
+    return _logs_payload(db, page=page, page_size=page_size, level=level, keyword=keyword)
+
+
+def _logs_payload(db: Session, page: int = 1, page_size: int = 20, level: str = "", keyword: str = "") -> dict[str, Any]:
     query = db.query(SystemLog)
     if level:
         query = query.filter(SystemLog.level == level)
@@ -896,15 +1046,19 @@ def logs(_: User = Depends(get_current_user), db: Session = Depends(get_db), pag
         query = query.filter(SystemLog.message.contains(keyword))
     total = query.count()
     rows = query.order_by(desc(SystemLog.created_at)).offset((page - 1) * page_size).limit(page_size).all()
-    return {"total": total, "items": [as_dict(row) for row in rows]}
+    return {"total": total, "page": page, "page_size": page_size, "items": [as_dict(row) for row in rows]}
 
 
 @router.get("/alerts")
 def alerts(_: User = Depends(get_current_user), db: Session = Depends(get_db), page: int = 1, page_size: int = 20) -> dict[str, Any]:
+    return _alerts_payload(db, page=page, page_size=page_size)
+
+
+def _alerts_payload(db: Session, page: int = 1, page_size: int = 20) -> dict[str, Any]:
     query = db.query(Alert)
     total = query.count()
     rows = query.order_by(desc(Alert.created_at)).offset((page - 1) * page_size).limit(page_size).all()
-    return {"total": total, "items": [as_dict(row) for row in rows]}
+    return {"total": total, "page": page, "page_size": page_size, "items": [as_dict(row) for row in rows]}
 
 
 @router.post("/alerts/{alert_id}/ack")

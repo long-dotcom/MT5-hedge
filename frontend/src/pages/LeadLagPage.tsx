@@ -4,6 +4,7 @@ import type { ColumnsType } from 'antd/es/table';
 import ReactECharts from 'echarts-for-react';
 import { useMemo, useState } from 'react';
 import { api } from '../api/client';
+import { usePageStream } from '../hooks/useLiveStream';
 import { fmtAdaptive, fmtChartTime, fmtLocalTime } from '../utils/format';
 
 function fmtMs(value?: number | null) {
@@ -29,11 +30,22 @@ export function LeadLagPage() {
   const [minMove, setMinMove] = useState(0);
   const [maxLagMs, setMaxLagMs] = useState(2000);
   const activeSymbol = symbol || symbols.data?.[0]?.symbol || '';
-  const query = useQuery({
-    queryKey: ['lead-lag', activeSymbol, windowSeconds, thresholdBps, minMove, maxLagMs],
+  const leadLagQueryKey = ['lead-lag', activeSymbol, windowSeconds, thresholdBps, minMove, maxLagMs];
+  const streamStatus = usePageStream('lead-lag', {
+    params: {
+      symbol: activeSymbol,
+      window_seconds: windowSeconds,
+      threshold_bps: thresholdBps,
+      min_move: minMove,
+      max_lag_ms: maxLagMs,
+    },
+    cacheKey: leadLagQueryKey,
     enabled: Boolean(activeSymbol),
-    queryFn: async () => (await api.get('/analytics/lead-lag', { params: { symbol: activeSymbol, window_seconds: windowSeconds, threshold_bps: thresholdBps, min_move: minMove, max_lag_ms: maxLagMs } })).data,
-    refetchInterval: 5000
+  });
+  const query = useQuery({
+    queryKey: leadLagQueryKey,
+    enabled: Boolean(activeSymbol),
+    queryFn: async () => (await api.get('/analytics/lead-lag', { params: { symbol: activeSymbol, window_seconds: windowSeconds, threshold_bps: thresholdBps, min_move: minMove, max_lag_ms: maxLagMs } })).data
   });
   const series = query.data?.series || [];
   const summary = query.data?.summary || {};
@@ -76,7 +88,10 @@ export function LeadLagPage() {
   return (
     <Space direction="vertical" size={16} className="full-width">
       <div>
-        <Typography.Title level={3}>报价领先滞后</Typography.Title>
+        <Space className="full-width" align="center" style={{ justifyContent: 'space-between' }}>
+          <Typography.Title level={3} style={{ margin: 0 }}>报价领先滞后</Typography.Title>
+          <Typography.Text type={streamStatus.online ? 'success' : 'secondary'}>{streamStatus.online ? '页面级推送运行中' : '等待页面级推送'}</Typography.Text>
+        </Space>
         <Typography.Text type="secondary">观察同一品种两边报价谁先动、另一边多久跟随，以及滞后期间价差是否可交易</Typography.Text>
       </div>
       <Card>

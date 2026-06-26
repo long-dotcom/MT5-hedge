@@ -126,10 +126,22 @@ class HedgePoolStore:
 
     def load_from_db(self, db: Session) -> int:
         rows = db.query(HedgeGroup).filter(HedgeGroup.status.in_(POOL_GROUP_STATUSES)).all()
-        snapshots = {int(row.id): HedgeGroupSnapshot.from_row(row) for row in rows}
         with self._lock:
+            current = dict(self._groups)
+            snapshots = {}
+            for row in rows:
+                snapshot = HedgeGroupSnapshot.from_row(row)
+                existing = current.get(snapshot.id)
+                if existing and snapshot.status in AUTO_CLOSE_STATUSES and existing.status in AUTO_CLOSE_STATUSES:
+                    snapshot = snapshot.with_updates(unrealized_pnl=existing.unrealized_pnl)
+                snapshots[snapshot.id] = snapshot
             self._groups = snapshots
         return len(snapshots)
+
+    def snapshot_groups(self) -> list[HedgeGroupSnapshot]:
+        with self._lock:
+            rows = list(self._groups.values())
+        return sorted(rows, key=lambda item: (item.symbol, item.id))
 
     def snapshot_open_groups(self, modes: Iterable[str] | None = None) -> list[HedgeGroupSnapshot]:
         allowed_modes = set(modes or [])

@@ -376,6 +376,7 @@ def _group_payload(group: HedgeGroup | HedgeGroupSnapshot, now: datetime) -> dic
     stage = _group_stage(group)
     spreads = hedge_group_spreads(group)
     unrealized_pnl = _runtime_unrealized_pnl(group, spreads)
+    updated_at = getattr(group, "updated_at", None) or getattr(group, "opened_at", None) or getattr(group, "closed_at", None)
     return {
         "id": group.id,
         "symbol": group.symbol,
@@ -396,7 +397,7 @@ def _group_payload(group: HedgeGroup | HedgeGroupSnapshot, now: datetime) -> dic
         "realized_pnl": group.realized_pnl,
         "unrealized_pnl": unrealized_pnl,
         "close_reason": group.close_reason,
-        "age_ms": _age_ms(now, group.updated_at),
+        "age_ms": _age_ms(now, updated_at),
     }
 
 

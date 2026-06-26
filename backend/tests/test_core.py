@@ -2727,6 +2727,41 @@ def test_pipeline_pool_payload_calculates_runtime_unrealized_pnl() -> None:
     assert item["unrealized_pnl"] == 8
 
 
+def test_pipeline_pool_payload_accepts_hedge_group_snapshot() -> None:
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    snapshot = HedgeGroupSnapshot(
+        id=10,
+        symbol="POOL-SNAPSHOT",
+        direction="long_hyperliquid_short_mt5",
+        status="open",
+        execution_mode="paper",
+        notional=1000,
+        quantity=1,
+        mt5_quantity=1,
+        hyperliquid_quantity=1,
+        open_cost=0,
+        fees=0,
+        funding=0,
+        swap=0,
+        realized_pnl=0,
+        unrealized_pnl=0,
+        trigger_spread=20,
+        entry_spread=20,
+        entry_threshold=20,
+        exit_target=10,
+        overheat_threshold=0,
+        close_reason="",
+        opened_at=now,
+        closed_at=None,
+        source="auto_paper",
+    )
+
+    item = _pool_payload([snapshot], now)["items"][0]
+
+    assert item["id"] == 10
+    assert item["age_ms"] == 0
+
+
 def test_xyz_growth_mode_uses_effective_fee_multiplier() -> None:
     taker, maker, source = _hyperliquid_effective_fee_rates(
         "xyz:JP225",

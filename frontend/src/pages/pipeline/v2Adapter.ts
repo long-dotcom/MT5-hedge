@@ -59,6 +59,7 @@ function toPipeline(symbol: SymbolPipeline): V2PipelineSymbol {
 function toHedgeStatus(item: HedgePoolItem): V2HedgeStatus {
   if (item.stage === 'ready_to_close') return 'closable';
   if (item.stage === 'opening' || item.stage === 'pending') return 'building';
+  if (item.stage === 'closing') return 'closing';
   if (item.stage === 'manual') return 'manual';
   return 'holding';
 }

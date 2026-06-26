@@ -1,5 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { Alert, Button, Card, Collapse, Form, Input, InputNumber, List, Modal, Popconfirm, Select, Space, Switch, Table, Tabs, Tag, Typography, message } from 'antd';
+import { Alert, Button, Card, Form, Input, InputNumber, List, Modal, Popconfirm, Select, Space, Switch, Table, Tabs, Tag, Typography, message } from 'antd';
 import type { ColumnsType } from 'antd/es/table';
 import { useState } from 'react';
 import { api } from '../api/client';
@@ -201,58 +201,73 @@ export function SettingsPage() {
               key: 'strategy',
               label: '策略参数',
               children: (
-                <Form key={strategy.data?.updated_at || 'strategy-loading'} layout="vertical" className="settings-form" initialValues={strategy.data} onFinish={(v) => saveStrategy.mutate({ ...strategy.data, ...v })}>
+                <Form key={strategy.data?.updated_at || 'strategy-loading'} layout="vertical" className="settings-form settings-wide-form" initialValues={strategy.data} onFinish={(v) => saveStrategy.mutate({ ...strategy.data, ...v })}>
                   <Alert type="info" showIcon message="第一版按单次目标 USD 名义价值触发；两边数量由品种规格、计价币种和实时汇率自动计算。" className="form-alert" />
-                  <Form.Item name="signal_mode" label="信号模式">
-                    <Select options={[{ value: 'statistical', label: '统计可达入场线' }, { value: 'fixed_profit', label: '固定净利润' }]} />
-                  </Form.Item>
-                  <Form.Item name="default_notional" label="单次目标名义价值 USD"><InputNumber min={1} /></Form.Item>
-                  <Form.Item name="statistical_lookback_range" label="统计窗口">
-                    <Select options={[{ value: '15m' }, { value: '1h' }, { value: '4h' }, { value: '24h' }]} />
-                  </Form.Item>
-                  <Form.Item name="statistical_min_samples" label="最小样本数"><InputNumber min={20} step={10} /></Form.Item>
-                  <Form.Item name="reachable_entry_percentile" label="可达入场分位数"><InputNumber min={0.5} max={0.95} step={0.01} /></Form.Item>
-                  <Form.Item name="cost_guard_percentile" label="成本保护分位数"><InputNumber min={0.5} max={0.99} step={0.01} /></Form.Item>
-                  <Form.Item name="min_total_profit" label="最小总净利润 USD"><InputNumber min={0} step={0.1} /></Form.Item>
-                  <Form.Item name="execution_mode" label="执行模式"><Select options={[{ value: 'dry_run' }, { value: 'paper' }, { value: 'live' }]} /></Form.Item>
-                  <Form.Item name="auto_execute_enabled" label="自动执行" valuePropName="checked"><Switch /></Form.Item>
-                  <Form.Item name="auto_close_enabled" label="自动平仓" valuePropName="checked"><Switch /></Form.Item>
-                  <Form.Item name="auto_close_live_enabled" label="Live 自动平仓" valuePropName="checked"><Switch /></Form.Item>
-                  <Form.Item name="exit_target_percentile" label="平仓价差退出低分位数"><InputNumber min={0.05} max={0.5} step={0.01} /></Form.Item>
-                  <Form.Item name="auto_close_unit_profit_buffer" label="每份平仓利润缓冲"><InputNumber min={0} step={0.01} /></Form.Item>
-                  <Form.Item name="auto_close_min_profit" label="自动平仓最小利润 USD"><InputNumber min={0} step={0.1} /></Form.Item>
-                  <Form.Item name="auto_execute_confirm_ticks" label="确认次数"><InputNumber min={1} step={1} /></Form.Item>
-                  <Form.Item name="auto_execute_min_hold_ms" label="最小持续毫秒"><InputNumber min={0} step={50} /></Form.Item>
-                  <Form.Item name="auto_execute_cooldown_seconds" label="冷却秒"><InputNumber min={0} step={1} /></Form.Item>
-                  <Collapse
-                    items={[
-                      {
-                        key: 'advanced-strategy',
-                        label: '高级策略与 Paper 模拟',
-                        children: (
-                          <>
-                            <Form.Item name="min_annualized_return" label="最小年化收益"><InputNumber min={0} step={0.01} /></Form.Item>
-                            <Form.Item name="min_net_profit" label="固定净利润模式阈值 USD"><InputNumber min={0} step={0.1} /></Form.Item>
-                            <Form.Item name="reachable_entry_zscore" label="可达入场 Z 倍数"><InputNumber min={0} step={0.1} /></Form.Item>
-                            <Form.Item name="min_unit_edge" label="最小每份边际"><InputNumber min={0} step={0.1} /></Form.Item>
-                            <Form.Item name="max_holding_minutes" label="最大持仓分钟"><InputNumber min={1} /></Form.Item>
-                            <Form.Item name="paper_use_live_account_risk" label="Paper 使用真实账户资金风控" valuePropName="checked"><Switch /></Form.Item>
-                            <Form.Item name="auto_execute_paper_only" label="仅允许纸面自动执行" valuePropName="checked"><Switch /></Form.Item>
-                            <Form.Item name="auto_execute_max_per_symbol_open_groups" label="单品种未平对冲组上限"><InputNumber min={1} step={1} /></Form.Item>
-                            <Form.Item name="auto_execute_max_global_open_groups" label="全局未平对冲组上限"><InputNumber min={1} step={1} /></Form.Item>
-                            <Form.Item name="auto_execute_min_net_profit" label="自动执行额外最小净利润"><InputNumber min={0} step={0.1} /></Form.Item>
-                            <Form.Item name="paper_decision_delay_ms_min" label="Paper 决策延迟最小毫秒"><InputNumber min={0} step={10} /></Form.Item>
-                            <Form.Item name="paper_decision_delay_ms_max" label="Paper 决策延迟最大毫秒"><InputNumber min={0} step={10} /></Form.Item>
-                            <Form.Item name="paper_hyperliquid_latency_ms_min" label="Paper Hyperliquid 延迟最小毫秒"><InputNumber min={0} step={10} /></Form.Item>
-                            <Form.Item name="paper_hyperliquid_latency_ms_max" label="Paper Hyperliquid 延迟最大毫秒"><InputNumber min={0} step={10} /></Form.Item>
-                            <Form.Item name="paper_mt5_latency_ms_min" label="Paper MT5 延迟最小毫秒"><InputNumber min={0} step={10} /></Form.Item>
-                            <Form.Item name="paper_mt5_latency_ms_max" label="Paper MT5 延迟最大毫秒"><InputNumber min={0} step={10} /></Form.Item>
-                          </>
-                        )
-                      }
-                    ]}
-                  />
-                  <Button type="primary" htmlType="submit">保存策略</Button>
+                  <div className="settings-group-grid">
+                    <section className="settings-group">
+                      <div className="settings-group-title">信号与执行</div>
+                      <div className="settings-field-grid">
+                        <Form.Item name="signal_mode" label="信号模式">
+                          <Select options={[{ value: 'statistical', label: '统计可达入场线' }, { value: 'fixed_profit', label: '固定净利润' }]} />
+                        </Form.Item>
+                        <Form.Item name="default_notional" label="单次目标名义价值 USD"><InputNumber min={1} /></Form.Item>
+                        <Form.Item name="execution_mode" label="执行模式"><Select options={[{ value: 'dry_run' }, { value: 'paper' }, { value: 'live' }]} /></Form.Item>
+                        <Form.Item name="auto_execute_confirm_ticks" label="确认次数"><InputNumber min={1} step={1} /></Form.Item>
+                        <Form.Item name="auto_execute_min_hold_ms" label="最小持续毫秒"><InputNumber min={0} step={50} /></Form.Item>
+                        <Form.Item name="auto_execute_cooldown_seconds" label="冷却秒"><InputNumber min={0} step={1} /></Form.Item>
+                        <Form.Item name="auto_execute_enabled" label="自动执行" valuePropName="checked"><Switch /></Form.Item>
+                        <Form.Item name="auto_execute_paper_only" label="仅允许纸面自动执行" valuePropName="checked"><Switch /></Form.Item>
+                      </div>
+                    </section>
+
+                    <section className="settings-group">
+                      <div className="settings-group-title">入场阈值</div>
+                      <div className="settings-field-grid">
+                        <Form.Item name="statistical_lookback_range" label="统计窗口">
+                          <Select options={[{ value: '15m' }, { value: '1h' }, { value: '4h' }, { value: '24h' }]} />
+                        </Form.Item>
+                        <Form.Item name="statistical_min_samples" label="最小样本数"><InputNumber min={20} step={10} /></Form.Item>
+                        <Form.Item name="reachable_entry_percentile" label="可达入场分位数"><InputNumber min={0.5} max={0.95} step={0.01} /></Form.Item>
+                        <Form.Item name="reachable_entry_zscore" label="可达入场 Z 倍数"><InputNumber min={0} step={0.1} /></Form.Item>
+                        <Form.Item name="cost_guard_percentile" label="成本保护分位数"><InputNumber min={0.5} max={0.99} step={0.01} /></Form.Item>
+                        <Form.Item name="min_total_profit" label="最小总净利润 USD"><InputNumber min={0} step={0.1} /></Form.Item>
+                        <Form.Item name="min_net_profit" label="固定净利润模式阈值 USD"><InputNumber min={0} step={0.1} /></Form.Item>
+                        <Form.Item name="min_unit_edge" label="最小每份边际"><InputNumber min={0} step={0.1} /></Form.Item>
+                      </div>
+                    </section>
+
+                    <section className="settings-group">
+                      <div className="settings-group-title">平仓与持仓</div>
+                      <div className="settings-field-grid">
+                        <Form.Item name="auto_close_enabled" label="自动平仓" valuePropName="checked"><Switch /></Form.Item>
+                        <Form.Item name="auto_close_live_enabled" label="Live 自动平仓" valuePropName="checked"><Switch /></Form.Item>
+                        <Form.Item name="exit_target_percentile" label="平仓价差退出低分位数"><InputNumber min={0.05} max={0.5} step={0.01} /></Form.Item>
+                        <Form.Item name="auto_close_unit_profit_buffer" label="每份平仓利润缓冲"><InputNumber min={0} step={0.01} /></Form.Item>
+                        <Form.Item name="auto_close_min_profit" label="自动平仓最小利润 USD"><InputNumber min={0} step={0.1} /></Form.Item>
+                        <Form.Item name="max_holding_minutes" label="最大持仓分钟"><InputNumber min={1} /></Form.Item>
+                        <Form.Item name="auto_execute_max_per_symbol_open_groups" label="单品种未平对冲组上限"><InputNumber min={1} step={1} /></Form.Item>
+                        <Form.Item name="auto_execute_max_global_open_groups" label="全局未平对冲组上限"><InputNumber min={1} step={1} /></Form.Item>
+                        <Form.Item name="auto_execute_min_net_profit" label="自动执行额外最小净利润"><InputNumber min={0} step={0.1} /></Form.Item>
+                        <Form.Item name="min_annualized_return" label="最小年化收益"><InputNumber min={0} step={0.01} /></Form.Item>
+                      </div>
+                    </section>
+
+                    <section className="settings-group">
+                      <div className="settings-group-title">Paper 模拟</div>
+                      <div className="settings-field-grid">
+                        <Form.Item name="paper_use_live_account_risk" label="Paper 使用真实账户资金风控" valuePropName="checked"><Switch /></Form.Item>
+                        <Form.Item name="paper_decision_delay_ms_min" label="Paper 决策延迟最小毫秒"><InputNumber min={0} step={10} /></Form.Item>
+                        <Form.Item name="paper_decision_delay_ms_max" label="Paper 决策延迟最大毫秒"><InputNumber min={0} step={10} /></Form.Item>
+                        <Form.Item name="paper_hyperliquid_latency_ms_min" label="Paper Hyperliquid 延迟最小毫秒"><InputNumber min={0} step={10} /></Form.Item>
+                        <Form.Item name="paper_hyperliquid_latency_ms_max" label="Paper Hyperliquid 延迟最大毫秒"><InputNumber min={0} step={10} /></Form.Item>
+                        <Form.Item name="paper_mt5_latency_ms_min" label="Paper MT5 延迟最小毫秒"><InputNumber min={0} step={10} /></Form.Item>
+                        <Form.Item name="paper_mt5_latency_ms_max" label="Paper MT5 延迟最大毫秒"><InputNumber min={0} step={10} /></Form.Item>
+                      </div>
+                    </section>
+                  </div>
+                  <div className="settings-form-actions">
+                    <Button type="primary" htmlType="submit">保存策略</Button>
+                  </div>
                 </Form>
               )
             },
@@ -260,30 +275,33 @@ export function SettingsPage() {
               key: 'risk',
               label: '风控参数',
               children: (
-                <Form key={risk.data?.updated_at || 'risk-loading'} layout="vertical" className="settings-form" initialValues={risk.data} onFinish={(v) => saveRisk.mutate({ ...risk.data, ...v })}>
-                  <Form.Item name="mode" label="系统模式"><Select options={Object.entries(RISK_MODE_MAP).map(([value, { label }]) => ({ value, label }))} /></Form.Item>
-                  <Form.Item name="max_order_notional" label="单笔名义价值上限 USD"><InputNumber min={1} /></Form.Item>
-                  <Form.Item name="max_slippage_bps" label="最大滑点 bps"><InputNumber min={0} /></Form.Item>
-                  <Form.Item name="max_market_age_seconds" label="最大行情延迟秒"><InputNumber min={1} /></Form.Item>
-                  <Collapse
-                    items={[
-                      {
-                        key: 'advanced-risk',
-                        label: '高级资金与账户风控',
-                        children: (
-                          <>
-                            <Form.Item name="max_symbol_exposure" label="品种敞口"><InputNumber min={1} /></Form.Item>
-                            <Form.Item name="max_total_leverage" label="总杠杆"><InputNumber min={0} step={0.1} /></Form.Item>
-                            <Form.Item name="max_new_margin_fraction" label="单笔可用资金比例"><InputNumber min={0} max={1} step={0.05} /></Form.Item>
-                            <Form.Item name="new_order_leverage" label="下单杠杆估算"><InputNumber min={1} step={1} /></Form.Item>
-                            <Form.Item name="min_margin_ratio" label="最低保证金率"><InputNumber min={0} step={0.01} /></Form.Item>
-                            <Form.Item name="max_api_errors" label="最大 API 错误次数"><InputNumber min={1} /></Form.Item>
-                          </>
-                        )
-                      }
-                    ]}
-                  />
-                  <Button type="primary" htmlType="submit">保存风控</Button>
+                <Form key={risk.data?.updated_at || 'risk-loading'} layout="vertical" className="settings-form settings-wide-form" initialValues={risk.data} onFinish={(v) => saveRisk.mutate({ ...risk.data, ...v })}>
+                  <div className="settings-group-grid settings-risk-grid">
+                    <section className="settings-group">
+                      <div className="settings-group-title">交易闸门</div>
+                      <div className="settings-field-grid">
+                        <Form.Item name="mode" label="系统模式"><Select options={Object.entries(RISK_MODE_MAP).map(([value, { label }]) => ({ value, label }))} /></Form.Item>
+                        <Form.Item name="max_order_notional" label="单笔名义价值上限 USD"><InputNumber min={1} /></Form.Item>
+                        <Form.Item name="max_slippage_bps" label="最大滑点 bps"><InputNumber min={0} /></Form.Item>
+                        <Form.Item name="max_market_age_seconds" label="最大行情延迟秒"><InputNumber min={1} /></Form.Item>
+                      </div>
+                    </section>
+
+                    <section className="settings-group">
+                      <div className="settings-group-title">资金账户</div>
+                      <div className="settings-field-grid">
+                        <Form.Item name="max_symbol_exposure" label="品种敞口"><InputNumber min={1} /></Form.Item>
+                        <Form.Item name="max_total_leverage" label="总杠杆"><InputNumber min={0} step={0.1} /></Form.Item>
+                        <Form.Item name="max_new_margin_fraction" label="单笔可用资金比例"><InputNumber min={0} max={1} step={0.05} /></Form.Item>
+                        <Form.Item name="new_order_leverage" label="下单杠杆估算"><InputNumber min={1} step={1} /></Form.Item>
+                        <Form.Item name="min_margin_ratio" label="最低保证金率"><InputNumber min={0} step={0.01} /></Form.Item>
+                        <Form.Item name="max_api_errors" label="最大 API 错误次数"><InputNumber min={1} /></Form.Item>
+                      </div>
+                    </section>
+                  </div>
+                  <div className="settings-form-actions">
+                    <Button type="primary" htmlType="submit">保存风控</Button>
+                  </div>
                 </Form>
               )
             },
@@ -294,7 +312,7 @@ export function SettingsPage() {
                 <Space direction="vertical" size={12} className="full-width">
                   <Alert type="info" showIcon message="同步 MT5 会写入最小手数、步进、合约大小和计价币种；扫描时按目标 USD 名义价值自动计算 MT5 手数和 HL 数量。" />
                   <Button type="primary" onClick={() => openSymbolModal()}>新增映射</Button>
-                  <Table rowKey="id" columns={columns} dataSource={symbols.data || []} loading={symbols.isLoading} pagination={{ pageSize: 10 }} scroll={{ x: 1200 }} />
+                  <Table rowKey="id" columns={columns} dataSource={symbols.data || []} loading={symbols.isLoading} pagination={{ pageSize: 10 }} scroll={{ x: 1200, y: 'calc(100vh - 420px)' }} />
                 </Space>
               )
             },
@@ -304,7 +322,7 @@ export function SettingsPage() {
               children: (
                 <Space direction="vertical" size={12} className="full-width">
                   <Alert type="info" showIcon message="本地交易时段用于补充经纪商的 close-only / quote-only 规则：只平仓窗口禁止新增、允许平仓；仅报价和休市窗口禁止所有交易动作。" />
-                  <Table rowKey="id" columns={sessionColumns} dataSource={symbols.data || []} loading={symbols.isLoading} pagination={{ pageSize: 10 }} scroll={{ x: 1300 }} />
+                  <Table rowKey="id" columns={sessionColumns} dataSource={symbols.data || []} loading={symbols.isLoading} pagination={{ pageSize: 10 }} scroll={{ x: 1300, y: 'calc(100vh - 420px)' }} />
                 </Space>
               )
             },
@@ -334,7 +352,7 @@ export function SettingsPage() {
                       />
                     </Space>
                   </Card>
-                  <Form key={String(live.data?.enabled)} layout="vertical" className="settings-form" initialValues={{ enabled: live.data?.enabled, confirmation: '' }} onFinish={(v) => saveLive.mutate(v)}>
+                  <Form key={String(live.data?.enabled)} layout="vertical" className="settings-form settings-compact-form" initialValues={{ enabled: live.data?.enabled, confirmation: '' }} onFinish={(v) => saveLive.mutate(v)}>
                     <Form.Item name="enabled" label="允许实盘" valuePropName="checked"><Switch /></Form.Item>
                     <Form.Item name="confirmation" label="确认短语"><Input placeholder="ENABLE LIVE TRADING" /></Form.Item>
                     <Button danger htmlType="submit">保存实盘开关</Button>

@@ -2,6 +2,7 @@ import ReactECharts from 'echarts-for-react';
 import { useQuery } from '@tanstack/react-query';
 import { Alert, Card, Col, Row, Space, Typography } from 'antd';
 import { api } from '../api/client';
+import { AccountTable } from '../components/AccountTable';
 import { DataCard } from '../components/DataCard';
 import { usePageStream } from '../hooks/useLiveStream';
 import { fmtChartDateTime, fmtMoney, fmtPnlColor, fmtPnlSigned } from '../utils/format';
@@ -10,6 +11,7 @@ export function DashboardPage() {
   const streamStatus = usePageStream('dashboard');
   const summary = useQuery({ queryKey: ['dashboard-summary'], queryFn: async () => (await api.get('/dashboard/summary')).data });
   const curve = useQuery({ queryKey: ['equity-curve'], queryFn: async () => (await api.get('/dashboard/equity-curve')).data });
+  const accounts = useQuery({ queryKey: ['accounts'], queryFn: async () => (await api.get('/accounts')).data });
   const data = summary.data || {};
   const curveData = curve.data || [];
 
@@ -38,6 +40,9 @@ export function DashboardPage() {
             series: [{ type: 'line', smooth: true, data: curveData.map((item: any) => item.equity), areaStyle: { opacity: 0.08 } }]
           }}
         />
+      </Card>
+      <Card title="账户">
+        <AccountTable data={accounts.data || []} loading={accounts.isLoading} y={220} />
       </Card>
     </Space>
   );

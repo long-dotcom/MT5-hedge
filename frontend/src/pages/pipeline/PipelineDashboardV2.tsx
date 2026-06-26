@@ -1,6 +1,6 @@
 import { Typography } from 'antd';
 import { fmtAdaptive, fmtSpread } from '../../utils/format';
-import type { V2DashboardData, V2HedgeGroup, V2LifecycleCounts, V2NodeStatus, V2PipelineSymbol } from './v2Types';
+import type { V2DashboardData, V2HedgeGroup, V2NodeStatus, V2PipelineSymbol } from './v2Types';
 
 function delayClass(ms: number) {
   if (ms === 0) return 'delay-idle';
@@ -130,104 +130,103 @@ const hedgeMeta: Record<V2HedgeGroup['status'], { label: string; cls: string }> 
   closable: { label: '可平仓', cls: 'closable' },
   manual: { label: '人工接管', cls: 'manual' },
   building: { label: '建仓中', cls: 'building' },
+  closing: { label: '平仓中', cls: 'closing' },
 };
 
-function HedgeCard({ group }: { group: V2HedgeGroup }) {
+const hedgeSections: Array<{ key: V2HedgeGroup['status']; label: string }> = [
+  { key: 'building', label: '待执行 / 建仓中' },
+  { key: 'holding', label: '持仓中' },
+  { key: 'closable', label: '可平仓' },
+  { key: 'closing', label: '平仓中' },
+  { key: 'manual', label: '人工接管' },
+];
+
+function spreadLabel(value?: number) {
+  return value === undefined ? '-' : fmtSpread(value);
+}
+
+function HedgeRow({ group }: { group: V2HedgeGroup }) {
   const meta = hedgeMeta[group.status];
   return (
-    <div className={`v2-hedge-card ${meta.cls}`}>
-      <div className="v2-hedge-title"><strong>{group.symbol}</strong><span>#{group.id}</span></div>
-      <div className="v2-hedge-status"><i />{meta.label}</div>
+    <div className={`v2-hedge-row ${meta.cls}`}>
+      <div className="v2-hedge-main">
+        <div className="v2-hedge-title"><strong>{group.symbol}</strong><span>#{group.id}</span></div>
+        <div className="v2-hedge-status"><i />{meta.label}</div>
+      </div>
+      <div className="v2-hedge-spreads">
+        <span>触发 <strong>{spreadLabel(group.triggerSpread)}</strong></span>
+        <span>开仓 <strong>{spreadLabel(group.entrySpread)}</strong></span>
+        <span>当前 <strong>{spreadLabel(group.currentSpread)}</strong></span>
+      </div>
       <div className="v2-hedge-pnl">PnL <strong className={(group.pnl || 0) >= 0 ? 'positive' : 'negative'}>{(group.pnl || 0) >= 0 ? '+' : ''}{(group.pnl || 0).toFixed(2)}</strong></div>
-      {group.status === 'building' && <div className="v2-progress"><span style={{ width: '65%' }} /></div>}
-      {group.status === 'closable' && <div className="v2-hedge-note">✓ 达退出线 · 价差 {fmtSpread(group.currentSpread)}</div>}
-      {(group.status === 'holding' || group.status === 'manual') && <div className="v2-hedge-note">触发 {fmtSpread(group.triggerSpread)} · 开仓 {fmtSpread(group.entrySpread)} → 当前 {fmtSpread(group.currentSpread)}</div>}
     </div>
   );
 }
 
 function HedgePoolPanelV2({ hedgeGroups, releasedCount, archivedCount }: { hedgeGroups: V2HedgeGroup[]; releasedCount: number; archivedCount: number }) {
+  const counts = hedgeSections.reduce((acc, section) => {
+    acc[section.key] = hedgeGroups.filter((group) => group.status === section.key).length;
+    return acc;
+  }, {} as Record<V2HedgeGroup['status'], number>);
+  const floatingPnl = hedgeGroups.reduce((sum, item) => sum + Number(item.pnl || 0), 0);
+
   return (
     <section className="v2-panel v2-pool-panel">
       <div className="v2-panel-header blue">
         <h2>对冲池</h2>
         <span>{hedgeGroups.length} 组在池</span>
       </div>
+      <div className="v2-pool-summary">
+        <div><span>持仓</span><strong>{counts.holding}</strong></div>
+        <div><span>可平</span><strong>{counts.closable}</strong></div>
+        <div><span>处理中</span><strong>{counts.building + counts.closing}</strong></div>
+        <div><span>浮盈亏</span><strong className={floatingPnl >= 0 ? 'positive' : 'negative'}>{floatingPnl >= 0 ? '+' : ''}{floatingPnl.toFixed(2)}</strong></div>
+      </div>
       <div className="v2-pool-body">
-        <div className="v2-pool-entry">
-          <div className="v2-entry-circle">候选<br />入口</div>
-          <div className="v2-entry-arrow">信号触发</div>
+        <div className="v2-pool-rail">
+          <div className="v2-rail-node green">候选入口</div>
+          <div className="v2-rail-line" />
+          <div className="v2-rail-node blue">对冲池</div>
+          <div className="v2-rail-line" />
+          <div className="v2-rail-node gray">平仓闸门</div>
+          <div className="v2-rail-stat">已释放<strong>{releasedCount}</strong></div>
+          <div className="v2-rail-stat muted">已归档<strong>{archivedCount}</strong></div>
         </div>
-        <div className="v2-water-tank">
-          <div className="v2-water-label">对冲池</div>
-          <svg className="v2-water-wave" viewBox="0 0 200 32" preserveAspectRatio="none">
-            <path d="M0 16 Q25 8 50 16 T100 16 T150 16 T200 16 V32 H0 Z" />
-          </svg>
-          <div className="v2-hedge-grid">{hedgeGroups.map((group) => <HedgeCard key={`${group.symbol}-${group.id}`} group={group} />)}</div>
-        </div>
-        <div className="v2-pool-exit">
-          <div className="v2-exit-gate">平仓<br />闸门</div>
-          <div className="v2-exit-arrow" />
-          <div className="v2-release-count">已释放<strong>{releasedCount}</strong></div>
-          <div className="v2-archive-count">已归档<strong>{archivedCount}</strong></div>
+        <div className="v2-hedge-scroll">
+          {hedgeGroups.length === 0 && <div className="v2-pool-empty">暂无活跃对冲组</div>}
+          {hedgeSections.map((section) => {
+            const groups = hedgeGroups.filter((group) => group.status === section.key);
+            if (!groups.length) return null;
+            return (
+              <div className="v2-hedge-section" key={section.key}>
+                <div className="v2-hedge-section-header"><span>{section.label}</span><strong>{groups.length}</strong></div>
+                {groups.map((group) => <HedgeRow key={`${group.symbol}-${group.id}`} group={group} />)}
+              </div>
+            );
+          })}
         </div>
       </div>
     </section>
   );
 }
 
-const lifecycleStages: Array<{ key: keyof V2LifecycleCounts; label: string; cls: string }> = [
-  { key: 'pending', label: '待执行', cls: 'pending' },
-  { key: 'building', label: '建仓中', cls: 'building' },
-  { key: 'holding', label: '持仓中', cls: 'holding' },
-  { key: 'closable', label: '可平仓', cls: 'closable' },
-  { key: 'closing', label: '平仓中', cls: 'closing' },
-  { key: 'abnormal', label: '异常', cls: 'abnormal' },
-];
-
-function LifecycleBarV2({ lifecycle }: { lifecycle: V2LifecycleCounts }) {
-  const total = Object.values(lifecycle).reduce((sum, item) => sum + item, 0);
-  return (
-    <section className="v2-panel v2-lifecycle-panel">
-      <div className="v2-panel-header purple"><h2>生命周期</h2><span>共 {total} 组</span></div>
-      <div className="v2-lifecycle-bar">
-        {lifecycleStages.map((stage) => lifecycle[stage.key] > 0 ? <div key={stage.key} className={stage.cls} style={{ width: `${(lifecycle[stage.key] / Math.max(total, 1)) * 100}%` }}>{lifecycle[stage.key]}</div> : null)}
-      </div>
-      <div className="v2-lifecycle-grid">
-        {lifecycleStages.map((stage) => <div key={stage.key} className={stage.cls}><span>{stage.label}</span><strong>{lifecycle[stage.key]}</strong></div>)}
-      </div>
-    </section>
-  );
-}
-
-function BottomStatsV2({ data }: { data: V2DashboardData }) {
-  const stats = [
-    ['总对冲组', data.stats.totalHedgeGroups, '组'],
-    ['占用保证金', data.stats.usedMargin.toLocaleString(undefined, { maximumFractionDigits: 2 }), 'USD'],
-    ['浮动盈亏', `${data.stats.floatingPnl >= 0 ? '+' : ''}${data.stats.floatingPnl.toFixed(2)}`, 'USD'],
-    ['今日已平仓', data.stats.todayClosed, '组'],
-    ['今日已释放', data.stats.todayReleased, '笔'],
+function StatusStripV2({ data }: { data: V2DashboardData }) {
+  const items = [
+    ['SSE', data.sseStatus.online ? '在线' : '离线', data.sseStatus.online ? `延迟 ${data.sseStatus.latency}s` : '等待连接', data.sseStatus.online ? 'green' : 'gray'],
+    ['启用品种', data.sseStatus.enabledSymbols, '个', 'blue'],
+    ['流动正常', data.sseStatus.normalFlow, '条', 'green'],
+    ['阻塞', data.sseStatus.blockedFlow, '条', data.sseStatus.blockedFlow ? 'red' : 'gray'],
+    ['保证金', data.stats.usedMargin.toLocaleString(undefined, { maximumFractionDigits: 0 }), 'USD', 'blue'],
   ];
   return (
-    <section className="v2-panel v2-bottom-stats">
-      {stats.map(([label, value, suffix]) => <div key={label}><span>{label}</span><strong>{value}</strong><em>{suffix}</em></div>)}
-    </section>
-  );
-}
-
-function SummaryCardsV2({ data }: { data: V2DashboardData }) {
-  const closable = data.hedgeGroups.filter((item) => item.status === 'closable').length;
-  const cards = [
-    ['SSE 在线', data.sseStatus.online ? '在线' : '离线', `延迟 ${data.sseStatus.latency}s`, 'green'],
-    ['启用品种', data.sseStatus.enabledSymbols, '', 'blue'],
-    ['流动正常', data.sseStatus.normalFlow, '', 'green'],
-    ['阻塞', data.sseStatus.blockedFlow, '', 'red'],
-    ['池中对冲组', data.hedgeGroups.length, '', 'blue'],
-    ['可平仓', closable, '', 'orange'],
-  ];
-  return (
-    <div className="v2-summary-grid">
-      {cards.map(([label, value, sub, color]) => <div key={label} className={`v2-summary-card ${color}`}><span>{label}</span><strong>{value}</strong>{sub && <em>{sub}</em>}</div>)}
+    <div className="v2-status-strip">
+      {items.map(([label, value, sub, color]) => (
+        <div key={label} className={`v2-status-item ${color}`}>
+          <span>{label}</span>
+          <strong>{value}</strong>
+          <em>{sub}</em>
+        </div>
+      ))}
     </div>
   );
 }
@@ -244,13 +243,11 @@ export function PipelineDashboardV2({
         <div className="v2-title"><h1>链路与对冲池</h1><span /><p>{data.sseStatus.online ? 'SSE 在线' : 'SSE 离线'}</p><em>最后推送：{lastPushText}</em></div>
         <div className="v2-actions"><span>页面级推送</span><Typography.Text type={data.sseStatus.online ? 'success' : 'secondary'}>{data.sseStatus.online ? '运行中' : '等待连接'}</Typography.Text></div>
       </div>
-      <SummaryCardsV2 data={data} />
+      <StatusStripV2 data={data} />
       <div className="v2-main-grid">
         <PipelinePanelV2 pipelines={data.pipelines} />
         <HedgePoolPanelV2 hedgeGroups={data.hedgeGroups} releasedCount={data.releasedCount} archivedCount={data.archivedCount} />
       </div>
-      <LifecycleBarV2 lifecycle={data.lifecycle} />
-      <BottomStatsV2 data={data} />
     </div>
   );
 }

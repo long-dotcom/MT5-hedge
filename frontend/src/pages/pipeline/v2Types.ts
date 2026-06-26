@@ -1,6 +1,6 @@
 export type V2NodeStatus = 'active' | 'blocked' | 'warning' | 'inactive';
 export type V2Direction = 'long_mt5_short_hyperliquid' | 'long_hyperliquid_short_mt5';
-export type V2HedgeStatus = 'holding' | 'closable' | 'manual' | 'building';
+export type V2HedgeStatus = 'holding' | 'closable' | 'manual' | 'building' | 'closing';
 
 export type V2PipelineSymbol = {
   symbol: string;

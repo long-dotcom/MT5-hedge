@@ -24,10 +24,10 @@ export function RiskPage() {
     }
   });
   const columns: ColumnsType<any> = [
-    { title: '等级', dataIndex: 'level', render: (v) => <Tag color={v === 'critical' ? 'red' : v === 'warning' ? 'gold' : 'default'}>{v}</Tag> },
-    { title: '规则', dataIndex: 'rule' },
-    { title: '品种', dataIndex: 'symbol' },
-    { title: '消息', dataIndex: 'message', ellipsis: true },
+    { title: '等级', dataIndex: 'level', width: 92, render: (v) => <Tag color={v === 'critical' ? 'red' : v === 'warning' ? 'gold' : 'default'}>{v}</Tag> },
+    { title: '规则', dataIndex: 'rule', width: 180 },
+    { title: '品种', dataIndex: 'symbol', width: 120 },
+    { title: '消息', dataIndex: 'message', width: 520, ellipsis: true },
     { title: '时间', dataIndex: 'created_at', width: 190, render: fmtLocalTime }
   ];
   const risk = status.data || {};
@@ -61,6 +61,7 @@ export function RiskPage() {
           columns={columns}
           dataSource={events.data?.items || []}
           loading={events.isLoading}
+          scroll={{ x: 1102, y: 'calc(100vh - 430px)' }}
           pagination={{ current: eventPage, pageSize: EVENT_PAGE_SIZE, total: events.data?.total || 0, onChange: setEventPage }}
         />
       </Card>

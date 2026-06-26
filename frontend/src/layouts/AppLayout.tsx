@@ -1,11 +1,9 @@
 import {
-  ApiOutlined,
   MenuFoldOutlined,
   MenuUnfoldOutlined,
   DashboardOutlined,
   DatabaseOutlined,
   ExperimentOutlined,
-  FundOutlined,
   LineChartOutlined,
   NodeIndexOutlined,
   PartitionOutlined,
@@ -25,11 +23,10 @@ const items = [
   { key: '/', icon: <DashboardOutlined />, label: '仪表盘' },
   { key: '/analytics', icon: <ExperimentOutlined />, label: '价差研究' },
   { key: '/funding', icon: <LineChartOutlined />, label: '资金费研究' },
-  { key: '/lead-lag', icon: <NodeIndexOutlined />, label: '报价领先滞后' },
+  { key: '/lead-lag', icon: <NodeIndexOutlined />, label: '报价时差' },
   { key: '/pipeline', icon: <PartitionOutlined />, label: '链路监控' },
   { key: '/hedge-groups', icon: <HistoryOutlined />, label: '对冲组' },
   { key: '/execution', icon: <OrderedListOutlined />, label: '执行记录' },
-  { key: '/accounts', icon: <FundOutlined />, label: '账户' },
   { key: '/positions', icon: <StockOutlined />, label: '仓位' },
   { key: '/risk', icon: <SafetyCertificateOutlined />, label: '风控' },
   { key: '/logs', icon: <DatabaseOutlined />, label: '日志' },
@@ -50,7 +47,7 @@ export function AppLayout() {
     <Layout className="app-shell">
       <Sider width={224} collapsedWidth={72} collapsed={collapsed} trigger={null} theme="light" className="side-nav">
         <div className={`brand ${collapsed ? 'collapsed' : ''}`}>
-          <div className="brand-mark"><ApiOutlined /></div>
+          <img className="brand-mark" src="/brand-mark.svg" alt="MT5 Hedge" />
           {!collapsed && <span>MT5 Hedge</span>}
         </div>
         <Menu mode="inline" selectedKeys={[location.pathname]} items={items} onClick={(event) => navigate(event.key)} inlineCollapsed={collapsed} />

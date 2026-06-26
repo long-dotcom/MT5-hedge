@@ -1,10 +1,13 @@
 import { useQuery } from '@tanstack/react-query';
-import { Card, Descriptions, Space, Table, Tabs, Tag, Typography } from 'antd';
+import { Card, Descriptions, Space, Table, Tabs, Tag } from 'antd';
 import type { ColumnsType } from 'antd/es/table';
 import { useState } from 'react';
 import { api } from '../api/client';
+import { EllipsisCell } from '../components/EllipsisCell';
+import { useHeaderStreamStatus } from '../components/HeaderStreamStatus';
 import { usePageStream } from '../hooks/useLiveStream';
 import { fmtLocalTime, fmtMoney, fmtNum } from '../utils/format';
+import { tableScrollAutoY } from '../utils/tableScroll';
 
 function platformTag(platform?: string) {
   if (platform === 'hyperliquid') return <Tag color="cyan">HL</Tag>;
@@ -37,10 +40,10 @@ function orderTypeTag(orderType?: string) {
 
 function orderDetailItems(row: any) {
   return [
-    { key: 'external_order_id', label: '外部单号', children: row.external_order_id || '-' },
+    { key: 'external_order_id', label: '外部单号', children: <EllipsisCell value={row.external_order_id} /> },
     { key: 'post_only', label: 'Post-only', children: row.post_only ? <Tag color="purple">是</Tag> : '-' },
     { key: 'reduce_only', label: 'Reduce-only', children: row.reduce_only ? <Tag color="orange">是</Tag> : '-' },
-    { key: 'error_message', label: '错误信息', children: row.error_message || '-' },
+    { key: 'error_message', label: '错误信息', children: <EllipsisCell value={row.error_message} /> },
     { key: 'ttl_seconds', label: 'TTL 秒', children: row.ttl_seconds ?? '-' },
     { key: 'updated_at', label: '更新时间', children: fmtLocalTime(row.updated_at) }
   ];
@@ -51,14 +54,17 @@ export function ExecutionPage() {
   const [fillPage, setFillPage] = useState(1);
   const [activeTab, setActiveTab] = useState('orders');
   const streamStatus = usePageStream('execution', { page: orderPage, fillPage, pageSize: 20 });
+  useHeaderStreamStatus(streamStatus.online);
   const orders = useQuery({ queryKey: ['orders', orderPage], queryFn: async () => (await api.get('/orders', { params: { page: orderPage, page_size: 20 } })).data });
   const fills = useQuery({ queryKey: ['fills', fillPage], queryFn: async () => (await api.get('/fills', { params: { page: fillPage, page_size: 20 } })).data });
+  const orderRows = orders.data?.items || [];
+  const fillRows = fills.data?.items || [];
 
   const orderColumns: ColumnsType<any> = [
     { title: 'ID', dataIndex: 'id', width: 70 },
     { title: '组ID', dataIndex: 'hedge_group_id', width: 80 },
     { title: '平台', dataIndex: 'platform', width: 82, render: platformTag },
-    { title: '品种', dataIndex: 'symbol', width: 104 },
+    { title: '品种', dataIndex: 'symbol', width: 104, ellipsis: true, render: (v) => <EllipsisCell value={v} /> },
     { title: '方向', dataIndex: 'side', width: 76, render: sideTag },
     { title: '状态', dataIndex: 'status', width: 96, render: statusTag },
     { title: '类型', dataIndex: 'order_type', width: 82, render: orderTypeTag },
@@ -71,7 +77,7 @@ export function ExecutionPage() {
     { title: 'ID', dataIndex: 'id', width: 70 },
     { title: '订单ID', dataIndex: 'order_id', width: 90 },
     { title: '平台', dataIndex: 'platform', width: 90, render: platformTag },
-    { title: '品种', dataIndex: 'symbol', width: 110 },
+    { title: '品种', dataIndex: 'symbol', width: 110, ellipsis: true, render: (v) => <EllipsisCell value={v} /> },
     { title: '方向', dataIndex: 'side', width: 80, render: sideTag },
     { title: '数量', dataIndex: 'quantity', width: 120, align: 'right', render: (v) => fmtNum(v, 6) },
     { title: '价格', dataIndex: 'price', width: 120, align: 'right', render: fmtMoney },
@@ -80,12 +86,8 @@ export function ExecutionPage() {
   ];
 
   return (
-    <Space direction="vertical" size={16} className="full-width">
-      <Space className="full-width" align="center" style={{ justifyContent: 'space-between' }}>
-        <Typography.Title level={3} style={{ margin: 0 }}>执行记录</Typography.Title>
-        <Typography.Text type={streamStatus.online ? 'success' : 'secondary'}>{streamStatus.online ? '页面级推送运行中' : '等待页面级推送'}</Typography.Text>
-      </Space>
-      <Card>
+    <div className="page-fill page-stack">
+      <Card title="执行记录" className="fill-card tabs-fill-card">
         <Tabs
           activeKey={activeTab}
           onChange={(key) => { setActiveTab(key); setOrderPage(1); setFillPage(1); }}
@@ -97,9 +99,10 @@ export function ExecutionPage() {
                 <Table
                   rowKey="id"
                   columns={orderColumns}
-                  dataSource={orders.data?.items || []}
+                  dataSource={orderRows}
                   loading={orders.isLoading}
-                  scroll={{ x: 990, y: 'calc(100vh - 340px)' }}
+                  tableLayout="fixed"
+                  scroll={tableScrollAutoY(990, orderRows.length, 'calc(100vh - 356px)', 8)}
                   pagination={{ current: orderPage, pageSize: 20, total: orders.data?.total || 0, onChange: setOrderPage }}
                   expandable={{
                     expandedRowRender: (row) => <Descriptions size="small" column={{ xs: 1, sm: 2, lg: 3 }} items={orderDetailItems(row)} />,
@@ -115,9 +118,10 @@ export function ExecutionPage() {
                 <Table
                   rowKey="id"
                   columns={fillColumns}
-                  dataSource={fills.data?.items || []}
+                  dataSource={fillRows}
                   loading={fills.isLoading}
-                  scroll={{ x: 980, y: 'calc(100vh - 340px)' }}
+                  tableLayout="fixed"
+                  scroll={tableScrollAutoY(980, fillRows.length, 'calc(100vh - 356px)', 8)}
                   pagination={{ current: fillPage, pageSize: 20, total: fills.data?.total || 0, onChange: setFillPage }}
                 />
               )
@@ -125,6 +129,6 @@ export function ExecutionPage() {
           ]}
         />
       </Card>
-    </Space>
+    </div>
   );
 }

@@ -1,10 +1,11 @@
-import { LineChartOutlined, ReloadOutlined } from '@ant-design/icons';
+import { LineChartOutlined } from '@ant-design/icons';
 import { useQuery } from '@tanstack/react-query';
-import { Alert, Button, Card, Col, Empty, Row, Select, Space, Statistic, Tag, Typography } from 'antd';
+import { Alert, Card, Col, Empty, Row, Select, Space, Statistic, Tag } from 'antd';
 import ReactECharts from 'echarts-for-react';
 import { useMemo, useState } from 'react';
 import { api } from '../api/client';
-import { fmtChartTime, fmtNum, fmtPct } from '../utils/format';
+import { EllipsisCell } from '../components/EllipsisCell';
+import { fmtChartDate, fmtChartDateTime, fmtChartTime, fmtNum, fmtPct } from '../utils/format';
 
 const ranges = [
   { value: '24h', label: '24小时' },
@@ -60,7 +61,7 @@ export function FundingAnalyticsPage() {
   const summary = query.data?.summary;
   const items = query.data?.items || [];
   const option = useMemo(() => {
-    const times = items.map((row: any) => fmtChartTime(row.time));
+    const times = items.map((row: any) => (bucket === 'day' ? fmtChartDate(row.time) : bucket === 'hour' ? fmtChartDateTime(row.time) : fmtChartTime(row.time)));
     const sumRates = items.map((row: any) => row.sum_funding_rate);
     const avgRates = items.map((row: any) => row.avg_funding_rate);
     return {
@@ -71,7 +72,12 @@ export function FundingAnalyticsPage() {
       },
       legend: { top: 0, data: ['累计资金费率', '平均资金费率'] },
       grid: { left: 60, right: 28, top: 48, bottom: 42 },
-      xAxis: { type: 'category', data: times, boundaryGap: bucket !== 'raw' },
+      xAxis: {
+        type: 'category',
+        data: times,
+        boundaryGap: bucket !== 'raw',
+        axisLabel: { hideOverlap: true, rotate: bucket === 'raw' ? 0 : 18 }
+      },
       yAxis: { type: 'value', scale: true, axisLabel: { formatter: (value: number) => fmtRate(value, 3) } },
       dataZoom: [{ type: 'inside' }, { type: 'slider', height: 18, bottom: 8 }],
       series: [
@@ -81,13 +87,15 @@ export function FundingAnalyticsPage() {
           data: sumRates,
           showSymbol: false,
           itemStyle: { color: (params: any) => (Number(params.value) >= 0 ? '#52c41a' : '#f5222d') },
-          lineStyle: { width: 2, color: '#1677ff' }
+          lineStyle: { width: 2, color: '#52c41a' }
         },
         {
           name: '平均资金费率',
           type: 'line',
           data: avgRates,
-          showSymbol: false,
+          showSymbol: true,
+          symbol: 'circle',
+          symbolSize: 5,
           lineStyle: { width: 1.5, type: 'dashed', color: '#1677ff' }
         }
       ]
@@ -98,16 +106,6 @@ export function FundingAnalyticsPage() {
 
   return (
     <Space direction="vertical" size={16} className="full-width">
-      <div className="page-title-row">
-        <div>
-          <Typography.Title level={3}>资金费研究</Typography.Title>
-          <Typography.Text type="secondary">观察单个品种历史资金费率长期偏正、偏负或震荡</Typography.Text>
-        </div>
-        <Button icon={<ReloadOutlined />} loading={query.isFetching} onClick={() => query.refetch()}>
-          刷新
-        </Button>
-      </div>
-
       <Card>
         <Space wrap>
           <Select className="analytics-control" value={activeSymbol} options={symbolOptions} loading={symbols.isLoading} onChange={setSymbol} />
@@ -116,7 +114,7 @@ export function FundingAnalyticsPage() {
           <Tag icon={<LineChartOutlined />} color={biasColor(summary?.bias)}>
             {biasText(summary?.bias)}
           </Tag>
-          <Typography.Text type="secondary">{query.data?.hyperliquid_symbol || '-'}</Typography.Text>
+          <EllipsisCell value={query.data?.hyperliquid_symbol} className="analytics-reason" />
         </Space>
       </Card>
 

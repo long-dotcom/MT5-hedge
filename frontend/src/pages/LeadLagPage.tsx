@@ -1,9 +1,11 @@
 import { useQuery } from '@tanstack/react-query';
-import { Card, Empty, Form, InputNumber, Select, Space, Table, Tag, Typography } from 'antd';
+import { Card, Empty, Form, InputNumber, Select, Space, Table, Tag } from 'antd';
 import type { ColumnsType } from 'antd/es/table';
 import ReactECharts from 'echarts-for-react';
 import { useMemo, useState } from 'react';
 import { api } from '../api/client';
+import { EllipsisCell } from '../components/EllipsisCell';
+import { useHeaderStreamStatus } from '../components/HeaderStreamStatus';
 import { usePageStream } from '../hooks/useLiveStream';
 import { fmtAdaptive, fmtChartTime, fmtLocalTime } from '../utils/format';
 
@@ -75,6 +77,7 @@ export function LeadLagPage() {
     cacheKey: leadLagQueryKey,
     enabled: Boolean(activeSymbol),
   });
+  useHeaderStreamStatus(streamStatus.online);
   const query = useQuery({
     queryKey: leadLagQueryKey,
     enabled: Boolean(activeSymbol),
@@ -115,7 +118,7 @@ export function LeadLagPage() {
     { title: '时间', dataIndex: 'leader_time', width: 190, render: fmtLocalTime },
     { title: '领先方', dataIndex: 'leader_platform', width: 120, render: (v) => <Tag color={v === 'hyperliquid' ? 'cyan' : 'geekblue'}>{platformLabel(v)}</Tag> },
     { title: '跟随方', dataIndex: 'follower_platform', width: 120, render: (v) => <Tag color={v === 'hyperliquid' ? 'cyan' : 'geekblue'}>{platformLabel(v)}</Tag> },
-    { title: '方向', dataIndex: 'direction', width: 80 },
+    { title: '方向', dataIndex: 'direction', width: 80, ellipsis: true, render: (v) => <EllipsisCell value={v} /> },
     { title: '跟随', dataIndex: 'followed', width: 80, render: (v) => <Tag color={v ? 'green' : 'gold'}>{v ? '是' : '否'}</Tag> },
     { title: '滞后', dataIndex: 'lag_ms', width: 100, render: fmtMs },
     { title: '领先跳动', dataIndex: 'leader_move', width: 110, render: (v) => fmtAdaptive(v, 2, 6) },
@@ -127,14 +130,6 @@ export function LeadLagPage() {
   const mt5ToHl = summary.mt5_to_hyperliquid || {};
   return (
     <div className="leadlag-page">
-      <div className="leadlag-header">
-        <div>
-          <Typography.Title level={3}>报价时差分析</Typography.Title>
-          <Typography.Text type="secondary">观察同一品种两边报价谁先动、另一边多久跟随</Typography.Text>
-        </div>
-        <Typography.Text type={streamStatus.online ? 'success' : 'secondary'}>{streamStatus.online ? '页面级推送运行中' : '等待页面级推送'}</Typography.Text>
-      </div>
-
       <Card className="leadlag-toolbar">
         <Form layout="inline">
           <Form.Item label="品种">
@@ -171,11 +166,11 @@ export function LeadLagPage() {
           <Card className="leadlag-latest-card">
             <div className="leadlag-latest-row">
               <span>HL 来源</span>
-              <strong>{latest.hyperliquid?.source || '-'}</strong>
+              <strong><EllipsisCell value={latest.hyperliquid?.source} /></strong>
             </div>
             <div className="leadlag-latest-row">
               <span>MT5 来源</span>
-              <strong>{latest.mt5?.source || '-'}</strong>
+              <strong><EllipsisCell value={latest.mt5?.source} /></strong>
             </div>
             <div className="leadlag-latest-row">
               <span>样本点</span>
@@ -188,7 +183,7 @@ export function LeadLagPage() {
       </div>
 
       <Card title="跳动事件" className="leadlag-events-card">
-        <Table rowKey={(_, index) => String(index)} columns={eventColumns} dataSource={query.data?.items || []} loading={query.isLoading} scroll={{ x: 1200, y: 260 }} pagination={{ pageSize: 20, size: 'small' }} />
+        <Table rowKey={(_, index) => String(index)} columns={eventColumns} dataSource={query.data?.items || []} loading={query.isLoading} tableLayout="fixed" scroll={{ x: 1200, y: 260 }} pagination={{ pageSize: 20, size: 'small' }} />
       </Card>
     </div>
   );

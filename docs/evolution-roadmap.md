@@ -1,25 +1,115 @@
-# 演进路线
+# 项目演进路线
 
-当前系统定位是“实时行情 + 策略研究 + Paper 自动交易验证 + 受保护 MT5 实盘执行接入”。Hyperliquid paper 已回到本地 `QuoteCache` 撮合，Hyperliquid live 当前只保留账户、仓位和订单快照的只读查询，真实下单 SDK 暂未启用。
+本文档只记录版本边界和后续优先级；实现细节见 `DEVELOPMENT.md`、`strategy.md`、`risk.md`、`deployment.md`。
 
-## 当前边界
+## 当前版本定位
 
-- 行情：Hyperliquid 使用原生 WebSocket/HTTP `l2Book`，MT5 使用本机终端 Python API 轮询 tick。
-- 执行：`ExecutionGateway` 统一输出 `OrderEvent` / `FillEvent`，`build_execution_gateway()` 当前统一返回 `AdapterExecutionGateway`。
-- Paper：Hyperliquid 腿按最新 bid/ask 本地撮合，MT5 腿走 demo `order_send`。
-- Live：MT5 真实下单受 `LIVE_TRADING_ENABLED` 和 `MT5_LIVE_ORDER_ENABLED` 双重保护；Hyperliquid live 下单固定 block。
-- 回查：`execution_reconciler` 负责 pending 订单、live 仓位、closed 残仓和外部孤儿仓位同步。
+当前系统是“实时行情 + 策略研究 + Paper 自动交易验证 + 受保护 MT5 执行接入”的管理台。
 
-## 优先级
+已明确开放：
 
-1. 稳定本地撮合：补齐 market、limit、post-only、reduce-only、TTL、部分成交和滑点模型。
-2. 强化执行编排：继续保持“Hyperliquid 先成交、MT5 后补腿”的顺序，失败时进入人工处理或按品种配置反向冲销。
-3. 完善恢复能力：启动后重建 pending 订单、账户快照、缺失外部单号和成交明细。
-4. 扩展风控：对单品种、全局敞口、MT5 会话、异常延迟和报价质量继续加保护。
-5. 评估 Hyperliquid live SDK：在 paper 撮合稳定后，再单独设计真实下单接入，不影响当前对冲组和本地撮合逻辑。
+- Hyperliquid 与 MT5 行情采集。
+- 品种映射、MT5 规格同步、MT5 会话/交易能力保护。
+- 价差扫描、候选机会池、统计入场线和退出线。
+- 链路监控、报价时差、价差研究、资金费研究。
+- Paper 执行、MT5 demo 下单、Hyperliquid 本地撮合。
+- 可选 Hyperliquid paper-live 最小探针单。
+- 对冲组、订单、成交、仓位、账户、日志、风控页面。
+- 页面级 SSE 推送。
+- 执行回查、pending 订单恢复、live positions 同步、外部孤儿仓位提示和接管。
+
+当前不开放：
+
+- Hyperliquid live 全量真实下单。
+- 绕过 readiness 的 live 开仓或平仓。
+- 没有 MT5 demo/live 开关保护的真实 MT5 下单。
+- 未经过对冲组生命周期管理的外部订单托管。
+
+## 已完成的关键演进
+
+1. 行情从接口即时请求改为 `QuoteCache` 和同步报价对。
+2. 扫描热路径内存化，历史落库和聚合桶低频持久化。
+3. 统计信号、成本保护线、品种硬阈值合并为最终入场/退出口径。
+4. 执行入口统一到 `ExecutionGateway` 和 `OrderEvent` / `FillEvent`。
+5. 对冲组运行期状态进入内存 `HedgePoolStore`。
+6. `execution_reconciler` 负责 pending 回查、补腿、撤销异常 pending 和外部仓位归属检查。
+7. 前端实时页面切到页面级 SSE，连接状态统一显示在页头。
+8. 设置页、仓位页、日志页、执行页等列表布局统一为占满视口的卡片式表格。
+9. JWT、默认密码、SSE token 传输和实盘开关增加基础安全保护。
+10. SQLite 到 PostgreSQL 迁移脚本和说明已补齐。
+
+## 下一阶段优先级
+
+### P0：稳定性和可恢复性
+
+- 扩展 execution reconciler 测试覆盖，尤其是部分成交、外部订单缺失、补腿失败、撤 pending 失败。
+- 启动恢复时更完整地重建 pending 订单、缺失 external order id 和成交明细。
+- 对 `HedgePoolStore` 落库失败重试、重启恢复和运行期状态覆盖增加测试。
+- 增加关键后台任务的可观测指标：最近运行时间、耗时、失败原因、队列积压。
+
+### P1：Paper 执行质量
+
+- 完善 Hyperliquid 本地撮合模型：limit、post-only、reduce-only、TTL、部分成交和盘口深度吃单。
+- 用 paper-live 探针数据校准滑点、费用和下单前复核阈值。
+- 对 MT5 demo order_check/order_send 的 retcode 做更细分类，减少误判为通用失败。
+- 建立 paper 执行回放样本，覆盖开仓、平仓、单腿异常和自动冲销。
+
+### P2：风控和实盘准备
+
+- 扩展单品种敞口、平台敞口、总杠杆、保证金率和强平距离检查。
+- 把 live 自动平仓从默认关闭推进到小额灰度验证，但仍必须经过 readiness。
+- 补齐跨进程锁或外部锁，防止多实例同时触发 live 订单。
+- 完善管理员审计和敏感操作确认。
+
+### P3：Agent 辅助再平衡与异常处理
+
+目标是在不绕过现有风控和对冲组生命周期的前提下，引入一个定时运行的 Agent 辅助层，用于读取系统状态、识别双腿不平衡，并在明确条件下生成补平动作。
+
+首阶段只做只读诊断和建议：
+
+- 定时读取价差分析、报价同步状态、资金费趋势和当前可平仓价差。
+- 定时读取账户、仓位、对冲组、订单、成交和日志告警。
+- 识别单腿持仓、双腿数量不平衡、方向不一致、closed 残仓、外部孤儿仓位和 pending 订单长时间未恢复。
+- 为每个异常生成可审计的处理建议，包括建议补哪一腿、方向、数量、订单类型、限价/市价依据、风险原因和不处理原因。
+- 在前端提供 Agent 建议列表，由管理员确认后再调用现有手工平仓、接管或同步接口。
+
+后续阶段才评估受控自动挂单：
+
+- 仅允许对已归属系统对冲组的双腿不平衡做补平，不自动接管未知外部仓位。
+- 自动补平必须先通过 `risk`、`readiness`、MT5 会话权限、报价严格同步和当前价差复核。
+- 优先生成 reduce-only 或不会扩大净风险的补平订单；禁止为了补平开出更大裸露仓位。
+- 挂单参数必须有明确来源：当前盘口深度、价差研究口径、最大滑点、TTL、post-only/reduce-only 语义。
+- 每次建议、确认、下单、撤单、成交和失败都必须写入审计、系统日志和对冲组事件。
+- Agent 只能调用现有执行网关和 reconciler，不允许直接访问平台 SDK 绕过系统控制面。
+
+### P4：Hyperliquid live 评估
+
+- 单独设计 Hyperliquid live 下单适配，不复用 paper-live 探针开关作为正式实盘入口。
+- 先接只读订单状态和成交回报恢复，再接最小额真实订单提交。
+- live 下单必须保持统一风控、readiness、对冲组状态机和 reconciler 回查。
+- 在测试网或隔离小额账户完成 reduce-only、部分成交、撤单、失败回滚验证后再考虑开放。
+
+### P5：产品体验
+
+- 增加后台任务/系统健康页，展示行情、扫描、SSE、数据库、MT5、Hyperliquid 状态。
+- 继续优化图表空态、表格分页和异常提示。
+- 为价差研究和资金费研究补充更明确的数据新鲜度提示。
+- 增加导出和只读审计视图。
 
 ## 非目标
 
-- 不把双腿对冲组交给第三方框架表达。
-- 不让任何外部 SDK 绕过本系统的风控、readiness 和对冲组生命周期。
+- 不把真实交易交给第三方框架绕过本系统生命周期。
 - 不在 Hyperliquid live 下单未验证前开放真实提交。
+- 不把 paper-live 探针等同于正式实盘交易。
+- 不为了前端展示直接在扫描热路径查库或发网络请求。
+- 不让任何自动流程绕过 `risk`、`readiness`、实盘确认短语和平台开关。
+- 不允许 Agent 直接调用交易所或 MT5 SDK 绕过执行网关、reconciler 和审计。
+
+## 判断某项能否进入下一阶段
+
+进入更高风险阶段前，必须同时满足：
+
+- 有自动化测试覆盖核心成功和失败路径。
+- 前端能清楚展示当前状态、阻塞原因和人工处理入口。
+- 后端日志、风控事件、告警和审计能复盘每个关键动作。
+- 小额或 paper 环境连续稳定运行，且异常路径被实际演练过。

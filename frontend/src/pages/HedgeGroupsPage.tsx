@@ -1,10 +1,13 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { Button, Card, Descriptions, Space, Table, Tag, Typography, message } from 'antd';
+import { Button, Card, Descriptions, Space, Table, Tag, message } from 'antd';
 import type { ColumnsType } from 'antd/es/table';
 import { useState } from 'react';
 import { api } from '../api/client';
+import { EllipsisCell } from '../components/EllipsisCell';
+import { useHeaderStreamStatus } from '../components/HeaderStreamStatus';
 import { usePageStream } from '../hooks/useLiveStream';
 import { executionModeLabel, fmtAdaptive, fmtMoney, fmtSpread } from '../utils/format';
+import { tableScrollAutoY } from '../utils/tableScroll';
 
 function statusTag(status: string) {
   const map: Record<string, { label: string; color: string }> = {
@@ -49,16 +52,6 @@ function hasTriggerPrices(row: any) {
   return ['trigger_hyperliquid_bid', 'trigger_hyperliquid_ask', 'trigger_mt5_bid', 'trigger_mt5_ask'].some((key) => Number(row[key] || 0) !== 0);
 }
 
-function triggerPriceSummary(row: any) {
-  if (!hasTriggerPrices(row)) return '-';
-  return (
-    <Space direction="vertical" size={0} style={{ lineHeight: 1.25 }}>
-      <Typography.Text style={{ fontSize: 12 }}>HL {fmtAdaptive(row.trigger_hyperliquid_bid, 2, 8)} / {fmtAdaptive(row.trigger_hyperliquid_ask, 2, 8)}</Typography.Text>
-      <Typography.Text style={{ fontSize: 12 }}>MT5 {fmtAdaptive(row.trigger_mt5_bid, 2, 8)} / {fmtAdaptive(row.trigger_mt5_ask, 2, 8)}</Typography.Text>
-    </Space>
-  );
-}
-
 function detailItems(row: any) {
   return [
     { key: 'mt5_quantity', label: 'MT5 数量', children: fmtAdaptive(row.mt5_quantity, 2, 6) },
@@ -81,14 +74,15 @@ function detailItems(row: any) {
     { key: 'swap', label: 'MT5 隔夜费', children: fmtCarryCost(row.swap) },
     { key: 'realized_pnl', label: '已实现', children: fmtMoney(row.realized_pnl) },
     { key: 'unrealized_pnl', label: '未实现', children: fmtMoney(row.unrealized_pnl) },
-    { key: 'source', label: '来源', children: row.source || '-' },
-    { key: 'close_reason', label: '平仓原因', children: row.close_reason || '-' }
+    { key: 'source', label: '来源', children: <EllipsisCell value={row.source} /> },
+    { key: 'close_reason', label: '平仓原因', children: <EllipsisCell value={row.close_reason} /> }
   ];
 }
 
 export function HedgeGroupsPage() {
   const [page, setPage] = useState(1);
   const streamStatus = usePageStream('hedge-groups', { page, pageSize: 20 });
+  useHeaderStreamStatus(streamStatus.online);
   const queryClient = useQueryClient();
   const [messageApi, contextHolder] = message.useMessage();
   const query = useQuery({ queryKey: ['hedge-groups', page], queryFn: async () => (await api.get('/hedge-groups', { params: { page, page_size: 20 } })).data });
@@ -113,39 +107,38 @@ export function HedgeGroupsPage() {
     onError: (err: any) => messageApi.error(err.response?.data?.detail || '同步失败')
   });
   const columns: ColumnsType<any> = [
-    { title: 'ID', dataIndex: 'id', width: 72 },
-    { title: '品种', dataIndex: 'symbol', width: 92 },
-    { title: '方向', dataIndex: 'direction', width: 168, render: directionTags },
-    { title: '状态', dataIndex: 'status', width: 96, render: statusTag },
-    { title: '模式', dataIndex: 'execution_mode', width: 86, render: executionModeLabel },
-    { title: '名义价值', dataIndex: 'notional', width: 112, align: 'right', render: fmtMoney },
-    { title: '数量', dataIndex: 'quantity', width: 92, align: 'right', render: (v) => fmtAdaptive(v, 2, 6) },
-    { title: '触发价差', dataIndex: 'trigger_spread', width: 112, align: 'right', render: fmtSpread },
-    { title: '触发价格', width: 188, render: (_, row) => triggerPriceSummary(row) },
-    { title: '真实开仓价差', dataIndex: 'entry_spread', width: 132, align: 'right', render: fmtSpread },
-    { title: '当前平仓价差', dataIndex: 'current_close_spread', width: 132, align: 'right', render: (v) => (v == null ? '-' : fmtSpread(v)) },
-    { title: 'HL资金费', dataIndex: 'funding', width: 124, align: 'right', render: fmtCarryCost },
-    { title: 'MT5隔夜费', dataIndex: 'swap', width: 124, align: 'right', render: fmtCarryCost },
-    { title: 'PnL', width: 112, align: 'right', render: (_, row) => fmtMoney(Number(row.realized_pnl || 0) + Number(row.unrealized_pnl || 0)) },
-    { title: '操作', fixed: 'right', width: 100, render: (_, row) => <Button size="small" disabled={!['open', 'open_partial', 'manual_intervention'].includes(row.status)} onClick={() => close.mutate(row.id)}>平仓</Button> }
+    { title: 'ID', dataIndex: 'id', width: 64, align: 'right' },
+    { title: '品种', dataIndex: 'symbol', width: 82, ellipsis: true, render: (v) => <EllipsisCell value={v} /> },
+    { title: '方向', dataIndex: 'direction', width: 162, render: directionTags },
+    { title: '状态', dataIndex: 'status', width: 82, render: statusTag },
+    { title: '模式', dataIndex: 'execution_mode', width: 74, render: executionModeLabel },
+    { title: '名义价值', dataIndex: 'notional', width: 104, align: 'right', render: (v) => <EllipsisCell value={fmtMoney(v)} align="right" /> },
+    { title: '数量', dataIndex: 'quantity', width: 80, align: 'right', render: (v) => <EllipsisCell value={fmtAdaptive(v, 2, 6)} align="right" /> },
+    { title: '触发价差', dataIndex: 'trigger_spread', width: 100, align: 'right', render: (v) => <EllipsisCell value={fmtSpread(v)} align="right" /> },
+    { title: '开仓价差', dataIndex: 'entry_spread', width: 100, align: 'right', render: (v) => <EllipsisCell value={fmtSpread(v)} align="right" /> },
+    { title: '平仓价差', dataIndex: 'current_close_spread', width: 100, align: 'right', render: (v) => <EllipsisCell value={v == null ? '-' : fmtSpread(v)} align="right" /> },
+    { title: '资金费', dataIndex: 'funding', width: 92, align: 'right', render: (v) => <EllipsisCell value={fmtCarryCost(v)} align="right" /> },
+    { title: '隔夜费', dataIndex: 'swap', width: 92, align: 'right', render: (v) => <EllipsisCell value={fmtCarryCost(v)} align="right" /> },
+    { title: 'PnL', width: 92, align: 'right', render: (_, row) => <EllipsisCell value={fmtMoney(Number(row.realized_pnl || 0) + Number(row.unrealized_pnl || 0))} align="right" /> },
+    { title: '操作', fixed: 'right', width: 86, render: (_, row) => <Button size="small" disabled={!['open', 'open_partial', 'manual_intervention'].includes(row.status)} onClick={() => close.mutate(row.id)}>平仓</Button> }
   ];
+  const rows = query.data?.items || [];
   return (
-    <Space direction="vertical" size={16} className="full-width">
+    <div className="page-fill page-stack">
       {contextHolder}
-      <Space className="full-width" align="center" style={{ justifyContent: 'space-between' }}>
-        <Typography.Title level={3} style={{ margin: 0 }}>对冲组</Typography.Title>
-        <Space>
-          <Typography.Text type={streamStatus.online ? 'success' : 'secondary'}>{streamStatus.online ? '页面级推送运行中' : '等待页面级推送'}</Typography.Text>
-          <Button loading={reconcile.isPending} onClick={() => reconcile.mutate()}>同步执行状态</Button>
-        </Space>
-      </Space>
-      <Card>
+      <Card
+        title="对冲组"
+        className="fill-card"
+        extra={<Button loading={reconcile.isPending} onClick={() => reconcile.mutate()}>同步执行状态</Button>}
+      >
         <Table
           rowKey="id"
           columns={columns}
-          dataSource={query.data?.items || []}
+          dataSource={rows}
           loading={query.isLoading}
-          scroll={{ x: 1740, y: 'calc(100vh - 310px)' }}
+          className="compact-data-table hedge-groups-table"
+          tableLayout="fixed"
+          scroll={tableScrollAutoY(1226, rows.length, 'calc(100vh - 314px)', 8)}
           pagination={{ current: page, pageSize: 20, total: query.data?.total || 0, onChange: setPage }}
           expandable={{
             expandedRowRender: (row) => <Descriptions size="small" column={{ xs: 1, sm: 2, lg: 4 }} items={detailItems(row)} />,
@@ -153,6 +146,6 @@ export function HedgeGroupsPage() {
           }}
         />
       </Card>
-    </Space>
+    </div>
   );
 }

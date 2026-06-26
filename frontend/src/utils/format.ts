@@ -66,6 +66,14 @@ export function fmtChartTime(value?: string) {
   return date.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false });
 }
 
+export function fmtChartDate(value?: string) {
+  const date = parseUtcTime(value);
+  if (!date) return '-';
+  const month = String(date.getMonth() + 1).padStart(2, '0');
+  const day = String(date.getDate()).padStart(2, '0');
+  return `${month}-${day}`;
+}
+
 export function fmtChartDateTime(value?: string) {
   const date = parseUtcTime(value);
   if (!date) return '-';

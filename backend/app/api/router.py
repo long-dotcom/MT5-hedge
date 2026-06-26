@@ -88,6 +88,16 @@ def json_default(value: Any) -> str:
     return str(value)
 
 
+def bearer_token_from_request(request: Request) -> str:
+    auth_header = request.headers.get("authorization", "")
+    if not auth_header.lower().startswith("bearer "):
+        raise HTTPException(status_code=401, detail="未登录")
+    token = auth_header.split(" ", 1)[1].strip()
+    if not token:
+        raise HTTPException(status_code=401, detail="未登录")
+    return token
+
+
 def audit(db: Session, user_id: int | None, action: str, resource: str, detail: str = "", request: Request | None = None) -> None:
     db.add(AuditLog(user_id=user_id, action=action, resource=resource, detail=detail, ip_address=request.client.host if request and request.client else ""))
 
@@ -245,7 +255,7 @@ def spreads(_: User = Depends(get_current_user), db: Session = Depends(get_db), 
 
 @router.get("/stream")
 async def stream(
-    token: str,
+    request: Request,
     channel: str = "all",
     page: int = 1,
     page_size: int = 20,
@@ -258,6 +268,7 @@ async def stream(
     follow_ratio: float = 0.5,
     max_lag_ms: int = 2000,
 ) -> StreamingResponse:
+    token = bearer_token_from_request(request)
     try:
         payload = decode_access_token(token)
     except Exception as exc:

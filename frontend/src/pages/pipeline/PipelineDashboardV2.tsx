@@ -1,4 +1,3 @@
-import { Typography } from 'antd';
 import { fmtAdaptive, fmtSpread } from '../../utils/format';
 import type { V2DashboardData, V2HedgeGroup, V2NodeStatus, V2PipelineSymbol } from './v2Types';
 
@@ -241,7 +240,6 @@ export function PipelineDashboardV2({
     <div className="pipeline-v2">
       <div className="v2-topbar">
         <div className="v2-title"><h1>链路与对冲池</h1><span /><p>{data.sseStatus.online ? 'SSE 在线' : 'SSE 离线'}</p><em>最后推送：{lastPushText}</em></div>
-        <div className="v2-actions"><span>页面级推送</span><Typography.Text type={data.sseStatus.online ? 'success' : 'secondary'}>{data.sseStatus.online ? '运行中' : '等待连接'}</Typography.Text></div>
       </div>
       <StatusStripV2 data={data} />
       <div className="v2-main-grid">

@@ -1,9 +1,10 @@
-import { ExperimentOutlined, ReloadOutlined } from '@ant-design/icons';
+import { ExperimentOutlined } from '@ant-design/icons';
 import { useQuery } from '@tanstack/react-query';
-import { Button, Card, Col, Empty, Row, Select, Space, Statistic, Tag, Typography } from 'antd';
+import { Card, Col, Empty, Row, Select, Space, Statistic, Tag } from 'antd';
 import ReactECharts from 'echarts-for-react';
 import { useMemo, useState } from 'react';
 import { api } from '../api/client';
+import { EllipsisCell } from '../components/EllipsisCell';
 import { fmtAdaptive, fmtChartTime, fmtNum, fmtPct } from '../utils/format';
 
 const directions = [
@@ -99,16 +100,6 @@ export function SpreadAnalyticsPage() {
 
   return (
     <Space direction="vertical" size={16} className="full-width">
-      <div className="page-title-row">
-        <div>
-          <Typography.Title level={3}>价差研究</Typography.Title>
-          <Typography.Text type="secondary">用历史价差分布判断当前偏离是否具备回归观察价值</Typography.Text>
-        </div>
-        <Button icon={<ReloadOutlined />} loading={query.isFetching} onClick={() => query.refetch()}>
-          刷新
-        </Button>
-      </div>
-
       <Card>
         <Space wrap>
           <Select className="analytics-control" value={activeSymbol} options={symbolOptions} loading={symbols.isLoading} onChange={setSymbol} />
@@ -118,9 +109,7 @@ export function SpreadAnalyticsPage() {
           <Tag icon={<ExperimentOutlined />} color={statusColor(summary?.analytics_status)}>
             {summary?.analytics_status || 'no_data'}
           </Tag>
-          <Typography.Text type="secondary" ellipsis className="analytics-reason">
-            {summary?.reason || '等待数据'}
-          </Typography.Text>
+          <EllipsisCell value={summary?.reason || '等待数据'} className="analytics-reason" />
         </Space>
       </Card>
 

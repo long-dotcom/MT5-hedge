@@ -3,6 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from loguru import logger
 
 from app.api.router import router
+from app.config.settings import enforce_runtime_security, get_settings
 from app.db.init_db import init_db
 from app.db.session import SessionLocal
 from app.execution.auto_closer import run_auto_close
@@ -33,6 +34,7 @@ app.include_router(router)
 
 @app.on_event("startup")
 def on_startup() -> None:
+    enforce_runtime_security(get_settings())
     init_db()
     market_data_manager.start()
     market_data_manager.wait_until_seeded()

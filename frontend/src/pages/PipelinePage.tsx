@@ -1,6 +1,7 @@
 import { useQuery } from '@tanstack/react-query';
 import { Alert } from 'antd';
 import { api } from '../api/client';
+import { useHeaderStreamStatus } from '../components/HeaderStreamStatus';
 import { usePageStream } from '../hooks/useLiveStream';
 import { PipelineDashboardV2 } from './pipeline/PipelineDashboardV2';
 import { toV2DashboardData } from './pipeline/v2Adapter';
@@ -8,6 +9,7 @@ import type { PipelineDiagnostics } from './pipeline/types';
 
 export function PipelinePage() {
   const streamStatus = usePageStream('pipeline');
+  useHeaderStreamStatus(streamStatus.online);
   const query = useQuery<PipelineDiagnostics>({
     queryKey: ['pipeline-diagnostics'],
     queryFn: async () => (await api.get('/diagnostics/pipeline')).data

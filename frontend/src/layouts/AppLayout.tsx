@@ -16,6 +16,7 @@ import {
 import { Button, Layout, Menu, Space, Typography } from 'antd';
 import { useState } from 'react';
 import { Outlet, useLocation, useNavigate } from 'react-router-dom';
+import { HeaderStreamStatus, HeaderStreamStatusProvider } from '../components/HeaderStreamStatus';
 
 const { Header, Sider, Content } = Layout;
 
@@ -44,34 +45,37 @@ export function AppLayout() {
   };
 
   return (
-    <Layout className="app-shell">
-      <Sider width={224} collapsedWidth={72} collapsed={collapsed} trigger={null} theme="light" className="side-nav">
-        <div className={`brand ${collapsed ? 'collapsed' : ''}`}>
-          <img className="brand-mark" src="/brand-mark.svg" alt="MT5 Hedge" />
-          {!collapsed && <span>MT5 Hedge</span>}
-        </div>
-        <Menu mode="inline" selectedKeys={[location.pathname]} items={items} onClick={(event) => navigate(event.key)} inlineCollapsed={collapsed} />
-      </Sider>
-      <Layout>
-        <Header className="topbar">
-          <Space size={12}>
-            <Button
-              type="text"
-              className="side-collapse-button"
-              icon={collapsed ? <MenuUnfoldOutlined /> : <MenuFoldOutlined />}
-              onClick={() => setCollapsed((value) => !value)}
-            />
-            <Typography.Text strong>Hyperliquid + MT5 套利管理台</Typography.Text>
-          </Space>
-          <Space>
-            <Typography.Text type="secondary">admin</Typography.Text>
-            <Button onClick={logout}>退出</Button>
-          </Space>
-        </Header>
-        <Content className="page-content">
-          <Outlet />
-        </Content>
+    <HeaderStreamStatusProvider>
+      <Layout className="app-shell">
+        <Sider width={224} collapsedWidth={72} collapsed={collapsed} trigger={null} theme="light" className="side-nav">
+          <div className={`brand ${collapsed ? 'collapsed' : ''}`}>
+            <img className="brand-mark" src="/brand-mark.svg" alt="MT5 Hedge" />
+            {!collapsed && <span>MT5 Hedge</span>}
+          </div>
+          <Menu mode="inline" selectedKeys={[location.pathname]} items={items} onClick={(event) => navigate(event.key)} inlineCollapsed={collapsed} />
+        </Sider>
+        <Layout>
+          <Header className="topbar">
+            <Space size={12}>
+              <Button
+                type="text"
+                className="side-collapse-button"
+                icon={collapsed ? <MenuUnfoldOutlined /> : <MenuFoldOutlined />}
+                onClick={() => setCollapsed((value) => !value)}
+              />
+              <Typography.Text strong>Hyperliquid + MT5 套利管理台</Typography.Text>
+            </Space>
+            <Space>
+              <HeaderStreamStatus />
+              <Typography.Text type="secondary">admin</Typography.Text>
+              <Button onClick={logout}>退出</Button>
+            </Space>
+          </Header>
+          <Content className="page-content">
+            <Outlet />
+          </Content>
+        </Layout>
       </Layout>
-    </Layout>
+    </HeaderStreamStatusProvider>
   );
 }

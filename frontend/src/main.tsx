@@ -10,7 +10,23 @@ const queryClient = new QueryClient();
 
 ReactDOM.createRoot(document.getElementById('root')!).render(
   <React.StrictMode>
-    <ConfigProvider locale={zhCN} theme={{ token: { borderRadius: 6, colorPrimary: '#1677ff' } }}>
+    <ConfigProvider
+      locale={zhCN}
+      theme={{
+        token: {
+          borderRadius: 8,
+          colorPrimary: '#0f766e',
+          colorInfo: '#2563eb',
+          colorSuccess: '#16a34a',
+          colorWarning: '#f97316',
+          colorError: '#ef4444',
+          colorText: '#172033',
+          colorTextSecondary: '#66758a',
+          colorBgLayout: '#eef4f3',
+          colorBorderSecondary: '#e2e8f0'
+        }
+      }}
+    >
       <AntApp>
         <QueryClientProvider client={queryClient}>
           <App />
@@ -19,4 +35,3 @@ ReactDOM.createRoot(document.getElementById('root')!).render(
     </ConfigProvider>
   </React.StrictMode>
 );
-

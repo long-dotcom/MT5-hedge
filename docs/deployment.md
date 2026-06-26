@@ -123,7 +123,9 @@ MT5_PASSWORD=
 MT5_SERVER=
 ```
 
-生产或实盘前必须修改 `JWT_SECRET` 和管理员密码。
+生产或实盘前必须修改 `JWT_SECRET` 和管理员密码。后端启动时会检查运行环境：当 `ENVIRONMENT` 不是 `local/dev/development/test/testing`，或 `LIVE_TRADING_ENABLED`、`MT5_LIVE_ORDER_ENABLED`、`HYPERLIQUID_PAPER_LIVE_ORDER_ENABLED`、`DEFAULT_EXECUTION_MODE=live` 任一实盘相关开关启用时，如果仍使用默认 `JWT_SECRET=change-me-before-live` 或默认 `ADMIN_PASSWORD=admin123`，服务会拒绝启动。已经用默认密码初始化过的数据库也需要重置管理员密码；如果现有管理员 hash 仍匹配 `admin123`，生产或实盘相关模式同样会拒绝启动。
+
+前端登录页不会预填默认账号密码；页面级 SSE 也不会再通过 URL query 传递 token，而是使用 `Authorization: Bearer <token>` 请求头，避免 token 被代理日志或浏览器历史记录下来。
 
 Hyperliquid 测试网需要同时切换：
 

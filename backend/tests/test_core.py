@@ -6,14 +6,17 @@ import sys
 from types import SimpleNamespace
 
 import pytest
+from fastapi import HTTPException
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from app.analytics.spreads import SpreadPoint, downsample_spreads, load_spread_points, summarize_spreads
 from app.analytics.funding import FundingPoint, bucket_funding_points, summarize_funding
 from app.analytics.lead_lag import lead_lag_report
+from app.auth.security import hash_password
 from app.market import scanner as scanner_module
 from app.market import symbols as symbol_module
+from app.db import init_db as init_db_module
 from app.db.models import AccountSnapshot, Alert, ArbitrageOpportunity, AuditLog, Base, Fill, HedgeGroup, HedgeGroupEvent, Order, Position, RiskEvent, RiskSetting, SpreadCurrent, SpreadDirectionCurrent, StrategySetting, SymbolMapping, SystemLog, SystemSetting, User
 from app.execution.auto_closer import evaluate_auto_close, run_auto_close
 from app.execution.auto_executor import run_auto_execute
@@ -25,7 +28,7 @@ from app.execution.hedge_pool import HedgeGroupSnapshot, hedge_pool
 from app.execution.persistence import persist_hedge_pool_events
 from app.execution.readiness import live_execution_readiness, paper_execution_readiness
 from app.execution.reconciler import reconcile_hedge_group, reconcile_orphan_positions, reconcile_residual_positions, sync_live_positions
-from app.config.settings import HYPERLIQUID_MAINNET_INFO_URL, HYPERLIQUID_TESTNET_INFO_URL, hyperliquid_execution_info_url
+from app.config.settings import HYPERLIQUID_MAINNET_INFO_URL, HYPERLIQUID_TESTNET_INFO_URL, Settings, enforce_runtime_security, hyperliquid_execution_info_url, insecure_runtime_reasons
 from app.api import router as api_router
 from app.diagnostics.pipeline import _pool_payload
 from app.market.mt5_schedule import apply_mt5_session_template, infer_template, local_schedule_state
@@ -67,6 +70,74 @@ def test_relative_sqlite_database_url_resolves_from_project_root(monkeypatch) ->
         monkeypatch.delenv("DATABASE_URL", raising=False)
         session_module.get_settings.cache_clear()
         reload(session_module)
+
+
+def test_runtime_security_allows_local_defaults() -> None:
+    settings = Settings(environment="local")
+
+    enforce_runtime_security(settings)
+
+    assert insecure_runtime_reasons(settings)
+
+
+def test_runtime_security_rejects_production_defaults() -> None:
+    settings = Settings(environment="production")
+
+    with pytest.raises(RuntimeError, match="JWT_SECRET"):
+        enforce_runtime_security(settings)
+
+
+def test_runtime_security_rejects_live_defaults_even_in_local() -> None:
+    settings = Settings(environment="local", live_trading_enabled=True)
+
+    with pytest.raises(RuntimeError, match="ADMIN_PASSWORD"):
+        enforce_runtime_security(settings)
+
+
+def test_runtime_security_accepts_production_custom_secrets() -> None:
+    settings = Settings(
+        environment="production",
+        jwt_secret="a-prod-secret-with-enough-entropy",
+        admin_password="not-the-default-password",
+    )
+
+    enforce_runtime_security(settings)
+
+    assert insecure_runtime_reasons(settings) == []
+
+
+def test_seed_defaults_rejects_existing_default_admin_in_secure_runtime(monkeypatch) -> None:
+    engine = create_engine("sqlite:///:memory:", future=True)
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine, future=True)
+    db = Session()
+    db.add(User(username="admin", password_hash=hash_password("admin123"), role="admin"))
+    db.commit()
+    monkeypatch.setattr(
+        init_db_module,
+        "get_settings",
+        lambda: Settings(environment="production", jwt_secret="strong-secret", admin_password="changed-password"),
+    )
+
+    with pytest.raises(RuntimeError, match="默认密码"):
+        init_db_module.seed_defaults(db)
+
+    db.close()
+
+
+def test_stream_auth_rejects_missing_bearer_header() -> None:
+    request = SimpleNamespace(headers={})
+
+    with pytest.raises(HTTPException) as exc:
+        api_router.bearer_token_from_request(request)
+
+    assert exc.value.status_code == 401
+
+
+def test_stream_auth_reads_bearer_header_without_query_token() -> None:
+    request = SimpleNamespace(headers={"authorization": "Bearer secure-token"})
+
+    assert api_router.bearer_token_from_request(request) == "secure-token"
 
 
 def test_mt5_spread_rebate_reduces_spread_cost() -> None:

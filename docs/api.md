@@ -2,13 +2,15 @@
 
 后端服务默认地址为 `http://127.0.0.1:8000`，所有业务接口以 `/api` 开头。除登录外，其余接口都需要 `Authorization: Bearer <token>`。
 
+文档关系：系统总览和开发约定见 `../DEVELOPMENT.md`；启动、环境变量和迁移见 `deployment.md`；策略和扫描口径见 `strategy.md`；风控和 readiness 见 `risk.md`；阶段路线见 `evolution-roadmap.md`。
+
 ## 认证
 
 - `POST /api/auth/login`：管理员登录。
 - `POST /api/auth/logout`：退出登录。
 - `GET /api/auth/me`：获取当前用户。
 
-默认本地账号为 `admin/admin123`，生产环境必须通过 `.env` 修改。
+默认本地账号仍由 `.env` 控制；登录页不会预填默认密码。生产环境或任何实盘/探针下单开关开启时，后端会拒绝使用默认 `JWT_SECRET` 或默认管理员密码启动。
 
 ## 仪表盘
 
@@ -19,7 +21,7 @@
 ## 行情与机会
 
 - `POST /api/markets/scan`：手动触发一次价差扫描。
-- `GET /api/stream?channel=pipeline&token=<access_token>`：页面级 SSE 推送。`channel=pipeline` 只推送链路监控所需的诊断快照，前端仅在打开链路监控页时订阅；`channel=dashboard` 只推送仪表盘摘要和权益曲线；`channel=hedge-groups&page=1&page_size=20` 只推送对冲组列表当前页；`channel=positions` 只推送仓位页当前仓位列表；`channel=accounts` 只推送账户快照；`channel=execution&page=1&fill_page=1&page_size=20` 只推送执行记录页当前订单页和成交页；`channel=logs&page=1&alert_page=1&page_size=20` 只推送日志中心当前日志页和告警页；`channel=risk&page=1&page_size=10` 只推送风控页状态和当前风险事件页；`channel=lead-lag&symbol=JP225&window_seconds=300&threshold_bps=3&min_move=0&max_lag_ms=2000` 只推送报价时差分析页当前筛选参数的报告。未指定 `channel` 时保留兼容的全量 snapshot 行为。
+- `GET /api/stream?channel=pipeline`：页面级 SSE 推送，必须通过 `Authorization: Bearer <token>` 请求头鉴权，不再允许把 access token 放在 URL query 中。`channel=pipeline` 只推送链路监控所需的诊断快照，前端仅在打开链路监控页时订阅；`channel=dashboard` 只推送仪表盘摘要和权益曲线；`channel=hedge-groups&page=1&page_size=20` 只推送对冲组列表当前页；`channel=positions` 只推送仓位页当前仓位列表；`channel=accounts` 只推送账户快照；`channel=execution&page=1&fill_page=1&page_size=20` 只推送执行记录页当前订单页和成交页；`channel=logs&page=1&alert_page=1&page_size=20` 只推送日志中心当前日志页和告警页；`channel=risk&page=1&page_size=10` 只推送风控页状态和当前风险事件页；`channel=lead-lag&symbol=JP225&window_seconds=300&threshold_bps=3&min_move=0&max_lag_ms=2000` 只推送报价时差分析页当前筛选参数的报告。未指定 `channel` 时保留兼容的全量 snapshot 行为。
 - `GET /api/markets/symbols`：查看手动品种映射。
 - `GET /api/markets/quotes`：查看实时行情缓存中的最新报价、来源和本地接收时间。
 - `GET /api/markets/trading-sessions`：查看每个品种的 MT5 交易时段状态和动作级权限。
@@ -28,6 +30,7 @@
 - `GET /api/analytics/spread-summary?symbol=BTC&direction=long_mt5_short_hyperliquid&range=1h&basis=entry`：查看价差均值、标准差、Z-Score、分位数、半衰期和回归概率；`basis` 支持 `entry/close/mid`，默认 `entry`。
 - `GET /api/analytics/spread-series?symbol=BTC&direction=long_mt5_short_hyperliquid&range=1h&basis=entry`：查看后端降采样后的价差曲线，支持 `15m/1h/4h/24h/7d`；`15m/1h/4h` 优先用原始快照统计，`24h/7d` 优先用聚合桶。
 - `GET /api/analytics/funding-series?symbol=JP225&range=7d&bucket=day`：查看单个品种历史资金费率曲线和统计，后端会按品种映射自动查询 Hyperliquid/HIP-3 合约，支持 `24h/7d/30d/90d` 和 `raw/hour/day` 聚合。
+- 价差研究和资金费研究当前按筛选条件直接请求上述分析接口，不使用页面级 SSE；筛选条件变化会触发重新读取。
 - `GET /api/analytics/lead-lag?symbol=JP225&window_seconds=300&threshold_bps=3&max_lag_ms=2000`：查看最近报价时差分析，用内存报价历史判断 HL 与 MT5 谁先跳动、另一边是否跟随、滞后毫秒和滞后期间最大 mid 差。报价时差分析页打开后会使用 `channel=lead-lag` 页面级 SSE 持续接收当前筛选条件的报告，不再使用前端轮询。
 - `GET /api/opportunities?page=1&page_size=20`：查看当前仍满足条件的候选机会；价差回落后对应机会会从当前池移除；展示口径使用 `gross_spread`、`unit_cost`、`unit_net_profit`，其中 `gross_spread` 为入场价差兼容别名。候选机会还会保存触发时盘口 `trigger_hyperliquid_bid`、`trigger_hyperliquid_ask`、`trigger_mt5_bid`、`trigger_mt5_ask`。
 - `GET /api/opportunities/{id}`：查看单个机会。

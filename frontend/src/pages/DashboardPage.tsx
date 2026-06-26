@@ -1,14 +1,16 @@
 import ReactECharts from 'echarts-for-react';
 import { useQuery } from '@tanstack/react-query';
-import { Alert, Card, Col, Row, Space, Typography } from 'antd';
+import { Alert, Card, Col, Row, Space } from 'antd';
 import { api } from '../api/client';
 import { AccountTable } from '../components/AccountTable';
 import { DataCard } from '../components/DataCard';
+import { useHeaderStreamStatus } from '../components/HeaderStreamStatus';
 import { usePageStream } from '../hooks/useLiveStream';
 import { fmtChartDateTime, fmtMoney, fmtPnlColor, fmtPnlSigned } from '../utils/format';
 
 export function DashboardPage() {
   const streamStatus = usePageStream('dashboard');
+  useHeaderStreamStatus(streamStatus.online);
   const summary = useQuery({ queryKey: ['dashboard-summary'], queryFn: async () => (await api.get('/dashboard/summary')).data });
   const curve = useQuery({ queryKey: ['equity-curve'], queryFn: async () => (await api.get('/dashboard/equity-curve')).data });
   const accounts = useQuery({ queryKey: ['accounts'], queryFn: async () => (await api.get('/accounts')).data });
@@ -17,10 +19,6 @@ export function DashboardPage() {
 
   return (
     <Space direction="vertical" size={16} className="full-width">
-      <Space className="full-width" align="center" style={{ justifyContent: 'space-between' }}>
-        <Typography.Title level={3} style={{ margin: 0 }}>仪表盘</Typography.Title>
-        <Typography.Text type={streamStatus.online ? 'success' : 'secondary'}>{streamStatus.online ? '页面级推送运行中' : '等待页面级推送'}</Typography.Text>
-      </Space>
       {data.risk_mode === 'emergency_stop' && <Alert type="error" showIcon message="系统处于紧急停止模式" />}
       <Row gutter={[16, 16]}>
         <Col xs={24} md={8} xl={4}><DataCard title="总权益" value={fmtMoney(data.equity)} /></Col>

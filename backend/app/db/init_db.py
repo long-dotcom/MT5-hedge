@@ -1,8 +1,8 @@
 from sqlalchemy import inspect, text
 from sqlalchemy.orm import Session
 
-from app.auth.security import hash_password
-from app.config.settings import get_settings
+from app.auth.security import hash_password, verify_password
+from app.config.settings import INSECURE_DEFAULT_ADMIN_PASSWORD, get_settings, runtime_requires_strong_secrets
 from app.db.models import Base, RiskSetting, StrategySetting, SymbolMapping, SystemSetting, User
 from app.db.session import engine, IS_POSTGRESQL, IS_SQLITE
 from app.accounts.sync import ensure_initial_account_snapshots
@@ -298,7 +298,8 @@ def ensure_schema_columns() -> None:
 
 def seed_defaults(db: Session) -> None:
     settings = get_settings()
-    if not db.query(User).filter(User.username == settings.admin_username).first():
+    admin_user = db.query(User).filter(User.username == settings.admin_username).first()
+    if not admin_user:
         db.add(
             User(
                 username=settings.admin_username,
@@ -306,6 +307,8 @@ def seed_defaults(db: Session) -> None:
                 role="admin",
             )
         )
+    elif runtime_requires_strong_secrets(settings) and verify_password(INSECURE_DEFAULT_ADMIN_PASSWORD, admin_user.password_hash):
+        raise RuntimeError("不安全启动配置：数据库中的管理员账号仍使用默认密码。请先重置管理员密码后再以生产或实盘相关模式启动。")
     if not db.query(StrategySetting).first():
         db.add(StrategySetting(execution_mode=settings.default_execution_mode))
     if not db.query(RiskSetting).first():

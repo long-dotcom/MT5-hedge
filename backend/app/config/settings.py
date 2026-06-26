@@ -8,6 +8,9 @@ ROOT_DIR = Path(__file__).resolve().parents[3]
 HYPERLIQUID_MAINNET_INFO_URL = "https://api.hyperliquid.xyz/info"
 HYPERLIQUID_TESTNET_INFO_URL = "https://api.hyperliquid-testnet.xyz/info"
 HYPERLIQUID_MAINNET_API_URL = "https://api.hyperliquid.xyz"
+INSECURE_DEFAULT_JWT_SECRET = "change-me-before-live"
+INSECURE_DEFAULT_ADMIN_PASSWORD = "admin123"
+LOCAL_ENVIRONMENTS = {"local", "dev", "development", "test", "testing"}
 
 
 def _load_env_file() -> dict[str, str]:
@@ -42,11 +45,11 @@ class Settings:
     database_pool_size: int = 10
     database_max_overflow: int = 20
     database_pool_recycle: int = 3600
-    jwt_secret: str = "change-me-before-live"
+    jwt_secret: str = INSECURE_DEFAULT_JWT_SECRET
     jwt_algorithm: str = "HS256"
     access_token_minutes: int = 720
     admin_username: str = "admin"
-    admin_password: str = "admin123"
+    admin_password: str = INSECURE_DEFAULT_ADMIN_PASSWORD
     default_execution_mode: str = "paper"
     symbol_mapping_path: str = str(ROOT_DIR / "config" / "symbol_mappings.yaml")
     live_trading_enabled: bool = False
@@ -107,6 +110,37 @@ class Settings:
 def hyperliquid_execution_info_url(settings: Settings | None = None) -> str:
     settings = settings or get_settings()
     return getattr(settings, "hyperliquid_info_url", HYPERLIQUID_MAINNET_INFO_URL)
+
+
+def insecure_runtime_reasons(settings: Settings) -> list[str]:
+    reasons: list[str] = []
+    if not settings.jwt_secret.strip() or settings.jwt_secret == INSECURE_DEFAULT_JWT_SECRET:
+        reasons.append("JWT_SECRET 仍为默认值")
+    if not settings.admin_password.strip():
+        reasons.append("ADMIN_PASSWORD 不能为空")
+    elif settings.admin_password == INSECURE_DEFAULT_ADMIN_PASSWORD:
+        reasons.append("ADMIN_PASSWORD 仍为默认值")
+    return reasons
+
+
+def runtime_requires_strong_secrets(settings: Settings) -> bool:
+    environment = settings.environment.strip().lower()
+    live_switch_enabled = (
+        settings.live_trading_enabled
+        or settings.mt5_live_order_enabled
+        or settings.hyperliquid_paper_live_order_enabled
+        or settings.default_execution_mode == "live"
+    )
+    return environment not in LOCAL_ENVIRONMENTS or live_switch_enabled
+
+
+def enforce_runtime_security(settings: Settings) -> None:
+    if not runtime_requires_strong_secrets(settings):
+        return
+    reasons = insecure_runtime_reasons(settings)
+    if reasons:
+        detail = "；".join(reasons)
+        raise RuntimeError(f"不安全启动配置：{detail}。生产或实盘相关模式必须在 .env 中设置强随机 JWT_SECRET 和非默认管理员密码。")
 
 
 @lru_cache

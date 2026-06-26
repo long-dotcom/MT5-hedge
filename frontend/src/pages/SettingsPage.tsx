@@ -1,9 +1,11 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { Alert, Button, Card, Form, Input, InputNumber, List, Modal, Popconfirm, Select, Space, Switch, Table, Tabs, Tag, Typography, message } from 'antd';
+import { Alert, Button, Card, Form, Input, InputNumber, List, Modal, Popconfirm, Select, Space, Switch, Table, Tabs, Tag, message } from 'antd';
 import type { ColumnsType } from 'antd/es/table';
 import { useState } from 'react';
 import { api } from '../api/client';
+import { EllipsisCell } from '../components/EllipsisCell';
 import { RISK_MODE_MAP } from '../utils/format';
+import { tableScrollAutoY } from '../utils/tableScroll';
 
 export function SettingsPage() {
   const queryClient = useQueryClient();
@@ -142,17 +144,17 @@ export function SettingsPage() {
     setSessionModalOpen(true);
   };
   const columns: ColumnsType<any> = [
-    { title: '内部品种', dataIndex: 'symbol' },
-    { title: 'Hyperliquid', dataIndex: 'hyperliquid_symbol' },
-    { title: 'MT5', dataIndex: 'mt5_symbol' },
-    { title: 'MT5最小手数', dataIndex: 'mt5_min_lot' },
-    { title: 'MT5步进', dataIndex: 'mt5_volume_step' },
-    { title: '合约大小', dataIndex: 'mt5_contract_size' },
-    { title: '盈亏币种', dataIndex: 'mt5_currency_profit' },
+    { title: '内部品种', dataIndex: 'symbol', width: 100, ellipsis: true, render: (v) => <EllipsisCell value={v} /> },
+    { title: 'Hyperliquid', dataIndex: 'hyperliquid_symbol', width: 128, ellipsis: true, render: (v) => <EllipsisCell value={v} /> },
+    { title: 'MT5', dataIndex: 'mt5_symbol', width: 116, ellipsis: true, render: (v) => <EllipsisCell value={v} /> },
+    { title: 'MT5最小手数', dataIndex: 'mt5_min_lot', width: 116 },
+    { title: 'MT5步进', dataIndex: 'mt5_volume_step', width: 104 },
+    { title: '合约大小', dataIndex: 'mt5_contract_size', width: 104 },
+    { title: '盈亏币种', dataIndex: 'mt5_currency_profit', width: 96, ellipsis: true, render: (v) => <EllipsisCell value={v} /> },
     { title: '买入价差下限', dataIndex: 'min_entry_spread', width: 130 },
     { title: '卖出价差上限', dataIndex: 'max_close_spread', width: 130 },
-    { title: '执行方式', dataIndex: 'execution_style', ellipsis: true, width: 170 },
-    { title: '启用', dataIndex: 'enabled', render: (v) => (v ? '是' : '否') },
+    { title: '执行方式', dataIndex: 'execution_style', ellipsis: true, width: 150, render: (v) => <EllipsisCell value={v} /> },
+    { title: '启用', dataIndex: 'enabled', width: 70, render: (v) => (v ? '是' : '否') },
     {
       title: '操作',
       fixed: 'right',
@@ -169,13 +171,13 @@ export function SettingsPage() {
     }
   ];
   const sessionColumns: ColumnsType<any> = [
-    { title: '内部品种', dataIndex: 'symbol', width: 100 },
-    { title: 'MT5', dataIndex: 'mt5_symbol', width: 130 },
-    { title: '模板', dataIndex: 'mt5_session_template', width: 170, render: (v) => <Tag>{v || 'auto'}</Tag> },
-    { title: '时区', dataIndex: 'mt5_session_timezone', width: 100 },
+    { title: '内部品种', dataIndex: 'symbol', width: 100, ellipsis: true, render: (v) => <EllipsisCell value={v} /> },
+    { title: 'MT5', dataIndex: 'mt5_symbol', width: 130, ellipsis: true, render: (v) => <EllipsisCell value={v} /> },
+    { title: '模板', dataIndex: 'mt5_session_template', width: 150, render: (v) => <EllipsisCell value={v || 'auto'}><Tag>{v || 'auto'}</Tag></EllipsisCell> },
+    { title: '时区', dataIndex: 'mt5_session_timezone', width: 100, ellipsis: true, render: (v) => <EllipsisCell value={v} /> },
     { title: '自动同步', dataIndex: 'mt5_session_auto_sync', width: 100, render: (v) => (v ? '是' : '否') },
     { title: '启用', dataIndex: 'mt5_session_enabled', width: 80, render: (v) => (v ? '是' : '否') },
-    { title: '来源', dataIndex: 'mt5_session_source', width: 140, ellipsis: true },
+    { title: '来源', dataIndex: 'mt5_session_source', width: 140, ellipsis: true, render: (v) => <EllipsisCell value={v} /> },
     { title: '最后同步', dataIndex: 'mt5_session_last_synced_at', width: 180, render: (v) => v ? new Date(v).toLocaleString() : '-' },
     {
       title: '操作',
@@ -189,11 +191,11 @@ export function SettingsPage() {
       )
     }
   ];
+  const symbolRows = symbols.data || [];
 
   return (
-    <Space direction="vertical" size={16} className="full-width">
+    <div className="settings-page">
       {contextHolder}
-      <Typography.Title level={3}>设置</Typography.Title>
       <Card>
         <Tabs
           items={[
@@ -312,7 +314,7 @@ export function SettingsPage() {
                 <Space direction="vertical" size={12} className="full-width">
                   <Alert type="info" showIcon message="同步 MT5 会写入最小手数、步进、合约大小和计价币种；扫描时按目标 USD 名义价值自动计算 MT5 手数和 HL 数量。" />
                   <Button type="primary" onClick={() => openSymbolModal()}>新增映射</Button>
-                  <Table rowKey="id" columns={columns} dataSource={symbols.data || []} loading={symbols.isLoading} pagination={{ pageSize: 10 }} scroll={{ x: 1200, y: 'calc(100vh - 420px)' }} />
+                  <Table rowKey="id" columns={columns} dataSource={symbolRows} loading={symbols.isLoading} tableLayout="fixed" pagination={{ pageSize: 10 }} scroll={tableScrollAutoY(1474, symbolRows.length, 'calc(100vh - 404px)', 8)} />
                 </Space>
               )
             },
@@ -322,7 +324,7 @@ export function SettingsPage() {
               children: (
                 <Space direction="vertical" size={12} className="full-width">
                   <Alert type="info" showIcon message="本地交易时段用于补充经纪商的 close-only / quote-only 规则：只平仓窗口禁止新增、允许平仓；仅报价和休市窗口禁止所有交易动作。" />
-                  <Table rowKey="id" columns={sessionColumns} dataSource={symbols.data || []} loading={symbols.isLoading} pagination={{ pageSize: 10 }} scroll={{ x: 1300, y: 'calc(100vh - 420px)' }} />
+                  <Table rowKey="id" columns={sessionColumns} dataSource={symbolRows} loading={symbols.isLoading} tableLayout="fixed" pagination={{ pageSize: 10 }} scroll={tableScrollAutoY(1190, symbolRows.length, 'calc(100vh - 404px)', 8)} />
                 </Space>
               )
             },
@@ -343,9 +345,9 @@ export function SettingsPage() {
                         dataSource={liveReadiness.data?.checks || []}
                         renderItem={(item: any) => (
                           <List.Item>
-                            <Space>
+                            <Space className="settings-readiness-line">
                               <Tag color={item.status === 'ok' ? 'green' : item.status === 'warn' ? 'gold' : 'red'}>{item.status}</Tag>
-                              <Typography.Text>{item.message}</Typography.Text>
+                              <EllipsisCell value={item.message} className="settings-readiness-message" />
                             </Space>
                           </List.Item>
                         )}
@@ -464,6 +466,6 @@ export function SettingsPage() {
           <Form.Item name="allow_hold_through_mt5_close" label="允许跨 MT5 休市持仓" valuePropName="checked"><Switch /></Form.Item>
         </Form>
       </Modal>
-    </Space>
+    </div>
   );
 }

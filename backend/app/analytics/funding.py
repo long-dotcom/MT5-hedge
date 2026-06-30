@@ -8,8 +8,10 @@ from urllib import request
 
 from sqlalchemy.orm import Session
 
+from app.adapters.venue import mapping_leg
 from app.config.settings import get_settings
-from app.db.models import SymbolMapping
+from app.db.models import ExchangeCredential, SymbolMapping
+from app.exchanges.credentials import binance_futures_funding_history
 
 
 RANGE_SECONDS = {
@@ -37,26 +39,63 @@ def funding_history(db: Session, symbol: str, range_value: str, bucket: str) -> 
     normalized_range = range_value if range_value in RANGE_SECONDS else "7d"
     normalized_bucket = bucket if bucket in BUCKET_SECONDS else "day"
     mapping = db.query(SymbolMapping).filter(SymbolMapping.symbol == symbol.upper()).first()
-    hyperliquid_symbol = mapping.hyperliquid_symbol if mapping else symbol.upper()
+    funding_leg = _funding_leg(mapping, symbol)
+    funding_venue, funding_symbol, funding_leg_name = funding_leg if funding_leg else ("", "", "")
 
     end_ms = int(time.time() * 1000)
     start_ms = end_ms - RANGE_SECONDS[normalized_range] * 1000
     source_error = ""
-    try:
-        points = fetch_funding_history(hyperliquid_symbol, start_ms, end_ms)
-    except Exception as exc:
-        source_error = str(exc)
-        points = []
+    points: list[FundingPoint] = []
+    credential: ExchangeCredential | None = None
+    supported = funding_venue in {"hyperliquid", "binance"} and bool(funding_symbol)
+    if funding_venue == "hyperliquid" and funding_symbol:
+        try:
+            points = fetch_funding_history(funding_symbol, start_ms, end_ms)
+        except Exception as exc:
+            source_error = str(exc)
+    elif funding_venue == "binance" and funding_symbol:
+        credential = db.query(ExchangeCredential).filter(ExchangeCredential.venue == "binance", ExchangeCredential.enabled.is_(True)).first()
+        if credential:
+            try:
+                points = fetch_binance_funding_history(credential, funding_symbol, start_ms, end_ms)
+            except Exception as exc:
+                source_error = str(exc)
+        else:
+            supported = False
+            source_error = "缺少已启用的 Binance 交易所配置，无法通过 Nautilus 读取资金费历史"
+    else:
+        source_error = "当前品种映射没有已支持 funding 的永续交易所腿，资金费历史暂不支持该 venue 组合"
     items = bucket_funding_points(points, normalized_bucket)
+    leg_a_venue, leg_a_symbol = mapping_leg(mapping, "a") if mapping else ("hyperliquid", symbol.upper())
+    leg_b_venue, leg_b_symbol = mapping_leg(mapping, "b") if mapping else ("mt5", "")
     return {
         "symbol": symbol.upper(),
-        "hyperliquid_symbol": hyperliquid_symbol,
+        "leg_a_venue": leg_a_venue,
+        "leg_a_symbol": leg_a_symbol,
+        "leg_b_venue": leg_b_venue,
+        "leg_b_symbol": leg_b_symbol,
+        "funding_venue": funding_venue,
+        "funding_symbol": funding_symbol,
+        "funding_leg": funding_leg_name,
+        "supported": supported,
+        "leg_a_venue_symbol": funding_symbol,
         "range": normalized_range,
         "bucket": normalized_bucket,
         "summary": summarize_funding(points, normalized_range),
         "items": items,
         "source_error": source_error,
     }
+
+
+def _funding_leg(mapping: SymbolMapping | None, symbol: str) -> tuple[str, str, str] | None:
+    if not mapping:
+        return "hyperliquid", symbol.upper(), "a"
+    funding_venues = {"hyperliquid", "binance"}
+    for leg in ("a", "b"):
+        venue, venue_symbol = mapping_leg(mapping, leg)
+        if venue in funding_venues:
+            return venue, venue_symbol, leg
+    return None
 
 
 def fetch_funding_history(coin: str, start_ms: int, end_ms: int) -> list[FundingPoint]:
@@ -72,6 +111,23 @@ def fetch_funding_history(coin: str, start_ms: int, end_ms: int) -> list[Funding
                 time=datetime.fromtimestamp(timestamp_ms / 1000, tz=timezone.utc).replace(tzinfo=None),
                 funding_rate=float(item.get("fundingRate", 0.0)),
                 premium=float(item["premium"]) if item.get("premium") is not None else None,
+            )
+        )
+    return sorted(points, key=lambda point: point.time)
+
+
+def fetch_binance_funding_history(credential: ExchangeCredential, symbol: str, start_ms: int, end_ms: int) -> list[FundingPoint]:
+    rows = binance_futures_funding_history(credential, symbol, start_ms, end_ms)
+    points: list[FundingPoint] = []
+    for item in rows:
+        timestamp_ms = int(item.get("fundingTime", 0) or 0)
+        if not timestamp_ms:
+            continue
+        points.append(
+            FundingPoint(
+                time=datetime.fromtimestamp(timestamp_ms / 1000, tz=timezone.utc).replace(tzinfo=None),
+                funding_rate=float(item.get("fundingRate", 0.0) or 0.0),
+                premium=None,
             )
         )
     return sorted(points, key=lambda point: point.time)

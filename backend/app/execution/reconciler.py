@@ -5,8 +5,9 @@ from sqlalchemy.orm import Session
 
 from app.adapters.hyperliquid import HyperliquidAdapter
 from app.adapters.mt5 import MT5Adapter
+from app.adapters.venue import build_market_adapter, NATIVE_VENUES, nautilus_venues_from_mappings
 from app.config.settings import get_settings
-from app.db.models import Alert, Fill, HedgeGroup, HedgeGroupEvent, Order, Position, SymbolMapping, SystemLog, WorkerRun
+from app.db.models import Alert, ExchangeCredential, Fill, HedgeGroup, HedgeGroupEvent, Order, Position, SymbolMapping, SystemLog, WorkerRun
 from app.db.retention import prune_table_by_id
 from app.execution.gateway import LegOrderIntent, build_execution_gateway
 from app.execution.hedge_pool import hedge_pool
@@ -47,12 +48,25 @@ def run_execution_reconcile(db: Session) -> int:
 
 def sync_live_positions(db: Session) -> int:
     adapters = [HyperliquidAdapter(live=True), MT5Adapter(live=True)]
+    settings = get_settings()
+    if getattr(settings, "nautilus_read_only_sync_enabled", True):
+        mappings = db.query(SymbolMapping).filter(SymbolMapping.enabled.is_(True)).all()
+        venues = nautilus_venues_from_mappings(mappings)
+        for (venue,) in db.query(ExchangeCredential.venue).filter(ExchangeCredential.enabled.is_(True)).all():
+            if venue not in NATIVE_VENUES and venue not in venues:
+                venues.append(venue)
+        for venue in venues:
+            adapters.append(build_market_adapter(venue, live=True))
     platforms = [adapter.platform for adapter in adapters]
     db.query(Position).filter(Position.platform.in_(platforms)).delete(synchronize_session=False)
     count = 0
     hyperliquid_dexes = _hyperliquid_position_dexes(db)
     for adapter in adapters:
-        positions = adapter.get_positions(dexes=hyperliquid_dexes) if isinstance(adapter, HyperliquidAdapter) else adapter.get_positions()
+        try:
+            positions = adapter.get_positions(dexes=hyperliquid_dexes) if isinstance(adapter, HyperliquidAdapter) else adapter.get_positions()
+        except Exception as exc:
+            db.add(SystemLog(level="warning", category="execution_reconcile", message=f"{adapter.platform} 持仓同步失败", context=str(exc)))
+            continue
         for item in positions:
             quantity = float(item.get("quantity", 0.0) or 0.0)
             if abs(quantity) <= 0:
@@ -76,7 +90,7 @@ def sync_live_positions(db: Session) -> int:
 
 def _hyperliquid_position_dexes(db: Session) -> list[str]:
     dexes: list[str] = []
-    rows = db.query(SymbolMapping.hyperliquid_symbol).filter(SymbolMapping.enabled.is_(True)).all()
+    rows = db.query(SymbolMapping.leg_a_venue_symbol).filter(SymbolMapping.enabled.is_(True)).all()
     for (symbol,) in rows:
         value = str(symbol or "")
         if ":" not in value:
@@ -120,7 +134,7 @@ def reconcile_residual_positions(db: Session) -> int:
 
 def reconcile_orphan_positions(db: Session) -> int:
     changed = 0
-    positions = db.query(Position).filter(Position.platform.in_(["hyperliquid", "mt5"])).all()
+    positions = db.query(Position).filter(Position.platform.in_(list(NATIVE_VENUES))).all()
     for position in positions:
         if abs(position.quantity) <= 0:
             continue
@@ -187,14 +201,19 @@ def _refresh_order(db: Session, group: HedgeGroup, order: Order) -> bool:
 def _recover_hyperliquid_orders_from_account(db: Session, group: HedgeGroup, orders: list[Order]) -> bool:
     if group.execution_mode != "live":
         return False
-    target_orders = [order for order in orders if order.platform == "hyperliquid" and order.status in PENDING_ORDER_STATUSES]
+    mapping = db.query(SymbolMapping).filter(SymbolMapping.symbol == group.symbol).first()
+    leg_a_venue = mapping.leg_a_venue if mapping else "hyperliquid"
+    target_orders = [order for order in orders if order.platform == leg_a_venue and order.status in PENDING_ORDER_STATUSES]
     if not target_orders:
         return False
-    gateway = build_execution_gateway(HyperliquidAdapter(live=True))
+    if leg_a_venue == "hyperliquid":
+        gateway = build_execution_gateway(HyperliquidAdapter(live=True))
+    else:
+        gateway = build_execution_gateway(build_market_adapter(leg_a_venue, live=True))
     query_account_orders = getattr(gateway, "query_account_orders", None)
     if not callable(query_account_orders):
         return False
-    snapshots = query_account_orders("hyperliquid")
+    snapshots = query_account_orders(leg_a_venue)
     if not snapshots:
         return False
     changed = False
@@ -270,7 +289,7 @@ def _same_symbol(db: Session, group: HedgeGroup, order: Order, external_symbol: 
     symbols = {order.symbol, group.symbol}
     mapping = db.query(SymbolMapping).filter(SymbolMapping.symbol == group.symbol).first()
     if mapping:
-        symbols.add(mapping.hyperliquid_symbol)
+        symbols.add(mapping.leg_a_venue_symbol)
     return external_symbol in symbols
 
 
@@ -380,24 +399,25 @@ def _auto_compensate_single_leg(db: Session, group: HedgeGroup, orders, phase: s
 
 
 def _complete_hyper_maker_with_mt5_taker(db: Session, group: HedgeGroup, platform_orders: dict[str, Order]) -> bool:
-    if set(platform_orders) != {"hyperliquid"}:
-        return False
     mapping = db.query(SymbolMapping).filter(SymbolMapping.symbol == group.symbol).first()
+    leg_a_venue = mapping.leg_a_venue if mapping else "hyperliquid"
+    if set(platform_orders) != {leg_a_venue}:
+        return False
     if not mapping or mapping.execution_style != "hyper_maker_mt5_taker":
         return False
-    hyper_order = platform_orders["hyperliquid"]
+    hyper_order = platform_orders[leg_a_venue]
     if not _order_has_position_effect(db, hyper_order):
         return False
     if _has_group_event(db, group.id, "maker_fill_mt5_taker_submitted"):
         return False
 
     hyper_fill_quantity = _order_fill_quantity(db, hyper_order.id)
-    hyper_target_quantity = float(group.hyperliquid_quantity or group.quantity or hyper_order.quantity)
+    hyper_target_quantity = float(group.leg_a_quantity or group.quantity or hyper_order.quantity)
     fill_ratio = min(max(hyper_fill_quantity / hyper_target_quantity, 0.0), 1.0) if hyper_target_quantity > 0 else 0.0
-    mt5_quantity = float(group.mt5_quantity or group.quantity or 0.0) * fill_ratio
+    mt5_quantity = float(group.leg_b_quantity or group.quantity or 0.0) * fill_ratio
     if mt5_quantity <= 0:
         return False
-    mt5_side = "sell" if group.direction == "long_hyperliquid_short_mt5" else "buy"
+    mt5_side = "sell" if group.direction == "long_leg_a_short_leg_b" else "buy"
     mt5_order = _submit_order_for_group(
         db,
         group,
@@ -428,12 +448,13 @@ def _complete_hyper_maker_with_mt5_taker(db: Session, group: HedgeGroup, platfor
 
 
 def _complete_hyper_then_mt5_after_fill(db: Session, group: HedgeGroup, platform_orders: dict[str, Order]) -> bool:
-    if set(platform_orders) != {"hyperliquid"}:
-        return False
     mapping = db.query(SymbolMapping).filter(SymbolMapping.symbol == group.symbol).first()
+    leg_a_venue = mapping.leg_a_venue if mapping else "hyperliquid"
+    if set(platform_orders) != {leg_a_venue}:
+        return False
     if not mapping or mapping.execution_style == "hyper_maker_mt5_taker":
         return False
-    hyper_order = platform_orders["hyperliquid"]
+    hyper_order = platform_orders[leg_a_venue]
     if not _order_has_position_effect(db, hyper_order):
         return False
     event_type = f"{group.status}_hyper_fill_mt5_submitted"
@@ -441,14 +462,14 @@ def _complete_hyper_then_mt5_after_fill(db: Session, group: HedgeGroup, platform
         return False
 
     hyper_fill_quantity = _order_fill_quantity(db, hyper_order.id)
-    hyper_target_quantity = float(group.hyperliquid_quantity or group.quantity or hyper_order.quantity)
+    hyper_target_quantity = float(group.leg_a_quantity or group.quantity or hyper_order.quantity)
     fill_ratio = min(max(hyper_fill_quantity / hyper_target_quantity, 0.0), 1.0) if hyper_target_quantity > 0 else 0.0
-    mt5_quantity = float(group.mt5_quantity or group.quantity or 0.0) * fill_ratio
+    mt5_quantity = float(group.leg_b_quantity or group.quantity or 0.0) * fill_ratio
     if mt5_quantity <= 0:
         return False
 
     if group.status == "opening":
-        mt5_side = "sell" if group.direction == "long_hyperliquid_short_mt5" else "buy"
+        mt5_side = "sell" if group.direction == "long_leg_a_short_leg_b" else "buy"
         order_type = mapping.mt5_open_order_type
         reduce_only = False
         success_status = "open"
@@ -457,7 +478,7 @@ def _complete_hyper_then_mt5_after_fill(db: Session, group: HedgeGroup, platform
         failure_title = "MT5 开仓补单失败"
         success_detail = "Hyperliquid 成交后 MT5 开仓补单完成"
     else:
-        mt5_side = "buy" if group.direction == "long_hyperliquid_short_mt5" else "sell"
+        mt5_side = "buy" if group.direction == "long_leg_a_short_leg_b" else "sell"
         order_type = mapping.mt5_close_order_type
         reduce_only = True
         success_status = "closed"
@@ -570,10 +591,10 @@ def _submit_compensation_order(db: Session, group: HedgeGroup, filled_order: Ord
 def _venue_symbol_for_order(group: HedgeGroup, order: Order, mapping: SymbolMapping | None) -> str:
     if not mapping:
         return order.symbol
-    if order.platform == "mt5":
+    if order.platform == mapping.leg_b_venue or order.platform == "mt5":
         return mapping.mt5_symbol
-    if order.platform == "hyperliquid":
-        return mapping.hyperliquid_symbol
+    if order.platform == mapping.leg_a_venue or order.platform == "hyperliquid":
+        return mapping.leg_a_venue_symbol
     return group.symbol
 
 
@@ -633,13 +654,15 @@ def _cancel_pending_orders(group: HedgeGroup, orders) -> list[str]:
 
 def _residual_positions_for_group(db: Session, group: HedgeGroup) -> list[Position]:
     mapping = db.query(SymbolMapping).filter(SymbolMapping.symbol == group.symbol).first()
+    leg_a_venue = mapping.leg_a_venue if mapping else "hyperliquid"
+    leg_b_venue = mapping.leg_b_venue if mapping else "mt5"
     symbols = {
-        "hyperliquid": {group.symbol},
-        "mt5": {group.symbol},
+        leg_a_venue: {group.symbol},
+        leg_b_venue: {group.symbol},
     }
     if mapping:
-        symbols["hyperliquid"].add(mapping.hyperliquid_symbol)
-        symbols["mt5"].add(mapping.mt5_symbol)
+        symbols[leg_a_venue].add(mapping.leg_a_venue_symbol)
+        symbols[leg_b_venue].add(mapping.mt5_symbol)
     residual: list[Position] = []
     for platform, names in symbols.items():
         rows = db.query(Position).filter(Position.platform == platform, Position.symbol.in_(names)).all()
@@ -653,18 +676,20 @@ def _position_has_live_group(db: Session, position: Position) -> bool:
 
 
 def _position_matches_group(db: Session, position: Position, group: HedgeGroup) -> bool:
-    if position.platform not in {"hyperliquid", "mt5"}:
-        return False
     mapping = db.query(SymbolMapping).filter(SymbolMapping.symbol == group.symbol).first()
+    leg_a_venue = mapping.leg_a_venue if mapping else "hyperliquid"
+    leg_b_venue = mapping.leg_b_venue if mapping else "mt5"
+    if position.platform not in {leg_a_venue, leg_b_venue}:
+        return False
     symbols = {
-        "hyperliquid": {group.symbol},
-        "mt5": {group.symbol},
+        leg_a_venue: {group.symbol},
+        leg_b_venue: {group.symbol},
     }
     if mapping:
-        if mapping.hyperliquid_symbol:
-            symbols["hyperliquid"].add(mapping.hyperliquid_symbol)
+        if mapping.leg_a_venue_symbol:
+            symbols[leg_a_venue].add(mapping.leg_a_venue_symbol)
         if mapping.mt5_symbol:
-            symbols["mt5"].add(mapping.mt5_symbol)
+            symbols[leg_b_venue].add(mapping.mt5_symbol)
     if position.symbol not in symbols.get(position.platform, set()):
         return False
     if _position_side(position.side) != _expected_position_side(group.direction, position.platform):
@@ -679,16 +704,20 @@ def _position_matches_group(db: Session, position: Position, group: HedgeGroup) 
 
 
 def _expected_position_side(direction: str, platform: str) -> str:
-    if direction == "long_hyperliquid_short_mt5":
-        return "long" if platform == "hyperliquid" else "short"
+    if direction == "long_leg_a_short_leg_b":
+        # Determine which platform is leg_a by checking mappings
+        # Default behavior: hyperliquid is leg_a
+        if platform == "hyperliquid":
+            return "long"
+        return "short"
     return "short" if platform == "hyperliquid" else "long"
 
 
 def _expected_position_quantity(group: HedgeGroup, platform: str) -> float:
     if platform == "hyperliquid":
-        value = group.hyperliquid_quantity
+        value = group.leg_a_quantity
     else:
-        value = group.mt5_quantity
+        value = group.leg_b_quantity
     return float(group.quantity if value is None else value)
 
 

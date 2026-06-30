@@ -50,6 +50,7 @@ class Settings:
     access_token_minutes: int = 720
     admin_username: str = "admin"
     admin_password: str = INSECURE_DEFAULT_ADMIN_PASSWORD
+    exchange_config_secret: str = ""
     default_execution_mode: str = "paper"
     symbol_mapping_path: str = str(ROOT_DIR / "config" / "symbol_mappings.yaml")
     live_trading_enabled: bool = False
@@ -95,6 +96,12 @@ class Settings:
     fx_fallback_rates: str = '{"JPY":0.00625}'
     cost_cache_ttl_seconds: int = 60
     carry_cost_sync_interval_seconds: int = 300
+    nautilus_enabled: bool = False
+    nautilus_read_only_sync_enabled: bool = True
+    nautilus_quote_poll_interval_ms: int = 1000
+    nautilus_allowed_venues: str = "binance,okx,bybit"
+    nautilus_environment: str = "sandbox"
+    nautilus_credentials_json: str = "{}"
 
     hyperliquid_account_address: str = ""
     execution_reconcile_pending_stale_seconds: int = 300

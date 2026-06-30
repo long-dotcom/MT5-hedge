@@ -1,0 +1,85 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 340" font-family="'Segoe UI', system-ui, sans-serif">
+  <defs>
+    <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#64748b"/>
+    </marker>
+    <marker id="arr-r" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#dc2626"/>
+    </marker>
+    <marker id="arr-g" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#16a34a"/>
+    </marker>
+  </defs>
+
+  <rect width="800" height="340" rx="8" fill="#f8fafc"/>
+
+  <!-- Gate 1: Market -->
+  <rect x="30" y="40" width="150" height="70" rx="6" fill="#dbeafe" stroke="#93c5fd" stroke-width="1.5"/>
+  <text x="105" y="65" text-anchor="middle" font-size="13" font-weight="600" fill="#1e40af">Gate 1</text>
+  <text x="105" y="82" text-anchor="middle" font-size="11" fill="#1e40af">Market Gate</text>
+  <text x="105" y="98" text-anchor="middle" font-size="9" fill="#3b82f6">品种资格 · 报价同步</text>
+
+  <!-- Arrow 1→2 -->
+  <line x1="180" y1="75" x2="210" y2="75" stroke="#64748b" stroke-width="1.5" marker-end="url(#arr)"/>
+
+  <!-- Gate 2: Signal -->
+  <rect x="215" y="40" width="150" height="70" rx="6" fill="#dcfce7" stroke="#86efac" stroke-width="1.5"/>
+  <text x="290" y="65" text-anchor="middle" font-size="13" font-weight="600" fill="#166534">Gate 2</text>
+  <text x="290" y="82" text-anchor="middle" font-size="11" fill="#166534">Signal Gate</text>
+  <text x="290" y="98" text-anchor="middle" font-size="9" fill="#16a34a">价差 · 成本 · 利润 · 统计线</text>
+
+  <!-- Arrow 2→3 -->
+  <line x1="365" y1="75" x2="395" y2="75" stroke="#64748b" stroke-width="1.5" marker-end="url(#arr)"/>
+
+  <!-- Gate 3: Risk Tags -->
+  <rect x="400" y="40" width="150" height="70" rx="6" fill="#fef3c7" stroke="#fcd34d" stroke-width="1.5"/>
+  <text x="475" y="65" text-anchor="middle" font-size="13" font-weight="600" fill="#92400e">Gate 3</text>
+  <text x="475" y="82" text-anchor="middle" font-size="11" fill="#92400e">Risk Tags</text>
+  <text x="475" y="98" text-anchor="middle" font-size="9" fill="#d97706">仅标签 · 不阻断</text>
+
+  <!-- Arrow 3→4 -->
+  <line x1="550" y1="75" x2="580" y2="75" stroke="#64748b" stroke-width="1.5" marker-end="url(#arr)"/>
+
+  <!-- Gate 4: Liquidity -->
+  <rect x="585" y="40" width="150" height="70" rx="6" fill="#fce7f3" stroke="#f9a8d4" stroke-width="1.5"/>
+  <text x="660" y="65" text-anchor="middle" font-size="13" font-weight="600" fill="#9d174d">Gate 4</text>
+  <text x="660" y="82" text-anchor="middle" font-size="11" fill="#9d174d">Liquidity Gate</text>
+  <text x="660" y="98" text-anchor="middle" font-size="9" fill="#ec4899">HL L2 深度检查</text>
+
+  <!-- Result: executable -->
+  <line x1="660" y1="110" x2="660" y2="145" stroke="#16a34a" stroke-width="1.5" marker-end="url(#arr-g)"/>
+  <rect x="590" y="150" width="140" height="40" rx="20" fill="#dcfce7" stroke="#16a34a" stroke-width="2"/>
+  <text x="660" y="175" text-anchor="middle" font-size="13" font-weight="700" fill="#166534">executable</text>
+
+  <!-- Rejected outputs -->
+  <line x1="105" y1="110" x2="105" y2="145" stroke="#dc2626" stroke-width="1.5" marker-end="url(#arr-r)"/>
+  <rect x="40" y="150" width="130" height="36" rx="18" fill="#fef2f2" stroke="#dc2626" stroke-width="1.5"/>
+  <text x="105" y="173" text-anchor="middle" font-size="12" font-weight="600" fill="#dc2626">rejected</text>
+
+  <line x1="290" y1="110" x2="290" y2="145" stroke="#dc2626" stroke-width="1.5" marker-end="url(#arr-r)"/>
+  <rect x="225" y="150" width="130" height="36" rx="18" fill="#fef2f2" stroke="#dc2626" stroke-width="1.5"/>
+  <text x="290" y="173" text-anchor="middle" font-size="12" font-weight="600" fill="#dc2626">rejected</text>
+
+  <line x1="475" y1="110" x2="475" y2="145" stroke="#d97706" stroke-width="1.5" marker-end="url(#arr)"/>
+  <rect x="410" y="150" width="130" height="36" rx="18" fill="#fffbeb" stroke="#d97706" stroke-width="1.5"/>
+  <text x="475" y="173" text-anchor="middle" font-size="12" font-weight="600" fill="#92400e">candidate</text>
+
+  <!-- Bottom: Signal state machine -->
+  <text x="400" y="225" text-anchor="middle" font-size="14" font-weight="600" fill="#334155">信号状态机</text>
+  <rect x="80" y="248" width="110" height="36" rx="18" fill="#fef2f2" stroke="#fca5a5" stroke-width="1.2"/>
+  <text x="135" y="271" text-anchor="middle" font-size="12" fill="#dc2626">rejected</text>
+  <line x1="190" y1="266" x2="230" y2="266" stroke="#64748b" stroke-width="1.2" marker-end="url(#arr)"/>
+
+  <rect x="235" y="248" width="120" height="36" rx="18" fill="#fffbeb" stroke="#fcd34d" stroke-width="1.2"/>
+  <text x="295" y="271" text-anchor="middle" font-size="12" fill="#92400e">candidate</text>
+  <line x1="355" y1="266" x2="395" y2="266" stroke="#64748b" stroke-width="1.2" marker-end="url(#arr)"/>
+
+  <rect x="400" y="248" width="130" height="36" rx="18" fill="#dcfce7" stroke="#86efac" stroke-width="1.2"/>
+  <text x="465" y="271" text-anchor="middle" font-size="12" fill="#166534">executable</text>
+  <line x1="530" y1="266" x2="570" y2="266" stroke="#64748b" stroke-width="1.2" marker-end="url(#arr)"/>
+
+  <rect x="575" y="248" width="120" height="36" rx="18" fill="#dbeafe" stroke="#93c5fd" stroke-width="1.2"/>
+  <text x="635" y="271" text-anchor="middle" font-size="12" fill="#1e40af">executed</text>
+
+  <text x="400" y="315" text-anchor="middle" font-size="10" fill="#94a3b8">每 100ms 扫描周期，每个品种 × 每个方向独立评估</text>
+</svg>

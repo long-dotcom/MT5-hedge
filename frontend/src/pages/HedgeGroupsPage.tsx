@@ -8,6 +8,7 @@ import { useHeaderStreamStatus } from '../components/HeaderStreamStatus';
 import { usePageStream } from '../hooks/useLiveStream';
 import { executionModeLabel, fmtAdaptive, fmtMoney, fmtSpread } from '../utils/format';
 import { tableScrollAutoY } from '../utils/tableScroll';
+import { legTitle, venueLabel } from '../utils/venues';
 
 function statusTag(status: string) {
   const map: Record<string, { label: string; color: string }> = {
@@ -23,20 +24,22 @@ function statusTag(status: string) {
   return <Tag color={item.color}>{item.label}</Tag>;
 }
 
-function directionTags(direction: string) {
-  if (direction === 'long_hyperliquid_short_mt5') {
+function directionTags(direction: string, row?: any) {
+  const legAName = venueLabel(row?.leg_a_venue);
+  const legBName = venueLabel(row?.leg_b_venue);
+  if (direction === 'long_leg_a_short_leg_b') {
     return (
       <Space size={4}>
-        <Tag color="green">HL 多</Tag>
-        <Tag color="red">MT5 空</Tag>
+        <Tag color="green">{legAName} 多</Tag>
+        <Tag color="red">{legBName} 空</Tag>
       </Space>
     );
   }
-  if (direction === 'long_mt5_short_hyperliquid') {
+  if (direction === 'long_leg_b_short_leg_a') {
     return (
       <Space size={4}>
-        <Tag color="green">MT5 多</Tag>
-        <Tag color="red">HL 空</Tag>
+        <Tag color="green">{legBName} 多</Tag>
+        <Tag color="red">{legAName} 空</Tag>
       </Space>
     );
   }
@@ -49,18 +52,18 @@ function fmtCarryCost(value?: number) {
 }
 
 function hasTriggerPrices(row: any) {
-  return ['trigger_hyperliquid_bid', 'trigger_hyperliquid_ask', 'trigger_mt5_bid', 'trigger_mt5_ask'].some((key) => Number(row[key] || 0) !== 0);
+  return ['trigger_leg_a_bid', 'trigger_leg_a_ask', 'trigger_leg_b_bid', 'trigger_leg_b_ask'].some((key) => Number(row[key] || 0) !== 0);
 }
 
 function detailItems(row: any) {
   return [
-    { key: 'mt5_quantity', label: 'MT5 数量', children: fmtAdaptive(row.mt5_quantity, 2, 6) },
-    { key: 'hyperliquid_quantity', label: 'HL 数量', children: fmtAdaptive(row.hyperliquid_quantity, 4, 8) },
+    { key: 'leg_b_quantity', label: `${legTitle(row, 'b')} 数量`, children: fmtAdaptive(row.leg_b_quantity, 2, 6) },
+    { key: 'leg_a_quantity', label: `${legTitle(row, 'a')} 数量`, children: fmtAdaptive(row.leg_a_quantity, 4, 8) },
     { key: 'trigger_spread', label: '触发价差', children: fmtSpread(row.trigger_spread) },
-    { key: 'trigger_hl_bid', label: '触发 HL Bid', children: hasTriggerPrices(row) ? fmtAdaptive(row.trigger_hyperliquid_bid, 2, 8) : '-' },
-    { key: 'trigger_hl_ask', label: '触发 HL Ask', children: hasTriggerPrices(row) ? fmtAdaptive(row.trigger_hyperliquid_ask, 2, 8) : '-' },
-    { key: 'trigger_mt5_bid', label: '触发 MT5 Bid', children: hasTriggerPrices(row) ? fmtAdaptive(row.trigger_mt5_bid, 2, 8) : '-' },
-    { key: 'trigger_mt5_ask', label: '触发 MT5 Ask', children: hasTriggerPrices(row) ? fmtAdaptive(row.trigger_mt5_ask, 2, 8) : '-' },
+    { key: 'trigger_leg_a_bid', label: `触发 ${legTitle(row, 'a')} Bid`, children: hasTriggerPrices(row) ? fmtAdaptive(row.trigger_leg_a_bid, 2, 8) : '-' },
+    { key: 'trigger_leg_a_ask', label: `触发 ${legTitle(row, 'a')} Ask`, children: hasTriggerPrices(row) ? fmtAdaptive(row.trigger_leg_a_ask, 2, 8) : '-' },
+    { key: 'trigger_leg_b_bid', label: `触发 ${legTitle(row, 'b')} Bid`, children: hasTriggerPrices(row) ? fmtAdaptive(row.trigger_leg_b_bid, 2, 8) : '-' },
+    { key: 'trigger_leg_b_ask', label: `触发 ${legTitle(row, 'b')} Ask`, children: hasTriggerPrices(row) ? fmtAdaptive(row.trigger_leg_b_ask, 2, 8) : '-' },
     { key: 'entry_spread', label: '真实开仓价差', children: fmtSpread(row.entry_spread) },
     { key: 'current_entry_spread', label: '当前重新入场价差', children: row.current_entry_spread == null ? '-' : fmtSpread(row.current_entry_spread) },
     { key: 'current_close_spread', label: '当前平仓价差', children: row.current_close_spread == null ? '-' : fmtSpread(row.current_close_spread) },
@@ -70,8 +73,8 @@ function detailItems(row: any) {
     { key: 'exit_target', label: '退出线（平仓价差分位）', children: fmtSpread(row.exit_target) },
     { key: 'open_cost', label: '开仓成本', children: fmtMoney(row.open_cost) },
     { key: 'fees', label: '手续费成本', children: fmtMoney(row.fees) },
-    { key: 'funding', label: 'HL 资金费', children: fmtCarryCost(row.funding) },
-    { key: 'swap', label: 'MT5 隔夜费', children: fmtCarryCost(row.swap) },
+    { key: 'funding', label: `${venueLabel(row.leg_a_venue)} 资金费`, children: fmtCarryCost(row.funding) },
+    { key: 'swap', label: `${venueLabel(row.leg_b_venue)} 隔夜费`, children: fmtCarryCost(row.swap) },
     { key: 'realized_pnl', label: '已实现', children: fmtMoney(row.realized_pnl) },
     { key: 'unrealized_pnl', label: '未实现', children: fmtMoney(row.unrealized_pnl) },
     { key: 'source', label: '来源', children: <EllipsisCell value={row.source} /> },
@@ -109,7 +112,7 @@ export function HedgeGroupsPage() {
   const columns: ColumnsType<any> = [
     { title: 'ID', dataIndex: 'id', width: 64, align: 'right' },
     { title: '品种', dataIndex: 'symbol', width: 82, ellipsis: true, render: (v) => <EllipsisCell value={v} /> },
-    { title: '方向', dataIndex: 'direction', width: 162, render: directionTags },
+    { title: '方向', dataIndex: 'direction', width: 190, render: (v, row) => directionTags(v, row) },
     { title: '状态', dataIndex: 'status', width: 82, render: statusTag },
     { title: '模式', dataIndex: 'execution_mode', width: 74, render: executionModeLabel },
     { title: '名义价值', dataIndex: 'notional', width: 104, align: 'right', render: (v) => <EllipsisCell value={fmtMoney(v)} align="right" /> },
@@ -117,8 +120,8 @@ export function HedgeGroupsPage() {
     { title: '触发价差', dataIndex: 'trigger_spread', width: 100, align: 'right', render: (v) => <EllipsisCell value={fmtSpread(v)} align="right" /> },
     { title: '开仓价差', dataIndex: 'entry_spread', width: 100, align: 'right', render: (v) => <EllipsisCell value={fmtSpread(v)} align="right" /> },
     { title: '平仓价差', dataIndex: 'current_close_spread', width: 100, align: 'right', render: (v) => <EllipsisCell value={v == null ? '-' : fmtSpread(v)} align="right" /> },
-    { title: '资金费', dataIndex: 'funding', width: 92, align: 'right', render: (v) => <EllipsisCell value={fmtCarryCost(v)} align="right" /> },
-    { title: '隔夜费', dataIndex: 'swap', width: 92, align: 'right', render: (v) => <EllipsisCell value={fmtCarryCost(v)} align="right" /> },
+    { title: '资金费', dataIndex: 'funding', width: 92, align: 'right', render: (v, row) => <EllipsisCell value={`${venueLabel(row.leg_a_venue)} ${fmtCarryCost(v)}`} align="right" /> },
+    { title: '隔夜费', dataIndex: 'swap', width: 92, align: 'right', render: (v, row) => <EllipsisCell value={`${venueLabel(row.leg_b_venue)} ${fmtCarryCost(v)}`} align="right" /> },
     { title: 'PnL', width: 92, align: 'right', render: (_, row) => <EllipsisCell value={fmtMoney(Number(row.realized_pnl || 0) + Number(row.unrealized_pnl || 0))} align="right" /> },
     { title: '操作', fixed: 'right', width: 86, render: (_, row) => <Button size="small" disabled={!['open', 'open_partial', 'manual_intervention'].includes(row.status)} onClick={() => close.mutate(row.id)}>平仓</Button> }
   ];

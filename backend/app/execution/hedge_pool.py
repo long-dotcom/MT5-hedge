@@ -22,8 +22,8 @@ class HedgeGroupSnapshot:
     execution_mode: str
     notional: float
     quantity: float
-    mt5_quantity: float
-    hyperliquid_quantity: float
+    leg_b_quantity: float
+    leg_a_quantity: float
     open_cost: float
     fees: float
     funding: float
@@ -50,8 +50,8 @@ class HedgeGroupSnapshot:
             execution_mode=str(row.execution_mode),
             notional=float(row.notional or 0.0),
             quantity=float(row.quantity or 0.0),
-            mt5_quantity=float(row.mt5_quantity if row.mt5_quantity is not None else row.quantity or 0.0),
-            hyperliquid_quantity=float(row.hyperliquid_quantity if row.hyperliquid_quantity is not None else row.quantity or 0.0),
+            leg_b_quantity=float(row.leg_b_quantity if row.leg_b_quantity is not None else row.quantity or 0.0),
+            leg_a_quantity=float(row.leg_a_quantity if row.leg_a_quantity is not None else row.quantity or 0.0),
             open_cost=float(row.open_cost or 0.0),
             fees=float(row.fees or 0.0),
             funding=float(row.funding or 0.0),

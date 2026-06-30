@@ -6,25 +6,99 @@ import { api } from '../api/client';
 import { EllipsisCell } from '../components/EllipsisCell';
 import { RISK_MODE_MAP } from '../utils/format';
 import { tableScrollAutoY } from '../utils/tableScroll';
+import { legTitle, venueLabel } from '../utils/venues';
+
+type CredentialField = {
+  name: string;
+  label: string;
+  secret?: boolean;
+};
+
+function credentialFieldsForVenue(venue: string): CredentialField[] {
+  const normalized = (venue || '').toLowerCase();
+  if (normalized === 'okx') {
+    return [
+      { name: 'api_key', label: 'API Key', secret: true },
+      { name: 'api_secret', label: 'API Secret', secret: true },
+      { name: 'passphrase', label: 'Passphrase', secret: true }
+    ];
+  }
+  if (normalized === 'mt5') {
+    return [
+      { name: 'login', label: 'Login' },
+      { name: 'password', label: 'Password', secret: true },
+      { name: 'server', label: 'Server' }
+    ];
+  }
+  if (normalized === 'hyperliquid') {
+    return [
+      { name: 'account_address', label: 'Account Address' },
+      { name: 'secret_key', label: 'Secret Key', secret: true }
+    ];
+  }
+  return [
+    { name: 'api_key', label: 'API Key', secret: true },
+    { name: 'api_secret', label: 'API Secret', secret: true }
+  ];
+}
 
 export function SettingsPage() {
   const queryClient = useQueryClient();
   const [messageApi, contextHolder] = message.useMessage();
   const [symbolForm] = Form.useForm();
   const [sessionForm] = Form.useForm();
+  const [exchangeForm] = Form.useForm();
   const [editingSymbol, setEditingSymbol] = useState<any | null>(null);
   const [editingSession, setEditingSession] = useState<any | null>(null);
+  const [editingExchange, setEditingExchange] = useState<any | null>(null);
   const [symbolModalOpen, setSymbolModalOpen] = useState(false);
   const [sessionModalOpen, setSessionModalOpen] = useState(false);
+  const [exchangeModalOpen, setExchangeModalOpen] = useState(false);
   const strategy = useQuery({ queryKey: ['settings-strategy'], queryFn: async () => (await api.get('/settings/strategy')).data });
   const risk = useQuery({ queryKey: ['settings-risk'], queryFn: async () => (await api.get('/settings/risk')).data });
   const symbols = useQuery({ queryKey: ['settings-symbols'], queryFn: async () => (await api.get('/settings/symbol-mappings')).data });
+  const exchanges = useQuery({ queryKey: ['settings-exchanges'], queryFn: async () => (await api.get('/settings/exchanges')).data });
   const sessionTemplates = useQuery({ queryKey: ['settings-mt5-session-templates'], queryFn: async () => (await api.get('/settings/mt5-session-templates')).data });
   const live = useQuery({ queryKey: ['settings-live'], queryFn: async () => (await api.get('/settings/live-trading')).data });
   const liveReadiness = useQuery({ queryKey: ['settings-live-readiness'], queryFn: async () => (await api.get('/settings/live-readiness')).data });
+  const venueOptions = [
+    { value: 'hyperliquid', label: 'Hyperliquid(native)' },
+    { value: 'mt5', label: 'MT5(native)' },
+    { value: 'binance', label: 'Binance(Nautilus)' },
+    { value: 'okx', label: 'OKX(Nautilus)' },
+    { value: 'bybit', label: 'Bybit(Nautilus)' }
+  ];
+  const selectedExchangeVenue = Form.useWatch('venue', exchangeForm) || 'binance';
+  const exchangeCredentialFields = credentialFieldsForVenue(selectedExchangeVenue);
   const saveStrategy = useMutation({ mutationFn: async (v: any) => (await api.put('/settings/strategy', v)).data, onSuccess: () => { messageApi.success('策略已保存'); queryClient.invalidateQueries({ queryKey: ['settings-strategy'] }); } });
   const saveRisk = useMutation({ mutationFn: async (v: any) => (await api.put('/settings/risk', v)).data, onSuccess: () => { messageApi.success('风控已保存'); queryClient.invalidateQueries({ queryKey: ['settings-risk'] }); } });
   const saveLive = useMutation({ mutationFn: async (v: any) => (await api.put('/settings/live-trading', v)).data, onSuccess: () => { messageApi.success('实盘开关已保存'); queryClient.invalidateQueries({ queryKey: ['settings-live'] }); queryClient.invalidateQueries({ queryKey: ['settings-live-readiness'] }); } });
+  const saveExchange = useMutation({
+    mutationFn: async (v: any) => editingExchange ? (await api.put(`/settings/exchanges/${editingExchange.venue}`, v)).data : (await api.post('/settings/exchanges', v)).data,
+    onSuccess: () => {
+      messageApi.success('交易所配置已保存');
+      setExchangeModalOpen(false);
+      setEditingExchange(null);
+      exchangeForm.resetFields();
+      queryClient.invalidateQueries({ queryKey: ['settings-exchanges'] });
+    },
+    onError: (err: any) => messageApi.error(err.response?.data?.detail || '保存失败')
+  });
+  const deleteExchange = useMutation({
+    mutationFn: async (venue: string) => (await api.delete(`/settings/exchanges/${venue}`)).data,
+    onSuccess: () => { messageApi.success('交易所配置已删除'); queryClient.invalidateQueries({ queryKey: ['settings-exchanges'] }); }
+  });
+  const testExchange = useMutation({
+    mutationFn: async (venue: string) => (await api.post(`/settings/exchanges/${venue}/test`)).data,
+    onSuccess: (data) => {
+      const text = data.last_test_message || '配置检查完成';
+      if (data.last_test_status === 'ok') messageApi.success(text);
+      else if (data.last_test_status === 'warning') messageApi.warning(text);
+      else messageApi.error(text);
+      queryClient.invalidateQueries({ queryKey: ['settings-exchanges'] });
+    },
+    onError: (err: any) => messageApi.error(err.response?.data?.detail || '检查失败')
+  });
   const saveSymbol = useMutation({
     mutationFn: async (v: any) => editingSymbol ? (await api.put(`/settings/symbol-mappings/${editingSymbol.id}`, v)).data : (await api.post('/settings/symbol-mappings', v)).data,
     onSuccess: () => {
@@ -78,10 +152,21 @@ export function SettingsPage() {
   });
   const openSymbolModal = (row?: any) => {
     setEditingSymbol(row || null);
-    symbolForm.setFieldsValue(row || {
+    const normalizedRow = row ? {
+      ...row,
+      leg_a_venue: row.leg_a_venue || 'hyperliquid',
+      leg_a_symbol: row.leg_a_symbol || row.leg_a_venue_symbol,
+      leg_b_venue: row.leg_b_venue || 'mt5',
+      leg_b_symbol: row.leg_b_symbol || row.mt5_symbol
+    } : null;
+    symbolForm.setFieldsValue(normalizedRow || {
       symbol: '',
-      hyperliquid_symbol: '',
+      leg_a_venue_symbol: '',
       mt5_symbol: '',
+      leg_a_venue: 'hyperliquid',
+      leg_a_symbol: '',
+      leg_b_venue: 'mt5',
+      leg_b_symbol: '',
       base_asset: '',
       quote_asset: 'USD',
       contract_multiplier: 1,
@@ -96,8 +181,8 @@ export function SettingsPage() {
       mt5_currency_margin: 'USD',
       mt5_calc_mode: 0,
       mt5_min_base_size: 0,
-      hyperliquid_min_base_size: 0,
-      hyperliquid_min_notional: 10,
+      leg_a_min_base_size: 0,
+      leg_a_min_notional: 10,
       execution_style: 'taker_taker',
       hl_open_order_type: 'market',
       hl_close_order_type: 'market',
@@ -143,14 +228,57 @@ export function SettingsPage() {
     });
     setSessionModalOpen(true);
   };
+  const openExchangeModal = (row?: any) => {
+    setEditingExchange(row || null);
+    exchangeForm.setFieldsValue(row ? {
+      venue: row.venue,
+      display_name: row.display_name,
+      environment: row.environment || 'sandbox',
+      enabled: row.enabled,
+      read_only: row.read_only,
+      credentials: {}
+    } : {
+      venue: 'binance',
+      display_name: 'Binance',
+      environment: 'sandbox',
+      enabled: false,
+      read_only: true,
+      credentials: {}
+    });
+    setExchangeModalOpen(true);
+  };
+  const exchangeColumns: ColumnsType<any> = [
+    { title: '交易所', dataIndex: 'venue', width: 120, ellipsis: true, render: (v) => <Tag>{venueLabel(v)}</Tag> },
+    { title: '名称', dataIndex: 'display_name', width: 140, ellipsis: true, render: (v) => <EllipsisCell value={v} /> },
+    { title: '环境', dataIndex: 'environment', width: 100, render: (v) => <Tag>{v}</Tag> },
+    { title: '启用', dataIndex: 'enabled', width: 80, render: (v) => (v ? '是' : '否') },
+    { title: '只读', dataIndex: 'read_only', width: 80, render: (v) => (v ? '是' : '否') },
+    { title: '凭证', dataIndex: 'configured', width: 90, render: (v) => (v ? '已保存' : '未配置') },
+    { title: '指纹', dataIndex: 'credentials_fingerprint', width: 130, ellipsis: true, render: (v) => <EllipsisCell value={v || '-'} /> },
+    { title: '检查', width: 180, render: (_, row) => <EllipsisCell value={`${row.last_test_status || 'untested'} ${row.last_test_message || ''}`} /> },
+    {
+      title: '操作',
+      fixed: 'right',
+      width: 220,
+      render: (_, row) => (
+        <Space>
+          <Button size="small" onClick={() => openExchangeModal(row)}>编辑</Button>
+          <Button size="small" loading={testExchange.isPending} onClick={() => testExchange.mutate(row.venue)}>检查</Button>
+          <Popconfirm title="确认删除该交易所配置？" onConfirm={() => deleteExchange.mutate(row.venue)}>
+            <Button size="small" danger>删除</Button>
+          </Popconfirm>
+        </Space>
+      )
+    }
+  ];
   const columns: ColumnsType<any> = [
     { title: '内部品种', dataIndex: 'symbol', width: 100, ellipsis: true, render: (v) => <EllipsisCell value={v} /> },
-    { title: 'Hyperliquid', dataIndex: 'hyperliquid_symbol', width: 128, ellipsis: true, render: (v) => <EllipsisCell value={v} /> },
-    { title: 'MT5', dataIndex: 'mt5_symbol', width: 116, ellipsis: true, render: (v) => <EllipsisCell value={v} /> },
-    { title: 'MT5最小手数', dataIndex: 'mt5_min_lot', width: 116 },
-    { title: 'MT5步进', dataIndex: 'mt5_volume_step', width: 104 },
-    { title: '合约大小', dataIndex: 'mt5_contract_size', width: 104 },
-    { title: '盈亏币种', dataIndex: 'mt5_currency_profit', width: 96, ellipsis: true, render: (v) => <EllipsisCell value={v} /> },
+    { title: '交易所 A', width: 190, ellipsis: true, render: (_, row) => <EllipsisCell value={legTitle(row, 'a')} /> },
+    { title: '交易所 B', width: 190, ellipsis: true, render: (_, row) => <EllipsisCell value={legTitle(row, 'b')} /> },
+    { title: 'MT5专属最小手数', dataIndex: 'mt5_min_lot', width: 138 },
+    { title: 'MT5专属步进', dataIndex: 'mt5_volume_step', width: 124 },
+    { title: 'MT5合约大小', dataIndex: 'mt5_contract_size', width: 116 },
+    { title: 'MT5盈亏币种', dataIndex: 'mt5_currency_profit', width: 110, ellipsis: true, render: (v) => <EllipsisCell value={v} /> },
     { title: '买入价差下限', dataIndex: 'min_entry_spread', width: 130 },
     { title: '卖出价差上限', dataIndex: 'max_close_spread', width: 130 },
     { title: '执行方式', dataIndex: 'execution_style', ellipsis: true, width: 150, render: (v) => <EllipsisCell value={v} /> },
@@ -172,7 +300,7 @@ export function SettingsPage() {
   ];
   const sessionColumns: ColumnsType<any> = [
     { title: '内部品种', dataIndex: 'symbol', width: 100, ellipsis: true, render: (v) => <EllipsisCell value={v} /> },
-    { title: 'MT5', dataIndex: 'mt5_symbol', width: 130, ellipsis: true, render: (v) => <EllipsisCell value={v} /> },
+    { title: 'MT5 品种', dataIndex: 'mt5_symbol', width: 130, ellipsis: true, render: (v) => <EllipsisCell value={v} /> },
     { title: '模板', dataIndex: 'mt5_session_template', width: 150, render: (v) => <EllipsisCell value={v || 'auto'}><Tag>{v || 'auto'}</Tag></EllipsisCell> },
     { title: '时区', dataIndex: 'mt5_session_timezone', width: 100, ellipsis: true, render: (v) => <EllipsisCell value={v} /> },
     { title: '自动同步', dataIndex: 'mt5_session_auto_sync', width: 100, render: (v) => (v ? '是' : '否') },
@@ -260,10 +388,10 @@ export function SettingsPage() {
                         <Form.Item name="paper_use_live_account_risk" label="Paper 使用真实账户资金风控" valuePropName="checked"><Switch /></Form.Item>
                         <Form.Item name="paper_decision_delay_ms_min" label="Paper 决策延迟最小毫秒"><InputNumber min={0} step={10} /></Form.Item>
                         <Form.Item name="paper_decision_delay_ms_max" label="Paper 决策延迟最大毫秒"><InputNumber min={0} step={10} /></Form.Item>
-                        <Form.Item name="paper_hyperliquid_latency_ms_min" label="Paper Hyperliquid 延迟最小毫秒"><InputNumber min={0} step={10} /></Form.Item>
-                        <Form.Item name="paper_hyperliquid_latency_ms_max" label="Paper Hyperliquid 延迟最大毫秒"><InputNumber min={0} step={10} /></Form.Item>
-                        <Form.Item name="paper_mt5_latency_ms_min" label="Paper MT5 延迟最小毫秒"><InputNumber min={0} step={10} /></Form.Item>
-                        <Form.Item name="paper_mt5_latency_ms_max" label="Paper MT5 延迟最大毫秒"><InputNumber min={0} step={10} /></Form.Item>
+                        <Form.Item name="paper_leg_a_latency_ms_min" label="Paper 交易所 A 延迟最小毫秒"><InputNumber min={0} step={10} /></Form.Item>
+                        <Form.Item name="paper_leg_a_latency_ms_max" label="Paper 交易所 A 延迟最大毫秒"><InputNumber min={0} step={10} /></Form.Item>
+                        <Form.Item name="paper_leg_b_latency_ms_min" label="Paper 交易所 B 延迟最小毫秒"><InputNumber min={0} step={10} /></Form.Item>
+                        <Form.Item name="paper_leg_b_latency_ms_max" label="Paper 交易所 B 延迟最大毫秒"><InputNumber min={0} step={10} /></Form.Item>
                       </div>
                     </section>
 
@@ -319,11 +447,22 @@ export function SettingsPage() {
               )
             },
             {
+              key: 'exchanges',
+              label: '交易所配置',
+              children: (
+                <Space direction="vertical" size={12} className="full-width">
+                  <Alert type="info" showIcon message="API 密钥会加密保存到数据库；保存后不回显明文。Hyperliquid/MT5 仍走原生实现，Nautilus venue 在 V1 仅用于只读行情、账户和持仓。" />
+                  <Button type="primary" onClick={() => openExchangeModal()}>新增交易所</Button>
+                  <Table rowKey="venue" columns={exchangeColumns} dataSource={exchanges.data || []} loading={exchanges.isLoading} tableLayout="fixed" pagination={{ pageSize: 10 }} scroll={tableScrollAutoY(1160, (exchanges.data || []).length, 'calc(100vh - 404px)', 8)} />
+                </Space>
+              )
+            },
+            {
               key: 'symbols',
               label: '品种映射',
               children: (
                 <Space direction="vertical" size={12} className="full-width">
-                  <Alert type="info" showIcon message="同步 MT5 会写入最小手数、步进、合约大小和计价币种；扫描时按目标 USD 名义价值自动计算 MT5 手数和 HL 数量。" />
+                  <Alert type="info" showIcon message="同步 MT5 会写入最小手数、步进、合约大小和计价币种；扫描时按目标 USD 名义价值自动计算两条腿数量。" />
                   <Button type="primary" onClick={() => openSymbolModal()}>新增映射</Button>
                   <Table rowKey="id" columns={columns} dataSource={symbolRows} loading={symbols.isLoading} tableLayout="fixed" pagination={{ pageSize: 10 }} scroll={tableScrollAutoY(1474, symbolRows.length, 'calc(100vh - 404px)', 8)} />
                 </Space>
@@ -377,6 +516,40 @@ export function SettingsPage() {
         />
       </Card>
       <Modal
+        title={editingExchange ? `编辑交易所配置：${editingExchange.venue}` : '新增交易所配置'}
+        open={exchangeModalOpen}
+        onCancel={() => setExchangeModalOpen(false)}
+        onOk={() => exchangeForm.submit()}
+        confirmLoading={saveExchange.isPending}
+        destroyOnClose
+      >
+        <Form form={exchangeForm} layout="vertical" onFinish={(v) => saveExchange.mutate(v)}>
+          <Form.Item name="venue" label="Venue" rules={[{ required: true }]}>
+            <Select
+              showSearch
+              disabled={!!editingExchange}
+              options={venueOptions}
+              onChange={(value) => {
+                const option = venueOptions.find((item) => item.value === value);
+                exchangeForm.setFieldsValue({ display_name: option?.label.replace(/\(.+\)/, '') || value, credentials: {} });
+              }}
+            />
+          </Form.Item>
+          <Form.Item name="display_name" label="显示名称"><Input /></Form.Item>
+          <Form.Item name="environment" label="环境">
+            <Select options={[{ value: 'sandbox', label: 'sandbox' }, { value: 'testnet', label: 'testnet' }, { value: 'live', label: 'live' }]} />
+          </Form.Item>
+          <Form.Item name="enabled" label="启用" valuePropName="checked"><Switch /></Form.Item>
+          <Form.Item name="read_only" label="只读" valuePropName="checked"><Switch /></Form.Item>
+          <Alert type="warning" showIcon message="凭证保存后不会回显；编辑时留空 credentials 不会覆盖旧凭证。" style={{ marginBottom: 12 }} />
+          {exchangeCredentialFields.map((field) => (
+            <Form.Item key={field.name} name={['credentials', field.name]} label={field.label} preserve={false}>
+              {field.secret ? <Input.Password autoComplete="off" /> : <Input autoComplete="off" />}
+            </Form.Item>
+          ))}
+        </Form>
+      </Modal>
+      <Modal
         title={editingSymbol ? '编辑品种映射' : '新增品种映射'}
         open={symbolModalOpen}
         onCancel={() => setSymbolModalOpen(false)}
@@ -386,8 +559,24 @@ export function SettingsPage() {
       >
         <Form form={symbolForm} layout="vertical" onFinish={(v) => saveSymbol.mutate(v)}>
           <Form.Item name="symbol" label="内部品种" rules={[{ required: true }]}><Input /></Form.Item>
-          <Form.Item name="hyperliquid_symbol" label="Hyperliquid 品种" rules={[{ required: true }]}><Input /></Form.Item>
-          <Form.Item name="mt5_symbol" label="MT5 品种" rules={[{ required: true }]}><Input /></Form.Item>
+          <Form.Item name="leg_a_venue_symbol" label="兼容字段：交易所 A 品种" rules={[{ required: true }]}><Input /></Form.Item>
+          <Form.Item name="mt5_symbol" label="兼容字段：MT5/交易所 B 品种" rules={[{ required: true }]}><Input /></Form.Item>
+          <Space.Compact block>
+            <Form.Item name="leg_a_venue" label="交易所 A" rules={[{ required: true }]} style={{ width: '42%' }}>
+              <Select showSearch options={venueOptions} />
+            </Form.Item>
+            <Form.Item name="leg_a_symbol" label="交易所 A symbol" rules={[{ required: true }]} style={{ width: '58%' }}>
+              <Input />
+            </Form.Item>
+          </Space.Compact>
+          <Space.Compact block>
+            <Form.Item name="leg_b_venue" label="交易所 B" rules={[{ required: true }]} style={{ width: '42%' }}>
+              <Select showSearch options={venueOptions} />
+            </Form.Item>
+            <Form.Item name="leg_b_symbol" label="交易所 B symbol" rules={[{ required: true }]} style={{ width: '58%' }}>
+              <Input />
+            </Form.Item>
+          </Space.Compact>
           <Form.Item name="base_asset" label="基础资产"><Input /></Form.Item>
           <Form.Item name="quote_asset" label="报价资产"><Input /></Form.Item>
           <Form.Item name="contract_multiplier" label="合约乘数"><InputNumber min={0} step={0.01} /></Form.Item>
@@ -402,25 +591,25 @@ export function SettingsPage() {
           <Form.Item name="mt5_currency_margin" label="MT5 保证金币种"><Input disabled /></Form.Item>
           <Form.Item name="mt5_calc_mode" label="MT5 计算模式"><InputNumber disabled /></Form.Item>
           <Form.Item name="mt5_min_base_size" label="MT5 基础最小量"><InputNumber min={0} step={0.001} disabled /></Form.Item>
-          <Form.Item name="hyperliquid_min_base_size" label="Hyperliquid 最小基础量"><InputNumber min={0} step={0.001} /></Form.Item>
-          <Form.Item name="hyperliquid_min_notional" label="Hyperliquid 最小名义额"><InputNumber min={0} step={1} /></Form.Item>
+          <Form.Item name="leg_a_min_base_size" label="交易所 A 最小基础量"><InputNumber min={0} step={0.001} /></Form.Item>
+          <Form.Item name="leg_a_min_notional" label="交易所 A 最小名义额"><InputNumber min={0} step={1} /></Form.Item>
           <Form.Item name="quantity_precision" label="数量精度"><InputNumber min={0} max={8} /></Form.Item>
           <Form.Item name="price_precision" label="价格精度"><InputNumber min={0} max={8} /></Form.Item>
           <Form.Item name="min_tick" label="最小价格跳动"><InputNumber min={0} step={0.0001} /></Form.Item>
           <Form.Item name="max_slippage_bps" label="最大滑点 bps"><InputNumber min={0} /></Form.Item>
           <Form.Item name="execution_style" label="执行方式">
-            <Select options={[{ value: 'taker_taker', label: '双边市价' }, { value: 'hyper_maker_mt5_taker', label: 'HL挂单成交后MT5市价' }]} />
+            <Select options={[{ value: 'taker_taker', label: '双边市价' }, { value: 'hyper_maker_mt5_taker', label: 'Hyperliquid挂单成交后MT5市价' }]} />
           </Form.Item>
-          <Form.Item name="hl_open_order_type" label="HL 开仓订单">
+          <Form.Item name="hl_open_order_type" label="Hyperliquid 专属开仓订单">
             <Select options={[{ value: 'market', label: '市价/taker' }, { value: 'limit', label: '限价/maker' }]} />
           </Form.Item>
-          <Form.Item name="hl_close_order_type" label="HL 平仓订单">
+          <Form.Item name="hl_close_order_type" label="Hyperliquid 专属平仓订单">
             <Select options={[{ value: 'market', label: '市价/taker' }, { value: 'limit', label: '限价/maker' }]} />
           </Form.Item>
-          <Form.Item name="hl_post_only" label="HL post-only" valuePropName="checked"><Switch /></Form.Item>
-          <Form.Item name="hl_maker_offset_bps" label="HL 挂单偏移 bps"><InputNumber min={0} step={0.1} /></Form.Item>
-          <Form.Item name="hl_order_ttl_seconds" label="HL 挂单 TTL 秒"><InputNumber min={0} /></Form.Item>
-          <Form.Item name="hl_unfilled_action" label="HL 未成交动作">
+          <Form.Item name="hl_post_only" label="Hyperliquid post-only" valuePropName="checked"><Switch /></Form.Item>
+          <Form.Item name="hl_maker_offset_bps" label="Hyperliquid 挂单偏移 bps"><InputNumber min={0} step={0.1} /></Form.Item>
+          <Form.Item name="hl_order_ttl_seconds" label="Hyperliquid 挂单 TTL 秒"><InputNumber min={0} /></Form.Item>
+          <Form.Item name="hl_unfilled_action" label="Hyperliquid 未成交动作">
             <Select options={[{ value: 'cancel', label: '撤单放弃' }, { value: 'taker_fallback', label: '转市价兜底' }]} />
           </Form.Item>
           <Form.Item name="single_leg_action" label="单腿异常动作">

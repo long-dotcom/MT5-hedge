@@ -93,7 +93,7 @@ def refresh_signal_stats_cache(db: Session) -> int:
     symbols = [row.symbol for row in db.query(SymbolMapping).filter(SymbolMapping.enabled.is_(True)).all()]
     now = monotonic()
     for symbol in symbols:
-        for direction in ("long_hyperliquid_short_mt5", "long_mt5_short_hyperliquid"):
+        for direction in ("long_leg_a_short_leg_b", "long_leg_b_short_leg_a"):
             entry_points, close_points = _load_entry_and_close_points(db, symbol, direction, strategy.statistical_lookback_range)
             stats = _compute_signal_stats(entry_points, close_points, strategy)
             _stats_cache[_stats_cache_key(db, strategy, symbol, direction)] = (now, stats)

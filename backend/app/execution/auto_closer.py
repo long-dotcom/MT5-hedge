@@ -174,7 +174,7 @@ def evaluate_auto_close(
         suffix = f"；执行前主动刷新: {','.join(refreshed)}" if refreshed else ""
         return CloseEvaluation(False, f"{sync_reason}{suffix}", 0.0, group.exit_target or 0.0, group.unrealized_pnl)
 
-    close_spread = spreads_for_direction(group.direction, synced.hyperliquid.bid, synced.hyperliquid.ask, synced.mt5.bid, synced.mt5.ask).close_spread
+    close_spread = spreads_for_direction(group.direction, synced.leg_a.bid, synced.leg_a.ask, synced.leg_b.bid, synced.leg_b.ask).close_spread
     exit_target = _effective_exit_target(group, mapping)
     estimated_profit = pnl_from_close_spread(group, close_spread)
     min_profit = float(strategy.auto_close_min_profit or 0.0)
@@ -218,23 +218,23 @@ def _execute_paper_close_snapshot(
         raise ValueError(final_reason)
 
     hl_side, mt5_side = _close_sides(group.direction)
-    hl, mt5 = _execution_adapters(live=False, simulated=True)
-    hl_quantity = _platform_close_quantity(group.hyperliquid_quantity, group.quantity)
-    mt5_quantity = _platform_close_quantity(group.mt5_quantity, group.quantity)
-    if hl_quantity <= 0 and mt5_quantity <= 0:
+    leg_a_adapter, leg_b_adapter = _execution_adapters(live=False, simulated=True, mapping=mapping)
+    leg_a_quantity = _platform_close_quantity(group.leg_a_quantity, group.quantity)
+    leg_b_quantity = _platform_close_quantity(group.leg_b_quantity, group.quantity)
+    if leg_a_quantity <= 0 and leg_b_quantity <= 0:
         raise ValueError("对冲组没有可平仓数量")
 
     results = []
-    if hl_quantity > 0 and mt5_quantity > 0 and _paper_live_parallel_enabled(live=False, simulated=True, hl=hl, mapping=mapping):
-        results = _submit_parallel_close(group, mapping, hl, mt5, hl_side, mt5_side, hl_quantity, mt5_quantity, strategy)
-    elif hl_quantity > 0:
-        hl_result = _submit_close_leg(group, mapping, hl, "hyperliquid", hl_side, hl_quantity, mapping.hl_close_order_type, mapping.hyperliquid_symbol, strategy)
+    if leg_a_quantity > 0 and leg_b_quantity > 0 and _paper_live_parallel_enabled(live=False, simulated=True, hl=leg_a_adapter, mapping=mapping):
+        results = _submit_parallel_close(group, mapping, leg_a_adapter, leg_b_adapter, hl_side, mt5_side, leg_a_quantity, leg_b_quantity, strategy)
+    elif leg_a_quantity > 0:
+        hl_result = _submit_close_leg(group, mapping, leg_a_adapter, mapping.leg_a_venue, hl_side, leg_a_quantity, mapping.hl_close_order_type, mapping.leg_a_venue_symbol, strategy)
         results.append(hl_result)
-        if _has_position_effect(hl_result.adapter_result) and mt5_quantity > 0:
-            fill_ratio = hl_result.adapter_result.filled_quantity / hl_quantity if hl_quantity > 0 else 0.0
-            results.append(_submit_close_leg(group, mapping, mt5, "mt5", mt5_side, mt5_quantity * fill_ratio, mapping.mt5_close_order_type, mapping.mt5_symbol, strategy))
-    elif mt5_quantity > 0:
-        results.append(_submit_close_leg(group, mapping, mt5, "mt5", mt5_side, mt5_quantity, mapping.mt5_close_order_type, mapping.mt5_symbol, strategy))
+        if _has_position_effect(hl_result.adapter_result) and leg_b_quantity > 0:
+            fill_ratio = hl_result.adapter_result.filled_quantity / leg_a_quantity if leg_a_quantity > 0 else 0.0
+            results.append(_submit_close_leg(group, mapping, leg_b_adapter, mapping.leg_b_venue, mt5_side, leg_b_quantity * fill_ratio, mapping.mt5_close_order_type, mapping.mt5_symbol, strategy))
+    elif leg_b_quantity > 0:
+        results.append(_submit_close_leg(group, mapping, leg_b_adapter, mapping.leg_b_venue, mt5_side, leg_b_quantity, mapping.mt5_close_order_type, mapping.mt5_symbol, strategy))
 
     order_snapshots = tuple(_order_snapshot(item) for item in results)
     adapter_results = [item.adapter_result for item in results]
@@ -256,17 +256,17 @@ def _execute_paper_close_snapshot(
     return CloseResultEvent(group.id, "open", detail, f"{event_prefix}close_failed", detail, None, evaluation.estimated_profit, fees_delta, None, order_snapshots)
 
 
-def _submit_parallel_close(group, mapping, hl, mt5, hl_side, mt5_side, hl_quantity, mt5_quantity, strategy):
+def _submit_parallel_close(group, mapping, leg_a_adapter, leg_b_adapter, hl_side, mt5_side, leg_a_quantity, leg_b_quantity, strategy):
     with ThreadPoolExecutor(max_workers=2) as pool:
         futures = [
-            pool.submit(_submit_close_leg, group, mapping, hl, "hyperliquid", hl_side, hl_quantity, mapping.hl_close_order_type, mapping.hyperliquid_symbol, strategy),
-            pool.submit(_submit_close_leg, group, mapping, mt5, "mt5", mt5_side, mt5_quantity, mapping.mt5_close_order_type, mapping.mt5_symbol, strategy),
+            pool.submit(_submit_close_leg, group, mapping, leg_a_adapter, mapping.leg_a_venue, hl_side, leg_a_quantity, mapping.hl_close_order_type, mapping.leg_a_venue_symbol, strategy),
+            pool.submit(_submit_close_leg, group, mapping, leg_b_adapter, mapping.leg_b_venue, mt5_side, leg_b_quantity, mapping.mt5_close_order_type, mapping.mt5_symbol, strategy),
         ]
         return [future.result() for future in futures]
 
 
 def _submit_close_leg(group, mapping, adapter, platform: str, side: str, quantity: float, order_type: str, venue_symbol: str, strategy):
-    if platform == "hyperliquid" and getattr(adapter, "simulated", False):
+    if platform == mapping.leg_a_venue and getattr(adapter, "simulated", False):
         refresh_execution_quotes(mapping, refresh_mt5=False)
     gateway = build_execution_gateway(adapter)
     return gateway.submit_order(
@@ -321,12 +321,18 @@ def _order_snapshot(gateway_result) -> CloseOrderSnapshot:
 
 def _realized_pnl_from_close_fills(group: HedgeGroupSnapshot, orders: tuple[CloseOrderSnapshot, ...]) -> float | None:
     prices = {order.platform: order.average_price for order in orders if order.average_price}
-    if "hyperliquid" not in prices or "mt5" not in prices:
+    leg_a_venue = getattr(group, "_leg_a_venue", None)
+    leg_b_venue = getattr(group, "_leg_b_venue", None)
+    # Try to determine venues from direction and available prices
+    if leg_a_venue and leg_b_venue:
+        if leg_a_venue not in prices or leg_b_venue not in prices:
+            return None
+    elif "hyperliquid" not in prices or "mt5" not in prices:
         return None
-    if group.direction == "long_hyperliquid_short_mt5":
-        close_spread = float(prices["mt5"]) - float(prices["hyperliquid"])
+    if group.direction == "long_leg_a_short_leg_b":
+        close_spread = float(prices.get(leg_b_venue or "mt5")) - float(prices.get(leg_a_venue or "hyperliquid"))
     else:
-        close_spread = float(prices["hyperliquid"]) - float(prices["mt5"])
+        close_spread = float(prices.get(leg_a_venue or "hyperliquid")) - float(prices.get(leg_b_venue or "mt5"))
     return pnl_from_close_spread(group, close_spread)
 
 

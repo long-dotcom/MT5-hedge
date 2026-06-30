@@ -3,9 +3,14 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 
-LONG_HL_SHORT_MT5 = "long_hyperliquid_short_mt5"
-LONG_MT5_SHORT_HL = "long_mt5_short_hyperliquid"
-DIRECTIONS = (LONG_HL_SHORT_MT5, LONG_MT5_SHORT_HL)
+# ── New canonical direction constants ──────────────────────────────────────
+LONG_LEG_A_SHORT_LEG_B = "long_leg_a_short_leg_b"
+LONG_LEG_B_SHORT_LEG_A = "long_leg_b_short_leg_a"
+DIRECTIONS = (LONG_LEG_A_SHORT_LEG_B, LONG_LEG_B_SHORT_LEG_A)
+
+# ── Deprecated aliases (kept for backward compatibility) ───────────────────
+LONG_HL_SHORT_MT5 = LONG_LEG_A_SHORT_LEG_B  # deprecated
+LONG_MT5_SHORT_HL = LONG_LEG_B_SHORT_LEG_A  # deprecated
 
 
 @dataclass(frozen=True)
@@ -21,17 +26,23 @@ class DirectionSpreads:
         return self.entry_spread
 
 
-def spreads_for_direction(direction: str, hl_bid: float, hl_ask: float, mt5_bid: float, mt5_ask: float) -> DirectionSpreads:
-    hl_mid = (hl_bid + hl_ask) / 2
-    mt5_mid = (mt5_bid + mt5_ask) / 2
-    if direction == LONG_HL_SHORT_MT5:
-        entry_spread = mt5_bid - hl_ask
-        close_spread = mt5_ask - hl_bid
-        mid_spread = mt5_mid - hl_mid
-    elif direction == LONG_MT5_SHORT_HL:
-        entry_spread = hl_bid - mt5_ask
-        close_spread = hl_ask - mt5_bid
-        mid_spread = hl_mid - mt5_mid
+def spreads_for_direction(
+    direction: str,
+    leg_a_bid: float,
+    leg_a_ask: float,
+    leg_b_bid: float,
+    leg_b_ask: float,
+) -> DirectionSpreads:
+    leg_a_mid = (leg_a_bid + leg_a_ask) / 2
+    leg_b_mid = (leg_b_bid + leg_b_ask) / 2
+    if direction == LONG_LEG_A_SHORT_LEG_B:
+        entry_spread = leg_b_bid - leg_a_ask
+        close_spread = leg_b_ask - leg_a_bid
+        mid_spread = leg_b_mid - leg_a_mid
+    elif direction == LONG_LEG_B_SHORT_LEG_A:
+        entry_spread = leg_a_bid - leg_b_ask
+        close_spread = leg_a_ask - leg_b_bid
+        mid_spread = leg_a_mid - leg_b_mid
     else:
         raise ValueError(f"未知价差方向: {direction}")
     return DirectionSpreads(

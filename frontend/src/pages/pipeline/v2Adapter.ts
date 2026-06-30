@@ -27,7 +27,11 @@ function toPipeline(symbol: SymbolPipeline): V2PipelineSymbol {
   const status = symbol.status === 'blocked' ? 'blocked' : 'normal';
   return {
     symbol: symbol.symbol,
-    direction: symbol.metrics.gross_spread && symbol.metrics.gross_spread < 0 ? 'long_hyperliquid_short_mt5' : 'long_mt5_short_hyperliquid',
+    direction: symbol.metrics.gross_spread && symbol.metrics.gross_spread < 0 ? 'long_leg_a_short_leg_b' : 'long_leg_b_short_leg_a',
+    leg_a_venue: symbol.leg_a_venue,
+    leg_a_symbol: symbol.leg_a_symbol || symbol.leg_a_venue_symbol,
+    leg_b_venue: symbol.leg_b_venue,
+    leg_b_symbol: symbol.leg_b_symbol || symbol.mt5_symbol,
     spread: Number(symbol.metrics.unit_net_profit ?? symbol.metrics.gross_spread ?? 0),
     pipelineStatus: status,
     blockReason: symbol.reason,
@@ -38,8 +42,8 @@ function toPipeline(symbol: SymbolPipeline): V2PipelineSymbol {
       candidate: pipelineStatus(symbol, 'candidate'),
     },
     delays: {
-      hlToSync: ms(symbol.metrics.hl_age_ms),
-      mt5ToSync: ms(symbol.metrics.mt5_age_ms),
+      hlToSync: ms(symbol.metrics.leg_a_age_ms ?? symbol.metrics.hl_age_ms),
+      mt5ToSync: ms(symbol.metrics.leg_b_age_ms ?? symbol.metrics.mt5_age_ms),
       syncToScan: ms(symbol.metrics.symbol_scan_duration_ms),
       scanToSignal: ms(symbol.metrics.signal_duration_ms),
       signalToCandidate: ms(symbol.metrics.candidate_sync_duration_ms),

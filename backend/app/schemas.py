@@ -1,3 +1,4 @@
+import re
 from datetime import datetime
 from typing import Any
 
@@ -45,10 +46,10 @@ class StrategySettingsIn(BaseModel):
     auto_execute_min_net_profit: float = 0.0
     paper_decision_delay_ms_min: int = 50
     paper_decision_delay_ms_max: int = 200
-    paper_hyperliquid_latency_ms_min: int = 80
-    paper_hyperliquid_latency_ms_max: int = 200
-    paper_mt5_latency_ms_min: int = 120
-    paper_mt5_latency_ms_max: int = 350
+    paper_leg_a_latency_ms_min: int = 80
+    paper_leg_a_latency_ms_max: int = 200
+    paper_leg_b_latency_ms_min: int = 120
+    paper_leg_b_latency_ms_max: int = 350
     cb_cooldown_seconds: float = 3.0
     cb_initial_threshold: float = 0.75
     cb_baseline_multiplier: float = 2.0
@@ -74,6 +75,20 @@ class LiveTradingIn(BaseModel):
     confirmation: str = ""
 
 
+class ExchangeCredentialIn(BaseModel):
+    venue: str
+    display_name: str = ""
+    environment: str = "sandbox"
+    enabled: bool = False
+    read_only: bool = True
+    credentials: dict[str, Any] = {}
+
+    @field_validator("venue", "display_name", "environment")
+    @classmethod
+    def strip_exchange_text(cls, value: str) -> str:
+        return value.strip()
+
+
 class RiskModeIn(BaseModel):
     mode: str
 
@@ -87,8 +102,9 @@ class AdoptPositionIn(BaseModel):
     symbol: str = ""
 
 
-class HyperliquidProbeTestIn(BaseModel):
+class VenueProbeTestIn(BaseModel):
     symbol: str
+    venue: str = ""
     side: str = "buy"
     quantity: float | None = None
     reduce_only: bool = False
@@ -96,7 +112,7 @@ class HyperliquidProbeTestIn(BaseModel):
     slippage: float | None = None
     confirmation: str = ""
 
-    @field_validator("symbol", "side", "confirmation")
+    @field_validator("symbol", "venue", "side", "confirmation")
     @classmethod
     def strip_probe_text(cls, value: str) -> str:
         return value.strip()
@@ -104,8 +120,12 @@ class HyperliquidProbeTestIn(BaseModel):
 
 class SymbolMappingIn(BaseModel):
     symbol: str
-    hyperliquid_symbol: str
+    leg_a_venue_symbol: str
     mt5_symbol: str
+    leg_a_venue: str
+    leg_a_symbol: str = ""
+    leg_b_venue: str = "mt5"
+    leg_b_symbol: str = ""
     base_asset: str = ""
     quote_asset: str = "USD"
     contract_multiplier: float = 1.0
@@ -120,8 +140,8 @@ class SymbolMappingIn(BaseModel):
     mt5_currency_margin: str = "USD"
     mt5_calc_mode: int = 0
     mt5_min_base_size: float = 0.0
-    hyperliquid_min_base_size: float = 0.0
-    hyperliquid_min_notional: float = 10.0
+    leg_a_min_base_size: float = 0.0
+    leg_a_min_notional: float = 10.0
     execution_style: str = "taker_taker"
     hl_open_order_type: str = "market"
     hl_close_order_type: str = "market"
@@ -149,18 +169,25 @@ class SymbolMappingIn(BaseModel):
     max_slippage_bps: float = 8.0
     enabled: bool = True
 
-    @field_validator("symbol", "hyperliquid_symbol", "mt5_symbol", "base_asset", "quote_asset", "mt5_currency_base", "mt5_currency_profit", "mt5_currency_margin", "mt5_session_template", "mt5_session_timezone", "mt5_session_source")
+    @field_validator("symbol", "leg_a_venue_symbol", "mt5_symbol", "leg_a_venue", "leg_a_symbol", "leg_b_venue", "leg_b_symbol", "base_asset", "quote_asset", "mt5_currency_base", "mt5_currency_profit", "mt5_currency_margin", "mt5_session_template", "mt5_session_timezone", "mt5_session_source")
     @classmethod
     def strip_symbol_text(cls, value: str) -> str:
         return value.strip()
 
     @model_validator(mode="after")
-    def validate_hyperliquid_symbol(self) -> "SymbolMappingIn":
-        value = self.hyperliquid_symbol.strip()
-        normalized = value.upper()
-        if ":" not in value and "." not in value and "-" not in value and normalized.endswith("USD"):
-            base = value[:-3]
-            raise ValueError(f"Hyperliquid 标准永续请填写基础币符号 `{base}`，不要填写 MT5 符号 `{value}`")
+    def normalize_legs_and_validate_leg_a_venue_symbol(self) -> "SymbolMappingIn":
+        self.leg_a_venue = (self.leg_a_venue or "").strip().lower()
+        self.leg_b_venue = (self.leg_b_venue or "mt5").strip().lower()
+        self.leg_a_symbol = (self.leg_a_symbol or self.leg_a_venue_symbol).strip()
+        self.leg_b_symbol = (self.leg_b_symbol or self.mt5_symbol).strip()
+        if self.leg_a_venue == self.leg_b_venue:
+            raise ValueError("两条腿不能选择同一个 venue")
+        if not self.leg_a_symbol or not self.leg_b_symbol:
+            raise ValueError("两条腿都必须填写 venue symbol")
+        if not self.leg_a_venue_symbol.strip():
+            raise ValueError("leg_a_venue_symbol 不能为空")
+        if self.leg_a_venue == "hyperliquid" and not re.match(r'^[A-Z][A-Z0-9]*(-[A-Z0-9]+)?$', self.leg_a_venue_symbol) and ":" not in self.leg_a_venue_symbol:
+            raise ValueError("Hyperliquid 标准永续合约仅接受大写字母开头的 symbol（如 BTC, ETH-USDT）或 HIP3 格式（如 xyz:JP225）")
         return self
 
 

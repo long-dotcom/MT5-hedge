@@ -5,6 +5,7 @@ from urllib import request
 
 from sqlalchemy.orm import Session
 
+from app.adapters.venue import mapping_leg
 from app.adapters.mt5 import _initialize_mt5
 from app.config.settings import get_settings, hyperliquid_execution_info_url
 from app.db.models import HedgeGroup, Order, SymbolMapping, SystemLog, WorkerRun
@@ -33,8 +34,8 @@ def run_carry_cost_sync(db: Session, *, force: bool = False) -> int:
                 continue
             old_funding = float(group.funding or 0.0)
             old_swap = float(group.swap or 0.0)
-            funding = _hyperliquid_funding_cost(group, mapping)
-            swap = _mt5_swap_cost(db, group, mapping)
+            funding = _hyperliquid_funding_cost(group, mapping) if _venue_leg(mapping, "hyperliquid") else None
+            swap = _mt5_swap_cost(db, group, mapping) if _venue_leg(mapping, "mt5") else None
             if funding is not None:
                 group.funding = funding
             if swap is not None:
@@ -80,6 +81,8 @@ def _hyperliquid_user_funding_usdc(group: HedgeGroup, mapping: SymbolMapping) ->
     if not isinstance(rows, list):
         return None
     symbols = _hyperliquid_symbol_aliases(mapping)
+    if not symbols:
+        return None
     total = 0.0
     for row in rows:
         delta = row.get("delta", {}) if isinstance(row, dict) else {}
@@ -91,16 +94,20 @@ def _hyperliquid_user_funding_usdc(group: HedgeGroup, mapping: SymbolMapping) ->
 
 
 def _paper_hyperliquid_funding_cost(group: HedgeGroup, mapping: SymbolMapping) -> float | None:
+    hyper_leg = _venue_leg(mapping, "hyperliquid")
+    if not hyper_leg:
+        return None
+    _, hyper_symbol = hyper_leg
     start_ms, end_ms = _group_window_ms(group)
     if end_ms <= start_ms:
         return 0.0
     try:
-        rows = _post_hyperliquid_info({"type": "fundingHistory", "coin": mapping.hyperliquid_symbol, "startTime": start_ms, "endTime": end_ms})
+        rows = _post_hyperliquid_info({"type": "fundingHistory", "coin": hyper_symbol, "startTime": start_ms, "endTime": end_ms})
     except Exception:
         return None
     if not isinstance(rows, list):
         return None
-    side_sign = 1.0 if group.direction == "long_hyperliquid_short_mt5" else -1.0
+    side_sign = 1.0 if _direction_is_venue_long(group.direction, hyper_leg[0]) else -1.0
     notional = float(group.notional or 0.0)
     return sum(notional * _float(row.get("fundingRate")) * side_sign for row in rows if isinstance(row, dict))
 
@@ -125,17 +132,21 @@ def _mt5_swap_cost(db: Session, group: HedgeGroup, mapping: SymbolMapping) -> fl
 
 
 def _open_position_swap(mt5, group: HedgeGroup, mapping: SymbolMapping) -> float | None:
+    mt5_leg = _venue_leg(mapping, "mt5")
+    if not mt5_leg:
+        return None
+    mt5_leg_name, mt5_symbol = mt5_leg
     try:
-        positions = mt5.positions_get(symbol=mapping.mt5_symbol)
+        positions = mt5.positions_get(symbol=mt5_symbol)
     except TypeError:
         positions = mt5.positions_get()
     except Exception:
         return None
-    target_type = getattr(mt5, "POSITION_TYPE_SELL", 1) if group.direction == "long_hyperliquid_short_mt5" else getattr(mt5, "POSITION_TYPE_BUY", 0)
+    target_type = getattr(mt5, "POSITION_TYPE_BUY", 0) if _direction_is_venue_long(group.direction, mt5_leg_name) else getattr(mt5, "POSITION_TYPE_SELL", 1)
     candidates = [
         position
         for position in positions or []
-        if str(getattr(position, "symbol", "")) == mapping.mt5_symbol
+        if str(getattr(position, "symbol", "")) == mt5_symbol
         and int(getattr(position, "type", -1)) == int(target_type)
         and float(getattr(position, "volume", 0.0) or 0.0) > 0
     ]
@@ -145,7 +156,8 @@ def _open_position_swap(mt5, group: HedgeGroup, mapping: SymbolMapping) -> float
     total_swap = sum(float(getattr(position, "swap", 0.0) or 0.0) for position in candidates)
     if total_volume <= 0:
         return None
-    expected = float(group.mt5_quantity or group.quantity or 0.0)
+    expected_quantity = group.leg_a_quantity if mt5_leg_name == "a" else group.leg_b_quantity
+    expected = float(expected_quantity or group.quantity or 0.0)
     ratio = min(max(expected / total_volume, 0.0), 1.0) if expected > 0 else 1.0
     return total_swap * ratio
 
@@ -187,11 +199,32 @@ def _post_hyperliquid_info(payload: dict):
 
 
 def _hyperliquid_symbol_aliases(mapping: SymbolMapping) -> set[str]:
-    value = str(mapping.hyperliquid_symbol or "")
+    hyper_leg = _venue_leg(mapping, "hyperliquid")
+    if not hyper_leg:
+        return set()
+    value = str(hyper_leg[1] or "")
     aliases = {value}
     if ":" in value:
         aliases.add(value.split(":", 1)[1])
     return aliases
+
+
+def _venue_leg(mapping: SymbolMapping, venue: str) -> tuple[str, str] | None:
+    for leg in ("a", "b"):
+        leg_venue, leg_symbol = mapping_leg(mapping, leg)
+        if leg_venue == venue:
+            return leg, leg_symbol
+    return None
+
+
+def _direction_is_venue_long(direction: str, leg: str) -> bool:
+    if direction == "long_leg_a_short_leg_b":
+        return leg == "a"
+    if direction == "long_leg_b_short_leg_a":
+        return leg == "b"
+    if direction == "long_mt5_short_hyperliquid":
+        return leg == "b"
+    return leg == "a"
 
 
 def _float(value) -> float:

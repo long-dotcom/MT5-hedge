@@ -9,11 +9,15 @@ from app.config.settings import get_settings
 
 
 @dataclass
-class HyperliquidCostInputs:
+class VenueCostInputs:
     taker_fee_rate: float
     maker_fee_rate: float
     funding_rate: float
     source: str
+
+
+# Backward-compatible alias
+HyperliquidCostInputs = VenueCostInputs
 
 
 @dataclass
@@ -36,16 +40,20 @@ _hl_market_cache: dict[str, tuple[float, HyperliquidMarketData]] = {}
 _hl_user_fee_cache: tuple[float, tuple[float, float] | None] = (0.0, None)
 
 
-def hyperliquid_cost_inputs(symbol: str) -> HyperliquidCostInputs:
-    taker, maker = _hyperliquid_user_fee_rates()
-    market_data = _hyperliquid_market_data(symbol)
+def leg_a_cost_inputs(symbol: str) -> VenueCostInputs:
+    taker, maker = _leg_a_user_fee_rates()
+    market_data = _leg_a_market_data(symbol)
     effective_taker, effective_maker, fee_source = _hyperliquid_effective_fee_rates(symbol, taker, maker, market_data.asset_meta)
-    return HyperliquidCostInputs(
+    return VenueCostInputs(
         taker_fee_rate=effective_taker,
         maker_fee_rate=effective_maker,
         funding_rate=market_data.funding_rates.get(symbol, 0.00010),
         source=f"{fee_source}+metaAndAssetCtxs",
     )
+
+
+# Backward-compatible alias
+hyperliquid_cost_inputs = leg_a_cost_inputs
 
 
 def mt5_cost_inputs(mt5_symbol: str, mt5_side: str, quantity: float, holding_days: float) -> MT5CostInputs:
@@ -94,7 +102,7 @@ def _estimate_mt5_swap_cost(swap_value: float, swap_mode: int, point: float, con
     return -swap_pnl
 
 
-def _hyperliquid_user_fee_rates() -> tuple[float, float]:
+def _leg_a_user_fee_rates() -> tuple[float, float]:
     global _hl_user_fee_cache
     settings = get_settings()
     now = time.time()
@@ -115,7 +123,7 @@ def _hyperliquid_user_fee_rates() -> tuple[float, float]:
         return settings.hyperliquid_default_taker_fee_rate, settings.hyperliquid_default_maker_fee_rate
 
 
-def _hyperliquid_market_data(symbol: str = "") -> HyperliquidMarketData:
+def _leg_a_market_data(symbol: str = "") -> HyperliquidMarketData:
     global _hl_market_cache
     settings = get_settings()
     now = time.time()

@@ -13,6 +13,15 @@
 7. `page-experience-improvements.md`：逐页用户体验改进清单。
 8. `evolution-roadmap.md`：当前版本边界、已完成演进、下一阶段优先级和非目标。
 
+## NautilusTrader V1 边界
+
+- 品种映射支持 `leg_a_venue/leg_a_symbol` 与 `leg_b_venue/leg_b_symbol`，旧 HL+MT5 字段继续保留。
+- Hyperliquid 和 MT5 固定使用当前项目原生实现；Binance、OKX、Bybit 等新增 venue 通过 NautilusTrader 只读 adapter 接入。Binance V1 的行情、账户、持仓均调用 NautilusTrader Binance adapter，不再使用项目内手写 Binance REST 读取。
+- V1 只开放行情、账户、持仓只读能力；只有 `leg_a=hyperliquid` 且 `leg_b=mt5` 的当前原生链路会进入自动执行，其他 pair 只显示观察型行情和候选。
+- API 和前端展示统一使用 mapping 的 leg metadata 渲染真实交易所名称和 symbol；方向 `long_leg_a_short_leg_b` / `long_leg_b_short_leg_a` 在页面上显示为“多对应交易所 / 空对应交易所”，不再把 Leg A/B 当成用户可见名称。
+- NautilusTrader 是可选依赖，使用前单独安装 `backend/requirements-nautilus.txt`。当前固定 `nautilus-trader==1.229.0`，避免后续 Python/Rust v2 API breaking changes 影响主服务。
+- 交易所 API 密钥可在设置页“交易所配置”维护，凭证加密后保存到数据库；默认使用 `JWT_SECRET` 派生加密密钥，也可单独配置 `EXCHANGE_CONFIG_SECRET`。
+
 ## 各文档职责
 
 - `DEVELOPMENT.md`：面向开发者的总览，只写当前版本事实和开发约定，不再放早期草案。

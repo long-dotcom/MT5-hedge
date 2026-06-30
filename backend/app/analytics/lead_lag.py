@@ -31,17 +31,19 @@ def lead_lag_report(
     min_move: float = 0.0,
     follow_ratio: float = 0.5,
     max_lag_ms: int = 2000,
+    leg_a_venue: str = "hyperliquid",
+    leg_b_venue: str = "mt5",
 ) -> dict[str, object]:
     symbol = symbol.upper()
     since = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(seconds=max(window_seconds, 10))
-    hl = [quote for quote in quote_cache.history("hyperliquid", symbol) if quote.local_recv_ts >= since]
-    mt5 = [quote for quote in quote_cache.history("mt5", symbol) if quote.local_recv_ts >= since]
-    events = _events_for_direction(symbol, "hyperliquid", "mt5", hl, mt5, threshold_bps, min_move, follow_ratio, max_lag_ms)
-    events += _events_for_direction(symbol, "mt5", "hyperliquid", mt5, hl, threshold_bps, min_move, follow_ratio, max_lag_ms)
+    hl = [quote for quote in quote_cache.history(leg_a_venue, symbol) if quote.local_recv_ts >= since]
+    mt5 = [quote for quote in quote_cache.history(leg_b_venue, symbol) if quote.local_recv_ts >= since]
+    events = _events_for_direction(symbol, leg_a_venue, leg_b_venue, hl, mt5, threshold_bps, min_move, follow_ratio, max_lag_ms)
+    events += _events_for_direction(symbol, leg_b_venue, leg_a_venue, mt5, hl, threshold_bps, min_move, follow_ratio, max_lag_ms)
     events.sort(key=lambda item: item.leader_time, reverse=True)
     summary = {
-        "hyperliquid_to_mt5": _summary(events, "hyperliquid", "mt5"),
-        "mt5_to_hyperliquid": _summary(events, "mt5", "hyperliquid"),
+        "leg_a_to_leg_b": _summary(events, leg_a_venue, leg_b_venue),
+        "leg_b_to_leg_a": _summary(events, leg_b_venue, leg_a_venue),
     }
     latest_hl = hl[-1] if hl else None
     latest_mt5 = mt5[-1] if mt5 else None
@@ -53,12 +55,12 @@ def lead_lag_report(
         "follow_ratio": follow_ratio,
         "max_lag_ms": max_lag_ms,
         "latest": {
-            "hyperliquid": _quote_dict(latest_hl),
-            "mt5": _quote_dict(latest_mt5),
+            leg_a_venue: _quote_dict(latest_hl),
+            leg_b_venue: _quote_dict(latest_mt5),
         },
         "summary": summary,
         "items": [_event_dict(event) for event in events[:200]],
-        "series": _series(hl, mt5),
+        "series": _series(hl, mt5, leg_a_venue, leg_b_venue),
     }
 
 
@@ -118,7 +120,7 @@ def _events_for_direction(
                 follower_move=follower_move,
                 leader_move_bps=move_bps,
                 follower_move_bps=follower_move_bps,
-                max_mid_diff=_max_mid_diff(symbol, quote.local_recv_ts, end_time),
+                max_mid_diff=_max_mid_diff(symbol, quote.local_recv_ts, end_time, leader, follower),
                 direction=direction,
                 followed=bool(follower_hit),
             )
@@ -137,9 +139,9 @@ def _latest_at_or_before(quotes: list[Quote], timestamp: datetime) -> Quote | No
     return result
 
 
-def _max_mid_diff(symbol: str, start: datetime, end: datetime) -> float:
-    hl = [quote for quote in quote_cache.history("hyperliquid", symbol) if start <= quote.local_recv_ts <= end]
-    mt5 = [quote for quote in quote_cache.history("mt5", symbol) if start <= quote.local_recv_ts <= end]
+def _max_mid_diff(symbol: str, start: datetime, end: datetime, leader: str = "hyperliquid", follower: str = "mt5") -> float:
+    hl = [quote for quote in quote_cache.history(leader, symbol) if start <= quote.local_recv_ts <= end]
+    mt5 = [quote for quote in quote_cache.history(follower, symbol) if start <= quote.local_recv_ts <= end]
     if not hl or not mt5:
         return 0.0
     values: list[float] = []
@@ -167,7 +169,7 @@ def _summary(events: list[LeadLagEvent], leader: str, follower: str) -> dict[str
     }
 
 
-def _series(hl: list[Quote], mt5: list[Quote]) -> list[dict[str, object]]:
+def _series(hl: list[Quote], mt5: list[Quote], leg_a_venue: str = "hyperliquid", leg_b_venue: str = "mt5") -> list[dict[str, object]]:
     merged = sorted([(quote.local_recv_ts, quote.platform, quote.mid) for quote in hl + mt5], key=lambda item: item[0])
     latest: dict[str, float] = {}
     rows: list[dict[str, object]] = []
@@ -176,9 +178,9 @@ def _series(hl: list[Quote], mt5: list[Quote]) -> list[dict[str, object]]:
         rows.append(
             {
                 "time": timestamp.isoformat(),
-                "hyperliquid_mid": latest.get("hyperliquid"),
-                "mt5_mid": latest.get("mt5"),
-                "mid_diff": (latest["hyperliquid"] - latest["mt5"]) if "hyperliquid" in latest and "mt5" in latest else None,
+                "leg_a_mid": latest.get(leg_a_venue),
+                "leg_b_mid": latest.get(leg_b_venue),
+                "mid_diff": (latest[leg_a_venue] - latest[leg_b_venue]) if leg_a_venue in latest and leg_b_venue in latest else None,
             }
         )
     if len(rows) <= 1000:

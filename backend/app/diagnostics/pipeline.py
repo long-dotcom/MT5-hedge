@@ -12,6 +12,7 @@ from app.execution.hedge_pool import HedgeGroupSnapshot, hedge_pool
 from app.execution.pnl import pnl_from_close_spread
 from app.market.hedge_spreads import hedge_group_spreads
 from app.market.mt5_sessions import mt5_session_state
+from app.adapters.venue import mapping_leg
 from app.market.quotes import quote_cache
 from app.market.scan_state import scan_state_store
 
@@ -47,7 +48,7 @@ def build_pipeline_diagnostics(db: Session) -> dict[str, Any]:
         )
         for mapping in mappings
     ]
-    pool = _pool_payload(groups, now)
+    pool = _pool_payload(groups, now, {m.symbol: m for m in mappings})
     summary = _summary(symbols, pool)
     return {
         "generated_at": now,
@@ -123,15 +124,17 @@ def _symbol_pipeline(
     settings,
 ) -> dict[str, Any]:
     symbol = mapping.symbol.upper()
-    hl_quote = quote_cache.latest("hyperliquid", symbol)
-    mt5_quote = quote_cache.latest("mt5", symbol)
+    leg_a_venue, leg_a_symbol = mapping_leg(mapping, "a")
+    leg_b_venue, leg_b_symbol = mapping_leg(mapping, "b")
+    leg_a_quote = quote_cache.latest(leg_a_venue, symbol)
+    leg_b_quote = quote_cache.latest(leg_b_venue, symbol)
     session = mt5_session_state(mapping)
 
-    hl_age = _age_ms(now, hl_quote.local_recv_ts) if hl_quote else None
-    mt5_age = _age_ms(now, mt5_quote.local_recv_ts) if mt5_quote else None
+    leg_a_age = _age_ms(now, leg_a_quote.local_recv_ts) if leg_a_quote else None
+    leg_b_age = _age_ms(now, leg_b_quote.local_recv_ts) if leg_b_quote else None
     sync_diff = (
-        abs((hl_quote.local_recv_ts - mt5_quote.local_recv_ts).total_seconds() * 1000)
-        if hl_quote and mt5_quote
+        abs((leg_a_quote.local_recv_ts - leg_b_quote.local_recv_ts).total_seconds() * 1000)
+        if leg_a_quote and leg_b_quote
         else None
     )
     scan_age = _age_ms(now, current.get("sampled_at")) if current else None
@@ -143,13 +146,17 @@ def _symbol_pipeline(
     sizing_duration = _metric_ms(current, "sizing_duration_ms")
     persist_duration = _metric_ms(current, "persist_duration_ms")
     opportunity = _best_opportunity(opportunities)
-    blocked_stage, status, reason = _pipeline_status(current, hl_quote, mt5_quote, session, hl_age, mt5_age, sync_diff, settings)
-    blockers = _pipeline_blockers(current, hl_quote, mt5_quote, session, hl_age, mt5_age, sync_diff, settings)
+    blocked_stage, status, reason = _pipeline_status(current, leg_a_quote, leg_b_quote, session, leg_a_age, leg_b_age, sync_diff, settings, leg_a_venue, leg_b_venue)
+    blockers = _pipeline_blockers(current, leg_a_quote, leg_b_quote, session, leg_a_age, leg_b_age, sync_diff, settings, leg_a_venue, leg_b_venue)
 
     return {
         "symbol": symbol,
-        "hyperliquid_symbol": mapping.hyperliquid_symbol,
+        "leg_a_venue_symbol": mapping.leg_a_venue_symbol,
         "mt5_symbol": mapping.mt5_symbol,
+        "leg_a_venue": leg_a_venue,
+        "leg_a_symbol": leg_a_symbol,
+        "leg_b_venue": leg_b_venue,
+        "leg_b_symbol": leg_b_symbol,
         "status": status,
         "blocked_stage": blocked_stage,
         "reason": reason,
@@ -157,42 +164,44 @@ def _symbol_pipeline(
         "nodes": [
             _node("mapping", "映射", "pass", "已启用"),
             _node(
-                "hl_quote",
-                "HL报价",
-                _quote_status(hl_quote, hl_age, settings.quote_stale_ms),
-                _quote_message(hl_quote, hl_age),
-                age_ms=hl_age,
-                source=getattr(hl_quote, "source", "") if hl_quote else "",
-                bid=getattr(hl_quote, "bid", None) if hl_quote else None,
-                ask=getattr(hl_quote, "ask", None) if hl_quote else None,
+                "leg_a_quote",
+                f"{_venue_label(leg_a_venue)}报价",
+                _venue_quote_status(leg_a_venue, leg_a_quote, leg_a_age, session, settings.quote_stale_ms),
+                _venue_quote_message(leg_a_venue, leg_a_quote, leg_a_age, session),
+                age_ms=leg_a_age,
+                source=getattr(leg_a_quote, "source", "") if leg_a_quote else "",
+                bid=getattr(leg_a_quote, "bid", None) if leg_a_quote else None,
+                ask=getattr(leg_a_quote, "ask", None) if leg_a_quote else None,
             ),
             _node(
-                "mt5_quote",
-                "MT5报价",
-                _mt5_quote_status(mt5_quote, mt5_age, session, settings.quote_stale_ms),
-                _mt5_quote_message(mt5_quote, mt5_age, session),
-                age_ms=mt5_age,
-                source=getattr(mt5_quote, "source", "") if mt5_quote else "",
-                bid=getattr(mt5_quote, "bid", None) if mt5_quote else None,
-                ask=getattr(mt5_quote, "ask", None) if mt5_quote else None,
+                "leg_b_quote",
+                f"{_venue_label(leg_b_venue)}报价",
+                _venue_quote_status(leg_b_venue, leg_b_quote, leg_b_age, session, settings.quote_stale_ms),
+                _venue_quote_message(leg_b_venue, leg_b_quote, leg_b_age, session),
+                age_ms=leg_b_age,
+                source=getattr(leg_b_quote, "source", "") if leg_b_quote else "",
+                bid=getattr(leg_b_quote, "bid", None) if leg_b_quote else None,
+                ask=getattr(leg_b_quote, "ask", None) if leg_b_quote else None,
             ),
-            _node("sync", "同步", _sync_status(sync_diff, hl_quote, mt5_quote, settings), _sync_message(sync_diff, hl_quote, mt5_quote, settings), latency_ms=sync_diff),
+            _node("sync", "同步", _sync_status(sync_diff, leg_a_quote, leg_b_quote, settings), _sync_message(sync_diff, leg_a_quote, leg_b_quote, settings), latency_ms=sync_diff),
             _node("scan", "扫描", _scan_status(current), _scan_message(current, scan_age), age_ms=scan_age, latency_ms=scan_duration),
             _node("signal", "信号", _signal_status(current), _signal_message(current), latency_ms=signal_duration),
             _node("candidate", "候选", _candidate_status(opportunity), _candidate_message(opportunity), opportunity=opportunity),
             _node("stream", "前端推送", "pass" if current else "idle", "等待扫描状态" if not current else "SSE/接口可读取"),
         ],
         "edges": [
-            _edge("hl_quote", "sync", hl_age, _quote_status(hl_quote, hl_age, settings.quote_stale_ms), "HL age"),
-            _edge("mt5_quote", "sync", mt5_age, _mt5_quote_status(mt5_quote, mt5_age, session, settings.quote_stale_ms), "MT5 age"),
-            _edge("sync", "scan", quote_sync_duration, _sync_status(sync_diff, hl_quote, mt5_quote, settings), "quote sync"),
+            _edge("leg_a_quote", "sync", leg_a_age, _venue_quote_status(leg_a_venue, leg_a_quote, leg_a_age, session, settings.quote_stale_ms), f"{leg_a_venue} age"),
+            _edge("leg_b_quote", "sync", leg_b_age, _venue_quote_status(leg_b_venue, leg_b_quote, leg_b_age, session, settings.quote_stale_ms), f"{leg_b_venue} age"),
+            _edge("sync", "scan", quote_sync_duration, _sync_status(sync_diff, leg_a_quote, leg_b_quote, settings), "quote sync"),
             _edge("scan", "signal", signal_duration, _scan_status(current), "signal calc"),
             _edge("signal", "candidate", candidate_sync_duration, _signal_status(current), "candidate sync"),
             _edge("candidate", "stream", None, "pass" if current else "idle", "push"),
         ],
         "metrics": {
-            "hl_age_ms": hl_age,
-            "mt5_age_ms": mt5_age,
+            "hl_age_ms": leg_a_age,
+            "mt5_age_ms": leg_b_age,
+            "leg_a_age_ms": leg_a_age,
+            "leg_b_age_ms": leg_b_age,
             "sync_diff_ms": sync_diff,
             "scan_age_ms": scan_age,
             "quote_sync_duration_ms": quote_sync_duration,
@@ -209,8 +218,8 @@ def _symbol_pipeline(
     }
 
 
-def _pipeline_status(current, hl_quote, mt5_quote, session, hl_age, mt5_age, sync_diff, settings) -> tuple[str, str, str]:
-    blockers = _pipeline_blockers(current, hl_quote, mt5_quote, session, hl_age, mt5_age, sync_diff, settings)
+def _pipeline_status(current, hl_quote, mt5_quote, session, hl_age, mt5_age, sync_diff, settings, leg_a_venue: str = "hyperliquid", leg_b_venue: str = "mt5") -> tuple[str, str, str]:
+    blockers = _pipeline_blockers(current, hl_quote, mt5_quote, session, hl_age, mt5_age, sync_diff, settings, leg_a_venue, leg_b_venue)
     if blockers:
         first = blockers[0]
         return first["stage"], "blocked", first["message"]
@@ -225,18 +234,19 @@ def _pipeline_status(current, hl_quote, mt5_quote, session, hl_age, mt5_age, syn
     return "stream", "flowing", reason or "链路正常"
 
 
-def _pipeline_blockers(current, hl_quote, mt5_quote, session, hl_age, mt5_age, sync_diff, settings) -> list[dict[str, str]]:
+def _pipeline_blockers(current, hl_quote, mt5_quote, session, hl_age, mt5_age, sync_diff, settings, leg_a_venue: str = "hyperliquid", leg_b_venue: str = "mt5") -> list[dict[str, str]]:
     blockers: list[dict[str, str]] = []
     if not hl_quote:
-        blockers.append({"stage": "hl_quote", "message": "缺少 Hyperliquid 报价"})
+        blockers.append({"stage": "leg_a_quote", "message": f"缺少 {leg_a_venue} 报价"})
     elif hl_age is not None and hl_age > settings.quote_stale_ms:
-        blockers.append({"stage": "hl_quote", "message": f"Hyperliquid 行情过期 {hl_age:.0f}ms"})
+        blockers.append({"stage": "leg_a_quote", "message": f"{leg_a_venue} 行情过期 {hl_age:.0f}ms"})
     if not mt5_quote:
-        blockers.append({"stage": "mt5_quote", "message": "缺少 MT5 报价"})
+        blockers.append({"stage": "leg_b_quote", "message": f"缺少 {leg_b_venue} 报价"})
     elif mt5_age is not None and mt5_age > settings.quote_stale_ms:
-        blockers.append({"stage": "mt5_quote", "message": f"MT5 行情过期 {mt5_age:.0f}ms"})
-    if not session.can_quote:
-        blockers.append({"stage": "mt5_quote", "message": f"MT5 不可报价: {session.status}"})
+        blockers.append({"stage": "leg_b_quote", "message": f"{leg_b_venue} 行情过期 {mt5_age:.0f}ms"})
+    if "mt5" in {leg_a_venue, leg_b_venue} and not session.can_quote:
+        mt5_stage = "leg_a_quote" if leg_a_venue == "mt5" else "leg_b_quote"
+        blockers.append({"stage": mt5_stage, "message": f"mt5 不可报价: {session.status}"})
     if hl_quote and mt5_quote and sync_diff is not None and sync_diff > settings.loose_quote_sync_ms:
         blockers.append({"stage": "sync", "message": f"行情未对齐，时间差 {sync_diff:.0f}ms"})
     if not current:
@@ -245,9 +255,15 @@ def _pipeline_blockers(current, hl_quote, mt5_quote, session, hl_age, mt5_age, s
     if current_status == "rejected":
         reason = str(current.get("reason", "") or current.get("reject_reason", "") or "扫描拒绝")
         if "MT5" in reason and ("不可报价" in reason or "不可交易" in reason):
-            if not any(item["stage"] == "mt5_quote" and item["message"] == reason for item in blockers):
-                blockers.append({"stage": "mt5_quote", "message": reason})
+            mt5_stage = "leg_a_quote" if leg_a_venue == "mt5" else "leg_b_quote"
+            if not any(item["stage"] == mt5_stage and item["message"] == reason for item in blockers):
+                blockers.append({"stage": mt5_stage, "message": reason})
     return blockers
+
+
+def _venue_label(venue: str) -> str:
+    labels = {"hyperliquid": "Hyperliquid", "mt5": "MT5", "binance": "Binance", "okx": "OKX", "bybit": "Bybit"}
+    return labels.get(str(venue or "").lower(), str(venue or "").upper() or "-")
 
 
 def _quote_status(quote, age_ms: float | None, stale_ms: int) -> str:
@@ -258,6 +274,12 @@ def _quote_status(quote, age_ms: float | None, stale_ms: int) -> str:
     if age_ms is not None and age_ms > stale_ms * 0.7:
         return "warning"
     return "flowing"
+
+
+def _venue_quote_status(venue: str, quote, age_ms: float | None, session, stale_ms: int) -> str:
+    if venue == "mt5":
+        return _mt5_quote_status(quote, age_ms, session, stale_ms)
+    return _quote_status(quote, age_ms, stale_ms)
 
 
 def _mt5_quote_status(quote, age_ms: float | None, session, stale_ms: int) -> str:
@@ -311,6 +333,12 @@ def _quote_message(quote, age_ms: float | None) -> str:
     return f"{quote.source}; age={_fmt_ms(age_ms)}"
 
 
+def _venue_quote_message(venue: str, quote, age_ms: float | None, session) -> str:
+    if venue == "mt5":
+        return _mt5_quote_message(quote, age_ms, session)
+    return _quote_message(quote, age_ms)
+
+
 def _mt5_quote_message(quote, age_ms: float | None, session) -> str:
     if not session.can_quote:
         return f"{session.status}: {session.reason}"
@@ -351,8 +379,8 @@ def _best_opportunity(rows: list[dict[str, Any]]) -> dict[str, Any] | None:
     return sorted(rows, key=lambda row: rank.get(str(row.get("status", "")), 0), reverse=True)[0]
 
 
-def _pool_payload(groups: list[HedgeGroup | HedgeGroupSnapshot], now: datetime) -> dict[str, Any]:
-    items = sorted((_group_payload(group, now) for group in groups), key=_pool_item_sort_key)
+def _pool_payload(groups: list[HedgeGroup | HedgeGroupSnapshot], now: datetime, mappings_by_symbol: dict[str, SymbolMapping] | None = None) -> dict[str, Any]:
+    items = sorted((_group_payload(group, now, mappings_by_symbol) for group in groups), key=_pool_item_sort_key)
     lanes = [
         {"key": "pending", "label": "待执行", "count": _lane_count(items, "pending")},
         {"key": "opening", "label": "建仓中", "count": _lane_count(items, "opening")},
@@ -372,15 +400,22 @@ def _pool_item_sort_key(item: dict[str, Any]) -> tuple[int, str, int]:
     )
 
 
-def _group_payload(group: HedgeGroup | HedgeGroupSnapshot, now: datetime) -> dict[str, Any]:
-    stage = _group_stage(group)
-    spreads = hedge_group_spreads(group)
+def _group_payload(group: HedgeGroup | HedgeGroupSnapshot, now: datetime, mappings_by_symbol: dict[str, SymbolMapping] | None = None) -> dict[str, Any]:
+    stage = _group_stage(group, mappings_by_symbol)
+    mapping = (mappings_by_symbol or {}).get(group.symbol)
+    leg_a_venue, leg_a_symbol = mapping_leg(mapping, "a") if mapping else ("hyperliquid", "")
+    leg_b_venue, leg_b_symbol = mapping_leg(mapping, "b") if mapping else ("mt5", "")
+    spreads = hedge_group_spreads(group, mapping=mapping)
     unrealized_pnl = _runtime_unrealized_pnl(group, spreads)
     updated_at = getattr(group, "updated_at", None) or getattr(group, "opened_at", None) or getattr(group, "closed_at", None)
     return {
         "id": group.id,
         "symbol": group.symbol,
         "direction": group.direction,
+        "leg_a_venue": leg_a_venue,
+        "leg_a_symbol": leg_a_symbol,
+        "leg_b_venue": leg_b_venue,
+        "leg_b_symbol": leg_b_symbol,
         "status": group.status,
         "stage": stage,
         "stage_label": _stage_label(stage),
@@ -411,7 +446,7 @@ def _runtime_unrealized_pnl(group: HedgeGroup | HedgeGroupSnapshot, spreads: dic
     return float(group.unrealized_pnl or 0.0)
 
 
-def _group_stage(group: HedgeGroup | HedgeGroupSnapshot) -> str:
+def _group_stage(group: HedgeGroup | HedgeGroupSnapshot, mappings_by_symbol: dict[str, SymbolMapping] | None = None) -> str:
     if group.status in {"pending_open"}:
         return "pending"
     if group.status in {"opening"}:
@@ -421,7 +456,8 @@ def _group_stage(group: HedgeGroup | HedgeGroupSnapshot) -> str:
     if group.status in {"manual_intervention", "failed"}:
         return "manual"
     if group.status in {"open", "open_partial"}:
-        current = hedge_group_spreads(group).get("current_close_spread")
+        mapping = (mappings_by_symbol or {}).get(group.symbol)
+        current = hedge_group_spreads(group, mapping=mapping).get("current_close_spread")
         unrealized_pnl = _runtime_unrealized_pnl(group, {"current_close_spread": current})
         if group.exit_target and group.entry_spread and unrealized_pnl > 0:
             return "ready_to_close"

@@ -6,6 +6,7 @@ import { useMemo, useState } from 'react';
 import { api } from '../api/client';
 import { EllipsisCell } from '../components/EllipsisCell';
 import { fmtChartDate, fmtChartDateTime, fmtChartTime, fmtNum, fmtPct } from '../utils/format';
+import { venueLabel } from '../utils/venues';
 
 const ranges = [
   { value: '24h', label: '24小时' },
@@ -60,6 +61,9 @@ export function FundingAnalyticsPage() {
 
   const summary = query.data?.summary;
   const items = query.data?.items || [];
+  const fundingVenue = query.data?.funding_venue;
+  const fundingSymbol = query.data?.funding_symbol;
+  const fundingLabel = fundingVenue ? `${venueLabel(fundingVenue)} ${fundingSymbol || ''}`.trim() : '不支持资金费历史';
   const option = useMemo(() => {
     const times = items.map((row: any) => (bucket === 'day' ? fmtChartDate(row.time) : bucket === 'hour' ? fmtChartDateTime(row.time) : fmtChartTime(row.time)));
     const sumRates = items.map((row: any) => row.sum_funding_rate);
@@ -114,16 +118,16 @@ export function FundingAnalyticsPage() {
           <Tag icon={<LineChartOutlined />} color={biasColor(summary?.bias)}>
             {biasText(summary?.bias)}
           </Tag>
-          <EllipsisCell value={query.data?.hyperliquid_symbol} className="analytics-reason" />
+          <EllipsisCell value={fundingLabel} className="analytics-reason" />
         </Space>
       </Card>
 
-      {query.data?.source_error ? <Alert type="warning" showIcon message="资金费历史读取失败" description={query.data.source_error} /> : null}
+      {query.data?.source_error ? <Alert type="warning" showIcon message={query.data?.supported === false ? "资金费历史暂不支持该组合" : "资金费历史读取失败"} description={query.data.source_error} /> : null}
 
       <Row gutter={[16, 16]}>
         <Col xs={24} sm={12} lg={6}>
           <Card className="metric-card">
-            <Statistic title="最新资金费率" value={fmtRate(summary?.latest_funding_rate)} />
+            <Statistic title={`${venueLabel(fundingVenue)} 最新资金费率`} value={fmtRate(summary?.latest_funding_rate)} />
           </Card>
         </Col>
         <Col xs={24} sm={12} lg={6}>

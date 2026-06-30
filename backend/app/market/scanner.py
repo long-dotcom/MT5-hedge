@@ -11,15 +11,16 @@ from app.db.retention import prune_table_by_id
 from app.market.symbols import enabled_mappings
 from app.market.fx import fx_to_usd
 from app.market.orderbook import order_book_cache, simulate_market_fill
-from app.market.quotes import quote_synchronizer
+from app.market.quotes import quote_cache, quote_synchronizer
 from app.market.scan_state import scan_state_store
 from app.market.mt5_sessions import mt5_action_allowed, mt5_session_state
 from app.market.mt5_tradability import mt5_tradability_cache
 from app.strategy.cost import estimate_cost
-from app.strategy.live_costs import hyperliquid_cost_inputs, mt5_cost_inputs
+from app.strategy.live_costs import leg_a_cost_inputs, mt5_cost_inputs
 from app.strategy.statistical_signal import evaluate_entry_signal
 from app.execution.circuit_breaker import feed_spread as breaker_feed
-from app.strategy.spread_math import DIRECTIONS, LONG_HL_SHORT_MT5, spreads_for_direction
+from app.strategy.spread_math import DIRECTIONS, LONG_LEG_A_SHORT_LEG_B, spreads_for_direction
+from app.adapters.venue import is_native_pair, mapping_leg
 
 
 @dataclass
@@ -43,10 +44,10 @@ class BucketAccumulator:
 
 @dataclass
 class PositionSizing:
-    mt5_quantity: float
-    mt5_base_quantity: float
-    mt5_point_value_usd: float
-    hyperliquid_quantity: float
+    leg_b_quantity: float
+    leg_b_base_quantity: float
+    leg_b_point_value_usd: float
+    leg_a_quantity: float
     notional_usd: float
     currency: str
     fx_rate_to_usd: float
@@ -104,6 +105,34 @@ def run_scan(db: Session) -> int:
             symbol_started = perf_counter()
             timings: dict[str, float] = {}
             try:
+                if not is_native_pair(mapping):
+                    persist_started = perf_counter()
+                    readonly_payloads = _readonly_leg_pair_payloads(mapping, settings)
+                    if readonly_payloads:
+                        direction_payloads_all.extend(readonly_payloads)
+                        current_payloads.append(_best_current_payload(readonly_payloads))
+                    else:
+                        current_payloads.append(_current_payload(
+                            symbol=mapping.symbol,
+                            direction="none",
+                            leg_a_bid=0,
+                            leg_a_ask=0,
+                            leg_b_bid=0,
+                            leg_b_ask=0,
+                            quantity=0,
+                            gross_spread=0,
+                            unit_cost=0,
+                            unit_net_profit=0,
+                            total_cost=0,
+                            net_profit=0,
+                            annualized_return=0,
+                            status="rejected",
+                            reason="缺少 Nautilus 只读行情",
+                            gate="quote",
+                            blocker="quote",
+                        ))
+                    _record_duration(timings, "persist_duration_ms", persist_started)
+                    continue
                 quote_sync_started = perf_counter()
                 session_state = mt5_session_state(mapping)
                 if not session_state.can_quote:
@@ -112,10 +141,10 @@ def run_scan(db: Session) -> int:
                     current_payloads.append(_current_payload(
                         symbol=mapping.symbol,
                         direction="none",
-                        hyperliquid_bid=0,
-                        hyperliquid_ask=0,
-                        mt5_bid=0,
-                        mt5_ask=0,
+                        leg_a_bid=0,
+                        leg_a_ask=0,
+                        leg_b_bid=0,
+                        leg_b_ask=0,
                         quantity=0,
                         gross_spread=0,
                         unit_cost=0,
@@ -130,11 +159,16 @@ def run_scan(db: Session) -> int:
                     ))
                     _record_duration(timings, "persist_duration_ms", persist_started)
                     continue
+                leg_a_venue_name, _ = mapping_leg(mapping, "a")
+                leg_b_venue_name, _ = mapping_leg(mapping, "b")
+                leg_meta = _leg_metadata(mapping)
                 synced, sync_reason = quote_synchronizer.synchronized(
                     mapping.symbol,
                     mode="loose",
                     max_time_diff_ms=settings.loose_quote_sync_ms,
                     max_age_ms=max(settings.quote_stale_ms, settings.loose_quote_sync_ms),
+                    leg_a_venue=leg_a_venue_name,
+                    leg_b_venue=leg_b_venue_name,
                 )
                 _record_duration(timings, "quote_sync_duration_ms", quote_sync_started)
                 if not synced:
@@ -142,10 +176,10 @@ def run_scan(db: Session) -> int:
                     current_payloads.append(_current_payload(
                         symbol=mapping.symbol,
                         direction="none",
-                        hyperliquid_bid=0,
-                        hyperliquid_ask=0,
-                        mt5_bid=0,
-                        mt5_ask=0,
+                        leg_a_bid=0,
+                        leg_a_ask=0,
+                        leg_b_bid=0,
+                        leg_b_ask=0,
                         quantity=0,
                         gross_spread=0,
                         unit_cost=0,
@@ -160,8 +194,8 @@ def run_scan(db: Session) -> int:
                     ))
                     _record_duration(timings, "persist_duration_ms", persist_started)
                     continue
-                hl = synced.hyperliquid
-                mt = synced.mt5
+                hl = synced.leg_a
+                mt = synced.leg_b
 
                 sizing_started = perf_counter()
                 try:
@@ -172,13 +206,13 @@ def run_scan(db: Session) -> int:
                     current_payloads.append(_current_payload(
                         symbol=mapping.symbol,
                         direction="none",
-                        hyperliquid_bid=hl.bid,
-                        hyperliquid_ask=hl.ask,
-                        mt5_bid=mt.bid,
-                        mt5_ask=mt.ask,
+                        leg_a_bid=hl.bid,
+                        leg_a_ask=hl.ask,
+                        leg_b_bid=mt.bid,
+                        leg_b_ask=mt.ask,
                         quantity=0,
-                        mt5_quantity=0,
-                        hyperliquid_quantity=0,
+                        leg_b_quantity=0,
+                        leg_a_quantity=0,
                         notional_currency=(mapping.mt5_currency_profit or mapping.quote_asset or "USD"),
                         fx_rate_to_usd=0,
                         gross_spread=0,
@@ -197,7 +231,7 @@ def run_scan(db: Session) -> int:
                 _record_duration(timings, "sizing_duration_ms", sizing_started)
 
                 holding_hours = max(strategy.max_holding_minutes / 60, 1)
-                hl_costs = hyperliquid_cost_inputs(mapping.hyperliquid_symbol)
+                hl_costs = leg_a_cost_inputs(mapping.leg_a_venue_symbol)
                 persist_started = perf_counter()
                 direction_payloads = []
                 cost_started = perf_counter()
@@ -207,34 +241,34 @@ def run_scan(db: Session) -> int:
                     spread_values = spreads_for_direction(direction, hl.bid, hl.ask, mt.bid, mt.ask)
                     gross_spread = spread_values.entry_spread
                     breaker_feed(mapping.symbol, direction, spread_values.entry_spread)
-                    gross_profit = gross_spread * sizing.hyperliquid_quantity
-                    quantity = sizing.mt5_quantity
+                    gross_profit = gross_spread * sizing.leg_a_quantity
+                    quantity = sizing.leg_b_quantity
                     notional = sizing.notional_usd
-                    hyperliquid_side = "buy" if direction == LONG_HL_SHORT_MT5 else "sell"
-                    mt5_side = "sell" if direction == LONG_HL_SHORT_MT5 else "buy"
-                    mt5_costs = mt5_cost_inputs(mapping.mt5_symbol, mt5_side, sizing.mt5_quantity, holding_hours / 24)
+                    leg_a_side = "buy" if direction == LONG_LEG_A_SHORT_LEG_B else "sell"
+                    leg_b_side = "sell" if direction == LONG_LEG_A_SHORT_LEG_B else "buy"
+                    mt5_costs = mt5_cost_inputs(mapping.mt5_symbol, leg_b_side, sizing.leg_b_quantity, holding_hours / 24)
                     cost = estimate_cost(
                         notional,
                         mt.bid,
                         mt.ask,
                         min(mapping.max_slippage_bps, settings.default_slippage_bps),
-                        quantity=sizing.hyperliquid_quantity,
-                        hyperliquid_bid=hl.bid,
-                        hyperliquid_ask=hl.ask,
-                        hyperliquid_fee_rate=_hl_fee_rate(mapping.hl_open_order_type, hl_costs),
-                        hyperliquid_fee_round_trips=settings.hyperliquid_fee_round_trips,
-                        hyperliquid_close_fee_rate=_hl_fee_rate(mapping.hl_close_order_type, hl_costs),
-                        hyperliquid_funding_rate=hl_costs.funding_rate,
-                        hyperliquid_side=hyperliquid_side,
-                        mt5_commission_rate=mt5_costs.commission_rate,
-                        mt5_swap_cost=mt5_costs.swap_cost,
+                        quantity=sizing.leg_a_quantity,
+                        leg_a_bid=hl.bid,
+                        leg_a_ask=hl.ask,
+                        leg_a_fee_rate=_leg_a_fee_rate(mapping.hl_open_order_type, hl_costs),
+                        leg_a_fee_round_trips=settings.hyperliquid_fee_round_trips,
+                        leg_a_close_fee_rate=_leg_a_fee_rate(mapping.hl_close_order_type, hl_costs),
+                        leg_a_funding_rate=hl_costs.funding_rate,
+                        leg_a_side=leg_a_side,
+                        leg_b_commission_rate=mt5_costs.commission_rate,
+                        leg_b_swap_cost=mt5_costs.swap_cost,
                         holding_hours=holding_hours,
-                        mt5_spread_rebate_rate=settings.mt5_spread_rebate_rate,
+                        leg_b_spread_rebate_rate=settings.mt5_spread_rebate_rate,
                         fx_cost_rate=settings.default_fx_cost_rate,
                         source=f"{hl_costs.source};{mt5_costs.source}",
                     )
                     net_profit = gross_profit - cost.total
-                    unit_cost = cost.total / sizing.hyperliquid_quantity if sizing.hyperliquid_quantity > 0 else cost.total
+                    unit_cost = cost.total / sizing.leg_a_quantity if sizing.leg_a_quantity > 0 else cost.total
                     unit_net_profit = gross_spread - unit_cost
                     annualized_return = (net_profit / notional) * (365 * 24 / holding_hours)
                     statistical_signal = evaluate_entry_signal(
@@ -254,25 +288,27 @@ def run_scan(db: Session) -> int:
                     risk_tags = _risk_tags(gross_spread, statistical_signal)
                     liquidity_gate = _liquidity_gate(
                         mapping.symbol,
-                        hyperliquid_side,
-                        sizing.hyperliquid_quantity,
+                        leg_a_side,
+                        sizing.leg_a_quantity,
                         notional,
                         hl.depth_notional,
                         signal_gate.status,
+                        leg_a_venue_name,
                     )
-                    market_gate = _direction_market_gate(session_state, mapping.symbol, direction, mt5_side)
+                    market_gate = _direction_market_gate(session_state, mapping.symbol, direction, leg_b_side)
                     final_gate = _combine_gates(signal_gate, liquidity_gate, market_gate)
                     reason = final_gate.reason or f"loose_sync={synced.time_diff_ms:.0f}ms; mt5_session={session_state.status}"
                     payload = dict(
                         symbol=mapping.symbol,
                         direction=direction,
-                        hyperliquid_bid=hl.bid,
-                        hyperliquid_ask=hl.ask,
-                        mt5_bid=mt.bid,
-                        mt5_ask=mt.ask,
+                        **leg_meta,
+                        leg_a_bid=hl.bid,
+                        leg_a_ask=hl.ask,
+                        leg_b_bid=mt.bid,
+                        leg_b_ask=mt.ask,
                         quantity=quantity,
-                        mt5_quantity=sizing.mt5_quantity,
-                        hyperliquid_quantity=sizing.hyperliquid_quantity,
+                        leg_b_quantity=sizing.leg_b_quantity,
+                        leg_a_quantity=sizing.leg_a_quantity,
                         notional_currency=sizing.currency,
                         fx_rate_to_usd=sizing.fx_rate_to_usd,
                         gross_spread=gross_spread,
@@ -291,10 +327,10 @@ def run_scan(db: Session) -> int:
                         blocker=final_gate.blocker,
                         risk_tags=risk_tags,
                         sampled_at=datetime.now(timezone.utc).replace(tzinfo=None),
-                        hyperliquid_captured_at=hl.local_recv_ts,
-                        mt5_captured_at=mt.local_recv_ts,
-                        hyperliquid_depth_notional=hl.depth_notional,
-                        mt5_depth_notional=mt.depth_notional,
+                        leg_a_captured_at=hl.local_recv_ts,
+                        leg_b_captured_at=mt.local_recv_ts,
+                        leg_a_depth_notional=hl.depth_notional,
+                        leg_b_depth_notional=mt.depth_notional,
                     )
                     direction_payloads_all.append(payload)
                     opportunity_payload = _opportunity_payload(
@@ -343,30 +379,30 @@ def _round_up_to_step(value: float, step: float, precision: int) -> float:
     return round(units * step, precision)
 
 
-def _position_sizing(mapping, mt5_mid: float, hyperliquid_mid: float, target_notional_usd: float) -> PositionSizing:
+def _position_sizing(mapping, leg_b_mid: float, leg_a_mid: float, target_notional_usd: float) -> PositionSizing:
     currency = (mapping.mt5_currency_profit or mapping.quote_asset or "USD").upper()
     fx = fx_to_usd(currency)
     contract_size = mapping.mt5_contract_size or mapping.contract_multiplier or 1.0
     lot_min = mapping.mt5_min_lot or mapping.min_order_size or 0.0
     lot_step = mapping.mt5_volume_step or lot_min or 0.0
-    if mt5_mid <= 0 or hyperliquid_mid <= 0:
+    if leg_b_mid <= 0 or leg_a_mid <= 0:
         raise ValueError("报价异常，无法计算名义价值")
-    lot_notional_usd = mt5_mid * contract_size * fx.rate_to_usd
+    lot_notional_usd = leg_b_mid * contract_size * fx.rate_to_usd
     if lot_notional_usd <= 0:
         raise ValueError("MT5 单手 USD 名义价值异常")
     raw_lots = max(target_notional_usd / lot_notional_usd, lot_min)
-    mt5_lots = _round_up_to_step(raw_lots, lot_step, _decimal_places(lot_step))
-    mt5_base_quantity = mt5_lots * contract_size
-    mt5_point_value_usd = mt5_base_quantity * fx.rate_to_usd
-    notional_usd = mt5_mid * mt5_base_quantity * fx.rate_to_usd
-    hyperliquid_quantity = mt5_point_value_usd
-    if hyperliquid_quantity <= 0:
+    leg_b_lots = _round_up_to_step(raw_lots, lot_step, _decimal_places(lot_step))
+    leg_b_base_quantity = leg_b_lots * contract_size
+    leg_b_point_value_usd = leg_b_base_quantity * fx.rate_to_usd
+    notional_usd = leg_b_mid * leg_b_base_quantity * fx.rate_to_usd
+    leg_a_quantity = leg_b_point_value_usd
+    if leg_a_quantity <= 0:
         raise ValueError("Hyperliquid 数量异常")
     return PositionSizing(
-        mt5_quantity=mt5_lots,
-        mt5_base_quantity=mt5_base_quantity,
-        mt5_point_value_usd=mt5_point_value_usd,
-        hyperliquid_quantity=round(hyperliquid_quantity, 8),
+        leg_b_quantity=leg_b_lots,
+        leg_b_base_quantity=leg_b_base_quantity,
+        leg_b_point_value_usd=leg_b_point_value_usd,
+        leg_a_quantity=round(leg_a_quantity, 8),
         notional_usd=notional_usd,
         currency=currency,
         fx_rate_to_usd=fx.rate_to_usd,
@@ -379,8 +415,79 @@ def _decimal_places(value: float) -> int:
     return len(text.split(".", 1)[1]) if "." in text else 0
 
 
-def _hl_fee_rate(order_type: str, hl_costs) -> float:
+def _leg_a_fee_rate(order_type: str, hl_costs) -> float:
     return hl_costs.maker_fee_rate if order_type == "limit" else hl_costs.taker_fee_rate
+
+
+def _readonly_leg_pair_payloads(mapping, settings) -> list[dict]:
+    leg_a_venue, _ = mapping_leg(mapping, "a")
+    leg_b_venue, _ = mapping_leg(mapping, "b")
+    leg_meta = _leg_metadata(mapping)
+    leg_a = quote_cache.latest(leg_a_venue, mapping.symbol)
+    leg_b = quote_cache.latest(leg_b_venue, mapping.symbol)
+    if not leg_a or not leg_b:
+        return []
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    max_age = max((now - leg_a.local_recv_ts).total_seconds() * 1000, (now - leg_b.local_recv_ts).total_seconds() * 1000)
+    if max_age > max(settings.quote_stale_ms, settings.loose_quote_sync_ms):
+        return []
+    time_diff = abs((leg_a.local_recv_ts - leg_b.local_recv_ts).total_seconds() * 1000)
+    if time_diff > settings.loose_quote_sync_ms:
+        return []
+    if leg_a.bid <= 0 or leg_a.ask <= 0 or leg_b.bid <= 0 or leg_b.ask <= 0:
+        return []
+    quantity = max(float(getattr(mapping, "min_order_size", 0.0) or 0.0), 1.0)
+    direction_specs = (
+        ("long_leg_a_short_leg_b", leg_b.bid - leg_a.ask, leg_a.mid - leg_b.mid),
+        ("long_leg_b_short_leg_a", leg_a.bid - leg_b.ask, leg_b.mid - leg_a.mid),
+    )
+    rows = []
+    for direction, entry_spread, mid_spread in direction_specs:
+        rows.append(_current_payload(
+            symbol=mapping.symbol,
+            direction=direction,
+            **leg_meta,
+            leg_a_bid=leg_a.bid,
+            leg_a_ask=leg_a.ask,
+            leg_b_bid=leg_b.bid,
+            leg_b_ask=leg_b.ask,
+            quantity=quantity,
+            leg_b_quantity=quantity,
+            leg_a_quantity=quantity,
+            notional_currency=getattr(mapping, "quote_asset", "USD") or "USD",
+            fx_rate_to_usd=1.0,
+            gross_spread=entry_spread,
+            entry_spread=entry_spread,
+            close_spread=-entry_spread,
+            mid_spread=mid_spread,
+            spread_cost=0.0,
+            unit_cost=0.0,
+            unit_net_profit=entry_spread,
+            total_cost=0.0,
+            net_profit=entry_spread * quantity,
+            annualized_return=0.0,
+            status="candidate",
+            reason=f"Nautilus V1 只读候选: {leg_a_venue}/{leg_b_venue}; 不进入自动执行",
+            gate="readonly",
+            blocker="execution",
+            sampled_at=now,
+            leg_a_captured_at=leg_a.local_recv_ts,
+            leg_b_captured_at=leg_b.local_recv_ts,
+            leg_a_depth_notional=leg_a.depth_notional,
+            leg_b_depth_notional=leg_b.depth_notional,
+        ))
+    return rows
+
+
+def _leg_metadata(mapping) -> dict[str, str]:
+    leg_a_venue, leg_a_symbol = mapping_leg(mapping, "a")
+    leg_b_venue, leg_b_symbol = mapping_leg(mapping, "b")
+    return {
+        "leg_a_venue": leg_a_venue,
+        "leg_a_symbol": leg_a_symbol,
+        "leg_b_venue": leg_b_venue,
+        "leg_b_symbol": leg_b_symbol,
+    }
 
 
 def _signal_gate(mapping: SymbolMapping, signal, gross_spread: float) -> GateResult:
@@ -407,10 +514,10 @@ def _risk_tags(gross_spread: float, statistical_signal) -> list[dict[str, float 
     return tags
 
 
-def _liquidity_gate(symbol: str, side: str, quantity: float, notional: float, top_depth_notional: float, current_status: str) -> GateResult:
+def _liquidity_gate(symbol: str, side: str, quantity: float, notional: float, top_depth_notional: float, current_status: str, leg_a_venue: str = "hyperliquid") -> GateResult:
     if current_status not in {"candidate", "executable"}:
         return GateResult("pass", "", "liquidity")
-    liquidity_reason = _hyperliquid_liquidity_reason(symbol, side, quantity, notional, top_depth_notional)
+    liquidity_reason = _leg_a_liquidity_reason(symbol, side, quantity, notional, top_depth_notional, leg_a_venue)
     if liquidity_reason:
         return GateResult("candidate", liquidity_reason, "liquidity", "liquidity")
     return GateResult("pass", "", "liquidity")
@@ -439,15 +546,15 @@ def _combine_gates(signal_gate: GateResult, liquidity_gate: GateResult, market_g
     return GateResult("executable", signal_gate.reason, "signal")
 
 
-def _hyperliquid_liquidity_reason(symbol: str, side: str, quantity: float, notional: float, top_depth_notional: float) -> str:
-    book = order_book_cache.latest("hyperliquid", symbol)
+def _leg_a_liquidity_reason(symbol: str, side: str, quantity: float, notional: float, top_depth_notional: float, leg_a_venue: str = "hyperliquid") -> str:
+    book = order_book_cache.latest(leg_a_venue, symbol)
     if book:
         fill = simulate_market_fill(book, side, quantity)
         if not fill.enough_liquidity:
-            return f"Hyperliquid L2 深度不足: 目标 {quantity:.8f}，可成交 {fill.filled_quantity:.8f}"
+            return f"{leg_a_venue} L2 深度不足: 目标 {quantity:.8f}，可成交 {fill.filled_quantity:.8f}"
         return ""
     if top_depth_notional > 0 and notional > top_depth_notional:
-        return f"Hyperliquid 顶层深度不足: 目标 {notional:.2f} USD > 深度 {top_depth_notional:.2f} USD"
+        return f"{leg_a_venue} 顶层深度不足: 目标 {notional:.2f} USD > 深度 {top_depth_notional:.2f} USD"
     return ""
 
 
@@ -479,8 +586,8 @@ def _current_payload(**values) -> dict:
     values.setdefault("close_spread", values.get("gross_spread", 0.0))
     values.setdefault("mid_spread", values.get("gross_spread", 0.0))
     values.setdefault("spread_cost", values.get("close_spread", 0.0) - values.get("entry_spread", 0.0))
-    values.setdefault("mt5_quantity", values.get("quantity", 0.0))
-    values.setdefault("hyperliquid_quantity", values.get("quantity", 0.0))
+    values.setdefault("leg_b_quantity", values.get("quantity", 0.0))
+    values.setdefault("leg_a_quantity", values.get("quantity", 0.0))
     values.setdefault("notional_currency", "USD")
     values.setdefault("fx_rate_to_usd", 1.0)
     values.setdefault("sampled_at", datetime.now(timezone.utc).replace(tzinfo=None))
@@ -501,8 +608,8 @@ def _opportunity_payload(
         return None
     return {
         **{key: payload[key] for key in (
-            "symbol", "direction", "hyperliquid_bid", "hyperliquid_ask", "mt5_bid", "mt5_ask",
-            "quantity", "mt5_quantity", "hyperliquid_quantity", "notional_currency", "fx_rate_to_usd",
+            "symbol", "direction", "leg_a_bid", "leg_a_ask", "leg_b_bid", "leg_b_ask",
+            "quantity", "leg_b_quantity", "leg_a_quantity", "notional_currency", "fx_rate_to_usd",
             "gross_spread", "unit_cost", "unit_net_profit", "total_cost", "net_profit",
             "annualized_return", "status"
         )},
@@ -553,10 +660,10 @@ def _filter_payload(payload: dict, fields: set[str]) -> dict:
 
 def _spread_current_fields() -> set[str]:
     return {
-        "symbol", "direction", "hyperliquid_bid", "hyperliquid_ask", "mt5_bid", "mt5_ask",
+        "symbol", "direction", "leg_a_bid", "leg_a_ask", "leg_b_bid", "leg_b_ask",
         "quantity", "gross_spread", "unit_cost", "unit_net_profit", "total_cost", "net_profit",
         "annualized_return", "status", "reason", "entry_spread", "close_spread", "mid_spread",
-        "spread_cost", "mt5_quantity", "hyperliquid_quantity", "notional_currency", "fx_rate_to_usd",
+        "spread_cost", "leg_b_quantity", "leg_a_quantity", "notional_currency", "fx_rate_to_usd",
     }
 
 
@@ -569,10 +676,10 @@ def _upsert_current_spread(
     *,
     symbol: str,
     direction: str,
-    hyperliquid_bid: float,
-    hyperliquid_ask: float,
-    mt5_bid: float,
-    mt5_ask: float,
+    leg_a_bid: float,
+    leg_a_ask: float,
+    leg_b_bid: float,
+    leg_b_ask: float,
     quantity: float,
     gross_spread: float,
     unit_cost: float,
@@ -586,8 +693,8 @@ def _upsert_current_spread(
     close_spread: float = 0.0,
     mid_spread: float = 0.0,
     spread_cost: float = 0.0,
-    mt5_quantity: float = 0.0,
-    hyperliquid_quantity: float = 0.0,
+    leg_b_quantity: float = 0.0,
+    leg_a_quantity: float = 0.0,
     notional_currency: str = "USD",
     fx_rate_to_usd: float = 1.0,
 ) -> SpreadCurrent:
@@ -596,13 +703,13 @@ def _upsert_current_spread(
         row = SpreadCurrent(symbol=symbol)
         db.add(row)
     row.direction = direction
-    row.hyperliquid_bid = hyperliquid_bid
-    row.hyperliquid_ask = hyperliquid_ask
-    row.mt5_bid = mt5_bid
-    row.mt5_ask = mt5_ask
+    row.leg_a_bid = leg_a_bid
+    row.leg_a_ask = leg_a_ask
+    row.leg_b_bid = leg_b_bid
+    row.leg_b_ask = leg_b_ask
     row.quantity = quantity
-    row.mt5_quantity = mt5_quantity or quantity
-    row.hyperliquid_quantity = hyperliquid_quantity or quantity
+    row.leg_b_quantity = leg_b_quantity or quantity
+    row.leg_a_quantity = leg_a_quantity or quantity
     row.notional_currency = notional_currency
     row.fx_rate_to_usd = fx_rate_to_usd
     row.gross_spread = gross_spread
@@ -626,10 +733,10 @@ def _upsert_direction_current(
     *,
     symbol: str,
     direction: str,
-    hyperliquid_bid: float,
-    hyperliquid_ask: float,
-    mt5_bid: float,
-    mt5_ask: float,
+    leg_a_bid: float,
+    leg_a_ask: float,
+    leg_b_bid: float,
+    leg_b_ask: float,
     quantity: float,
     gross_spread: float,
     entry_spread: float,
@@ -643,8 +750,8 @@ def _upsert_direction_current(
     annualized_return: float,
     status: str,
     reason: str,
-    mt5_quantity: float = 0.0,
-    hyperliquid_quantity: float = 0.0,
+    leg_b_quantity: float = 0.0,
+    leg_a_quantity: float = 0.0,
     notional_currency: str = "USD",
     fx_rate_to_usd: float = 1.0,
 ) -> SpreadDirectionCurrent:
@@ -652,13 +759,13 @@ def _upsert_direction_current(
     if not row:
         row = SpreadDirectionCurrent(symbol=symbol, direction=direction)
         db.add(row)
-    row.hyperliquid_bid = hyperliquid_bid
-    row.hyperliquid_ask = hyperliquid_ask
-    row.mt5_bid = mt5_bid
-    row.mt5_ask = mt5_ask
+    row.leg_a_bid = leg_a_bid
+    row.leg_a_ask = leg_a_ask
+    row.leg_b_bid = leg_b_bid
+    row.leg_b_ask = leg_b_ask
     row.quantity = quantity
-    row.mt5_quantity = mt5_quantity or quantity
-    row.hyperliquid_quantity = hyperliquid_quantity or quantity
+    row.leg_b_quantity = leg_b_quantity or quantity
+    row.leg_a_quantity = leg_a_quantity or quantity
     row.notional_currency = notional_currency
     row.fx_rate_to_usd = fx_rate_to_usd
     row.gross_spread = entry_spread
@@ -682,15 +789,15 @@ def _record_spread_history(
     *,
     symbol: str,
     direction: str,
-    hyperliquid_bid: float,
-    hyperliquid_ask: float,
-    mt5_bid: float,
-    mt5_ask: float,
-    hyperliquid,
-    mt5,
+    leg_a_bid: float,
+    leg_a_ask: float,
+    leg_b_bid: float,
+    leg_b_ask: float,
+    leg_a,
+    leg_b,
     quantity: float,
-    mt5_quantity: float,
-    hyperliquid_quantity: float,
+    leg_b_quantity: float,
+    leg_a_quantity: float,
     notional_currency: str,
     fx_rate_to_usd: float,
     gross_spread: float,
@@ -751,19 +858,19 @@ def _record_spread_history(
     if now.timestamp() - last_flush >= history_interval:
         _flush_bucket(db, accumulator)
         _last_snapshot_flush[key] = now.timestamp()
-        db.add(MarketSnapshot(platform="hyperliquid", symbol=symbol, bid=hyperliquid.bid, ask=hyperliquid.ask, mid=hyperliquid.mid, depth_notional=hyperliquid.depth_notional, captured_at=hyperliquid.local_recv_ts))
-        db.add(MarketSnapshot(platform="mt5", symbol=symbol, bid=mt5.bid, ask=mt5.ask, mid=mt5.mid, depth_notional=mt5.depth_notional, captured_at=mt5.local_recv_ts))
+        db.add(MarketSnapshot(platform="leg_a", symbol=symbol, bid=leg_a.bid, ask=leg_a.ask, mid=leg_a.mid, depth_notional=leg_a.depth_notional, captured_at=leg_a.local_recv_ts))
+        db.add(MarketSnapshot(platform="leg_b", symbol=symbol, bid=leg_b.bid, ask=leg_b.ask, mid=leg_b.mid, depth_notional=leg_b.depth_notional, captured_at=leg_b.local_recv_ts))
         db.add(
             SpreadSnapshot(
                 symbol=symbol,
                 direction=direction,
-                hyperliquid_bid=hyperliquid.bid,
-                hyperliquid_ask=hyperliquid.ask,
-                mt5_bid=mt5.bid,
-                mt5_ask=mt5.ask,
+                leg_a_bid=leg_a.bid,
+                leg_a_ask=leg_a.ask,
+                leg_b_bid=leg_b.bid,
+                leg_b_ask=leg_b.ask,
                 quantity=quantity,
-                mt5_quantity=mt5_quantity,
-                hyperliquid_quantity=hyperliquid_quantity,
+                leg_b_quantity=leg_b_quantity,
+                leg_a_quantity=leg_a_quantity,
                 notional_currency=notional_currency,
                 fx_rate_to_usd=fx_rate_to_usd,
                 gross_spread=entry_spread,
@@ -836,19 +943,19 @@ def _record_spread_history_from_payload(db: Session, payload: dict, settings) ->
         return
     _flush_bucket(db, accumulator)
     _last_snapshot_flush[key] = now.timestamp()
-    db.add(MarketSnapshot(platform="hyperliquid", symbol=symbol, bid=payload["hyperliquid_bid"], ask=payload["hyperliquid_ask"], mid=(payload["hyperliquid_bid"] + payload["hyperliquid_ask"]) / 2, depth_notional=float(payload.get("hyperliquid_depth_notional") or 0.0), captured_at=payload.get("hyperliquid_captured_at") or now))
-    db.add(MarketSnapshot(platform="mt5", symbol=symbol, bid=payload["mt5_bid"], ask=payload["mt5_ask"], mid=(payload["mt5_bid"] + payload["mt5_ask"]) / 2, depth_notional=float(payload.get("mt5_depth_notional") or 0.0), captured_at=payload.get("mt5_captured_at") or now))
+    db.add(MarketSnapshot(platform="leg_a", symbol=symbol, bid=payload["leg_a_bid"], ask=payload["leg_a_ask"], mid=(payload["leg_a_bid"] + payload["leg_a_ask"]) / 2, depth_notional=float(payload.get("leg_a_depth_notional") or 0.0), captured_at=payload.get("leg_a_captured_at") or now))
+    db.add(MarketSnapshot(platform="leg_b", symbol=symbol, bid=payload["leg_b_bid"], ask=payload["leg_b_ask"], mid=(payload["leg_b_bid"] + payload["leg_b_ask"]) / 2, depth_notional=float(payload.get("leg_b_depth_notional") or 0.0), captured_at=payload.get("leg_b_captured_at") or now))
     db.add(
         SpreadSnapshot(
             symbol=symbol,
             direction=direction,
-            hyperliquid_bid=payload["hyperliquid_bid"],
-            hyperliquid_ask=payload["hyperliquid_ask"],
-            mt5_bid=payload["mt5_bid"],
-            mt5_ask=payload["mt5_ask"],
+            leg_a_bid=payload["leg_a_bid"],
+            leg_a_ask=payload["leg_a_ask"],
+            leg_b_bid=payload["leg_b_bid"],
+            leg_b_ask=payload["leg_b_ask"],
             quantity=payload["quantity"],
-            mt5_quantity=payload.get("mt5_quantity", payload["quantity"]),
-            hyperliquid_quantity=payload.get("hyperliquid_quantity", payload["quantity"]),
+            leg_b_quantity=payload.get("leg_b_quantity", payload["quantity"]),
+            leg_a_quantity=payload.get("leg_a_quantity", payload["quantity"]),
             notional_currency=payload.get("notional_currency", "USD"),
             fx_rate_to_usd=payload.get("fx_rate_to_usd", 1.0),
             gross_spread=payload.get("entry_spread", gross_spread),
@@ -906,14 +1013,14 @@ def _sync_current_opportunity(
     *,
     symbol: str,
     direction: str,
-    hyperliquid_bid: float,
-    hyperliquid_ask: float,
-    mt5_bid: float,
-    mt5_ask: float,
+    leg_a_bid: float,
+    leg_a_ask: float,
+    leg_b_bid: float,
+    leg_b_ask: float,
     notional: float,
     quantity: float,
-    mt5_quantity: float,
-    hyperliquid_quantity: float,
+    leg_b_quantity: float,
+    leg_a_quantity: float,
     notional_currency: str,
     fx_rate_to_usd: float,
     gross_spread: float,
@@ -951,15 +1058,15 @@ def _sync_current_opportunity(
 
     current.notional = notional
     current.quantity = quantity
-    current.mt5_quantity = mt5_quantity
-    current.hyperliquid_quantity = hyperliquid_quantity
+    current.leg_b_quantity = leg_b_quantity
+    current.leg_a_quantity = leg_a_quantity
     current.notional_currency = notional_currency
     current.fx_rate_to_usd = fx_rate_to_usd
     current.gross_spread = gross_spread
-    current.trigger_hyperliquid_bid = hyperliquid_bid
-    current.trigger_hyperliquid_ask = hyperliquid_ask
-    current.trigger_mt5_bid = mt5_bid
-    current.trigger_mt5_ask = mt5_ask
+    current.trigger_leg_a_bid = leg_a_bid
+    current.trigger_leg_a_ask = leg_a_ask
+    current.trigger_leg_b_bid = leg_b_bid
+    current.trigger_leg_b_ask = leg_b_ask
     current.unit_cost = unit_cost
     current.unit_net_profit = unit_net_profit
     current.total_cost = total_cost
@@ -1007,15 +1114,15 @@ def _persist_opportunities(
         before = _opportunity_signature(current)
         current.notional = payload["notional"]
         current.quantity = payload["quantity"]
-        current.mt5_quantity = payload["mt5_quantity"]
-        current.hyperliquid_quantity = payload["hyperliquid_quantity"]
+        current.leg_b_quantity = payload["leg_b_quantity"]
+        current.leg_a_quantity = payload["leg_a_quantity"]
         current.notional_currency = payload["notional_currency"]
         current.fx_rate_to_usd = payload["fx_rate_to_usd"]
         current.gross_spread = payload["gross_spread"]
-        current.trigger_hyperliquid_bid = payload["hyperliquid_bid"]
-        current.trigger_hyperliquid_ask = payload["hyperliquid_ask"]
-        current.trigger_mt5_bid = payload["mt5_bid"]
-        current.trigger_mt5_ask = payload["mt5_ask"]
+        current.trigger_leg_a_bid = payload["leg_a_bid"]
+        current.trigger_leg_a_ask = payload["leg_a_ask"]
+        current.trigger_leg_b_bid = payload["leg_b_bid"]
+        current.trigger_leg_b_ask = payload["leg_b_ask"]
         current.unit_cost = payload["unit_cost"]
         current.unit_net_profit = payload["unit_net_profit"]
         current.total_cost = payload["total_cost"]

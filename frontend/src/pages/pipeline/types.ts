@@ -23,8 +23,12 @@ export type PipelineEdge = {
 
 export type SymbolPipeline = {
   symbol: string;
-  hyperliquid_symbol: string;
+  leg_a_venue_symbol: string;
   mt5_symbol: string;
+  leg_a_venue?: string;
+  leg_a_symbol?: string;
+  leg_b_venue?: string;
+  leg_b_symbol?: string;
   status: PipelineStatus;
   blocked_stage: string;
   reason: string;
@@ -34,6 +38,8 @@ export type SymbolPipeline = {
   metrics: {
     hl_age_ms?: number | null;
     mt5_age_ms?: number | null;
+    leg_a_age_ms?: number | null;
+    leg_b_age_ms?: number | null;
     sync_diff_ms?: number | null;
     scan_age_ms?: number | null;
     quote_sync_duration_ms?: number | null;
@@ -53,6 +59,10 @@ export type HedgePoolItem = {
   id: number;
   symbol: string;
   direction: string;
+  leg_a_venue?: string;
+  leg_a_symbol?: string;
+  leg_b_venue?: string;
+  leg_b_symbol?: string;
   status: string;
   stage: string;
   stage_label: string;

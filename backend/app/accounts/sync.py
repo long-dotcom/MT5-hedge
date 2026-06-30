@@ -6,12 +6,22 @@ from sqlalchemy import desc
 from sqlalchemy.orm import Session
 
 from app.adapters.paper import PaperAdapter
+from app.adapters.nautilus import nautilus_account_snapshot
+from app.adapters.venue import nautilus_venues_from_mappings
 from app.config.settings import get_settings, hyperliquid_execution_info_url
-from app.db.models import AccountSnapshot
+from app.db.models import AccountSnapshot, ExchangeCredential, SymbolMapping
+from app.exchanges.credentials import binance_account_balances, binance_futures_account, mark_test_result
 
 
 def sync_account_snapshots(db: Session) -> list[AccountSnapshot]:
     snapshots = [_hyperliquid_account_snapshot(), _mt5_account_snapshot()]
+    for credential in _enabled_exchange_credentials(db):
+        try:
+            snapshots.append(_configured_exchange_account_snapshot(credential))
+        except Exception as exc:
+            logger.warning(f"交易所账户读取失败: {credential.venue}; {exc}")
+            mark_test_result(credential, "failed", str(exc))
+            snapshots.append(_configured_exchange_status_snapshot(credential, "error"))
     for snapshot in snapshots:
         db.add(snapshot)
     db.commit()
@@ -20,7 +30,8 @@ def sync_account_snapshots(db: Session) -> list[AccountSnapshot]:
 
 def latest_account_snapshots(db: Session) -> list[AccountSnapshot]:
     rows: list[AccountSnapshot] = []
-    for platform in ("hyperliquid", "mt5"):
+    platforms = ["hyperliquid", "mt5", *_enabled_nautilus_venues(db)]
+    for platform in platforms:
         row = db.query(AccountSnapshot).filter(AccountSnapshot.platform == platform).order_by(desc(AccountSnapshot.created_at)).first()
         if row:
             rows.append(row)
@@ -43,6 +54,86 @@ def ensure_initial_account_snapshots(db: Session) -> None:
             )
         )
     db.commit()
+
+
+def _enabled_nautilus_venues(db: Session) -> list[str]:
+    mappings = db.query(SymbolMapping).filter(SymbolMapping.enabled.is_(True)).all()
+    venues = nautilus_venues_from_mappings(mappings)
+    configured = db.query(ExchangeCredential.venue).filter(ExchangeCredential.enabled.is_(True), ExchangeCredential.venue.notin_(["hyperliquid", "mt5"])).all()
+    for (venue,) in configured:
+        if venue not in venues:
+            venues.append(venue)
+    return venues
+
+
+def _enabled_exchange_credentials(db: Session) -> list[ExchangeCredential]:
+    return (
+        db.query(ExchangeCredential)
+        .filter(ExchangeCredential.enabled.is_(True), ExchangeCredential.venue.notin_(["hyperliquid", "mt5"]))
+        .order_by(ExchangeCredential.venue)
+        .all()
+    )
+
+
+def _configured_exchange_account_snapshot(row: ExchangeCredential) -> AccountSnapshot:
+    if row.venue == "binance":
+        try:
+            account = binance_futures_account(row)
+            equity = float(account.get("totalMarginBalance", 0.0) or account.get("totalWalletBalance", 0.0) or 0.0)
+            available = float(account.get("availableBalance", 0.0) or 0.0)
+            margin_used = float(account.get("totalInitialMargin", 0.0) or 0.0)
+            return AccountSnapshot(
+                platform=row.venue,
+                equity=equity,
+                available_balance=available,
+                margin_used=margin_used,
+                margin_ratio=(equity / margin_used) if margin_used > 0 else 1.0,
+                currency="USDT",
+                portfolio_value=equity,
+                perp_equity=equity,
+                withdrawable=available,
+                free_collateral=available,
+                data_source=f"binance_futures_{row.environment}_account"[:64],
+            )
+        except Exception:
+            balances = binance_account_balances(row)
+            stable_assets = {"USDT", "USDC", "BUSD", "FDUSD", "TUSD", "USD"}
+            stable_total = sum(amount for asset, amount in balances.items() if asset.upper() in stable_assets)
+        return AccountSnapshot(
+            platform=row.venue,
+            equity=stable_total,
+            available_balance=stable_total,
+            margin_used=0.0,
+            margin_ratio=1.0,
+            currency="USD",
+            portfolio_value=stable_total,
+            perp_equity=0.0,
+            withdrawable=stable_total,
+            free_collateral=stable_total,
+            data_source=f"binance_spot_{row.environment}_account"[:64],
+        )
+    try:
+        data = nautilus_account_snapshot(row.venue)
+        return AccountSnapshot(**data)
+    except Exception:
+        return _configured_exchange_status_snapshot(row, row.last_test_status or "not_implemented")
+
+
+def _configured_exchange_status_snapshot(row: ExchangeCredential, status: str) -> AccountSnapshot:
+    source = f"configured_{row.environment}_{status}"
+    return AccountSnapshot(
+        platform=row.venue,
+        equity=0.0,
+        available_balance=0.0,
+        margin_used=0.0,
+        margin_ratio=1.0,
+        currency="USD",
+        portfolio_value=0.0,
+        perp_equity=0.0,
+        withdrawable=0.0,
+        free_collateral=0.0,
+        data_source=source[:64],
+    )
 
 
 def _hyperliquid_account_snapshot() -> AccountSnapshot:

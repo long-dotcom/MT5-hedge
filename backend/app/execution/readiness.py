@@ -6,6 +6,7 @@ from urllib import request
 from sqlalchemy.orm import Session
 
 from app.config.settings import Settings, get_settings, hyperliquid_execution_info_url
+from app.adapters.venue import NATIVE_VENUES
 from app.db.models import HedgeGroup, Position, SymbolMapping, SystemSetting
 
 
@@ -169,7 +170,7 @@ def _symbol_mapping_checks(db: Session) -> list[ReadinessCheck]:
 
 
 def _position_safety_checks(db: Session) -> list[ReadinessCheck]:
-    positions = db.query(Position).filter(Position.platform.in_(["hyperliquid", "mt5"])).all()
+    positions = db.query(Position).filter(Position.platform.in_(list(NATIVE_VENUES))).all()
     active_positions = [row for row in positions if abs(row.quantity) > 0]
     if not active_positions:
         return [ReadinessCheck("live_position_management", "ok", "当前未发现已同步 live 仓位")]
@@ -200,18 +201,20 @@ def _live_groups_for_position(db: Session, position: Position) -> list[HedgeGrou
 
 
 def _position_matches_group(db: Session, position: Position, group: HedgeGroup) -> bool:
-    if position.platform not in {"hyperliquid", "mt5"}:
+    mapping = db.query(SymbolMapping).filter(SymbolMapping.symbol == group.symbol).first()
+    leg_a_venue = mapping.leg_a_venue if mapping else "hyperliquid"
+    leg_b_venue = mapping.leg_b_venue if mapping else "mt5"
+    if position.platform not in {leg_a_venue, leg_b_venue}:
         return False
     symbols = {
-        "hyperliquid": {group.symbol},
-        "mt5": {group.symbol},
+        leg_a_venue: {group.symbol},
+        leg_b_venue: {group.symbol},
     }
-    mapping = db.query(SymbolMapping).filter(SymbolMapping.symbol == group.symbol).first()
     if mapping:
-        if mapping.hyperliquid_symbol:
-            symbols["hyperliquid"].add(mapping.hyperliquid_symbol)
+        if mapping.leg_a_venue_symbol:
+            symbols[leg_a_venue].add(mapping.leg_a_venue_symbol)
         if mapping.mt5_symbol:
-            symbols["mt5"].add(mapping.mt5_symbol)
+            symbols[leg_b_venue].add(mapping.mt5_symbol)
     if position.symbol not in symbols.get(position.platform, set()):
         return False
     if _position_side(position.side) != _expected_position_side(group.direction, position.platform):
@@ -226,16 +229,18 @@ def _position_matches_group(db: Session, position: Position, group: HedgeGroup) 
 
 
 def _expected_position_side(direction: str, platform: str) -> str:
-    if direction == "long_hyperliquid_short_mt5":
-        return "long" if platform == "hyperliquid" else "short"
+    if direction == "long_leg_a_short_leg_b":
+        if platform == "hyperliquid":
+            return "long"
+        return "short"
     return "short" if platform == "hyperliquid" else "long"
 
 
 def _expected_position_quantity(group: HedgeGroup, platform: str) -> float:
     if platform == "hyperliquid":
-        value = group.hyperliquid_quantity
+        value = group.leg_a_quantity
     else:
-        value = group.mt5_quantity
+        value = group.leg_b_quantity
     return float(group.quantity if value is None else value)
 
 

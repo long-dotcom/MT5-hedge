@@ -8,6 +8,7 @@ from app.db.session import SessionLocal
 from app.execution.auto_closer import run_auto_close
 from app.execution.auto_executor import run_auto_execute
 from app.execution.carry_costs import run_carry_cost_sync
+from app.execution.circuit_breaker import reload_config as reload_cb_config
 from app.execution.persistence import persist_hedge_pool_events
 from app.execution.reconciler import run_execution_reconcile
 from app.market.scanner import persist_scan_state, run_scan
@@ -24,6 +25,7 @@ _scan_persistence_timer: Optional[threading.Timer] = None
 _execution_timer: Optional[threading.Timer] = None
 _carry_cost_timer: Optional[threading.Timer] = None
 _execution_persistence_timer: Optional[threading.Timer] = None
+_cb_config_timer: Optional[threading.Timer] = None
 _running = False
 _stats_refreshing = False
 _tradability_refreshing = False
@@ -32,6 +34,7 @@ _scan_persisting = False
 _execution_running = False
 _carry_cost_running = False
 _execution_persisting = False
+_cb_config_running = False
 
 
 def scanner_job() -> None:
@@ -174,6 +177,24 @@ def mt5_session_template_job() -> None:
     _schedule_next_session_templates()
 
 
+def cb_config_job() -> None:
+    global _cb_config_running
+    if _cb_config_running:
+        _schedule_next_cb_config()
+        return
+    _cb_config_running = True
+    db = SessionLocal()
+    try:
+        reload_cb_config(db)
+    except Exception as exc:
+        db.rollback()
+        logger.exception(f"断路器配置刷新任务失败: {exc}")
+    finally:
+        db.close()
+        _cb_config_running = False
+    _schedule_next_cb_config()
+
+
 def _schedule_next() -> None:
     global _timer
     if not _running:
@@ -260,6 +281,15 @@ def _schedule_next_session_templates() -> None:
     _session_template_timer.start()
 
 
+def _schedule_next_cb_config() -> None:
+    global _cb_config_timer
+    if not _running:
+        return
+    _cb_config_timer = threading.Timer(60.0, cb_config_job)
+    _cb_config_timer.daemon = True
+    _cb_config_timer.start()
+
+
 def start_scheduler() -> None:
     global _running
     if not _running:
@@ -272,6 +302,7 @@ def start_scheduler() -> None:
         _schedule_next_stats()
         _schedule_next_tradability()
         _schedule_next_session_templates()
+        _schedule_next_cb_config()
 
 
 def stop_scheduler() -> None:
@@ -293,3 +324,5 @@ def stop_scheduler() -> None:
         _carry_cost_timer.cancel()
     if _execution_persistence_timer:
         _execution_persistence_timer.cancel()
+    if _cb_config_timer:
+        _cb_config_timer.cancel()

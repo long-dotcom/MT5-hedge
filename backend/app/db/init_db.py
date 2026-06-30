@@ -148,6 +148,11 @@ def ensure_schema_columns() -> None:
             "paper_hyperliquid_latency_ms_max": "INTEGER DEFAULT 200",
             "paper_mt5_latency_ms_min": "INTEGER DEFAULT 120",
             "paper_mt5_latency_ms_max": "INTEGER DEFAULT 350",
+            "cb_cooldown_seconds": "FLOAT DEFAULT 3.0",
+            "cb_initial_threshold": "FLOAT DEFAULT 0.75",
+            "cb_baseline_multiplier": "FLOAT DEFAULT 2.0",
+            "cb_min_baseline_samples": "INTEGER DEFAULT 50",
+            "cb_detection_seconds": "FLOAT DEFAULT 5.0",
         }
         with engine.begin() as conn:
             for name, ddl in strategy_columns.items():

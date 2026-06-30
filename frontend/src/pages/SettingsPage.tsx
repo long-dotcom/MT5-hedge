@@ -266,6 +266,17 @@ export function SettingsPage() {
                         <Form.Item name="paper_mt5_latency_ms_max" label="Paper MT5 延迟最大毫秒"><InputNumber min={0} step={10} /></Form.Item>
                       </div>
                     </section>
+
+                    <section className="settings-group">
+                      <div className="settings-group-title">执行断路器</div>
+                      <div className="settings-field-grid">
+                        <Form.Item name="cb_cooldown_seconds" label="冷却期(秒)"><InputNumber min={1} max={30} step={0.5} /></Form.Item>
+                        <Form.Item name="cb_initial_threshold" label="冷启动阈值" tooltip="基线样本不足时的固定抖动率阈值"><InputNumber min={0.1} max={1.0} step={0.05} /></Form.Item>
+                        <Form.Item name="cb_baseline_multiplier" label="基线倍数 K" tooltip="动态阈值 = 基线P75 × K"><InputNumber min={1.0} max={5.0} step={0.1} /></Form.Item>
+                        <Form.Item name="cb_min_baseline_samples" label="最小基线样本"><InputNumber min={10} max={500} step={10} /></Form.Item>
+                        <Form.Item name="cb_detection_seconds" label="检测窗口(秒)"><InputNumber min={1} max={30} step={1} /></Form.Item>
+                      </div>
+                    </section>
                   </div>
                   <div className="settings-form-actions">
                     <Button type="primary" htmlType="submit">保存策略</Button>

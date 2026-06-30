@@ -49,6 +49,11 @@ class StrategySettingsIn(BaseModel):
     paper_hyperliquid_latency_ms_max: int = 200
     paper_mt5_latency_ms_min: int = 120
     paper_mt5_latency_ms_max: int = 350
+    cb_cooldown_seconds: float = 3.0
+    cb_initial_threshold: float = 0.75
+    cb_baseline_multiplier: float = 2.0
+    cb_min_baseline_samples: int = 50
+    cb_detection_seconds: float = 5.0
 
 
 class RiskSettingsIn(BaseModel):

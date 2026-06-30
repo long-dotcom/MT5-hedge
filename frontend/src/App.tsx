@@ -3,6 +3,7 @@ import { AppLayout } from './layouts/AppLayout';
 import { LoginPage } from './pages/LoginPage';
 import { DashboardPage } from './pages/DashboardPage';
 import { SpreadAnalyticsPage } from './pages/SpreadAnalyticsPage';
+import { VenueSpreadsPage } from './pages/VenueSpreadsPage';
 import { FundingAnalyticsPage } from './pages/FundingAnalyticsPage';
 import { LeadLagPage } from './pages/LeadLagPage';
 import { PipelinePage } from './pages/PipelinePage';
@@ -28,6 +29,7 @@ export default function App() {
         <Route element={<ProtectedRoute />}>
           <Route path="/" element={<DashboardPage />} />
           <Route path="/analytics" element={<SpreadAnalyticsPage />} />
+          <Route path="/venue-spreads" element={<VenueSpreadsPage />} />
           <Route path="/funding" element={<FundingAnalyticsPage />} />
           <Route path="/lead-lag" element={<LeadLagPage />} />
           <Route path="/pipeline" element={<PipelinePage />} />

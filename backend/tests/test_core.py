@@ -2705,6 +2705,30 @@ def test_dashboard_stream_channel_returns_summary_and_curve() -> None:
     assert len(event["equity_curve"]) == 1
 
 
+def test_equity_curve_aggregates_platform_snapshots_by_sync_batch() -> None:
+    engine = create_engine("sqlite:///:memory:", future=True)
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine, future=True)
+    db = Session()
+    first = datetime(2026, 6, 25, 3, 12, 0)
+    second = first + timedelta(minutes=5)
+    db.add_all(
+        [
+            AccountSnapshot(platform="hyperliquid", equity=0, available_balance=0, margin_used=0, margin_ratio=1, created_at=first),
+            AccountSnapshot(platform="mt5", equity=50000, available_balance=49000, margin_used=1000, margin_ratio=50, created_at=first + timedelta(milliseconds=300)),
+            AccountSnapshot(platform="hyperliquid", equity=100, available_balance=100, margin_used=0, margin_ratio=1, created_at=second),
+            AccountSnapshot(platform="mt5", equity=49900, available_balance=48900, margin_used=1000, margin_ratio=50, created_at=second + timedelta(milliseconds=300)),
+        ]
+    )
+    db.commit()
+
+    curve = api_router._equity_curve_payload(db)
+
+    assert [point["platform"] for point in curve] == ["total", "total"]
+    assert [point["equity"] for point in curve] == [50000, 50000]
+    assert curve[0]["platforms"] == {"hyperliquid": 0, "mt5": 50000}
+
+
 def test_logs_stream_channel_returns_current_log_and_alert_pages() -> None:
     engine = create_engine("sqlite:///:memory:", future=True)
     Base.metadata.create_all(engine)

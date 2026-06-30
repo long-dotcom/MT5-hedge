@@ -9,7 +9,9 @@
 3. `api.md`：HTTP API、页面级 SSE 和前端数据推送口径。
 4. `strategy.md`：行情同步、扫描、成本、统计信号、自动平仓和对冲池。
 5. `risk.md`：风控模式、开仓前检查、资金口径、实盘保护和 readiness。
-6. `evolution-roadmap.md`：当前版本边界、已完成演进、下一阶段优先级和非目标。
+6. `agent-design.md`：Agent 辅助诊断、建议和受控补残腿的功能设计。
+7. `page-experience-improvements.md`：逐页用户体验改进清单。
+8. `evolution-roadmap.md`：当前版本边界、已完成演进、下一阶段优先级和非目标。
 
 ## 各文档职责
 
@@ -18,6 +20,8 @@
 - `deployment.md`：怎么启动、怎么配置、怎么迁移、实盘前要注意什么。
 - `strategy.md`：策略、扫描、成本、信号和对冲池的业务口径。
 - `risk.md`：风控、资金、readiness、实盘保护。
+- `agent-design.md`：Agent 接入架构、工具边界、安全门槛、前端呈现和分阶段落地。
+- `page-experience-improvements.md`：按页面维护体验问题、优先级和后续改进方向。
 - `evolution-roadmap.md`：下一步做什么、不做什么、进入下一阶段的条件。
 
 ## 维护规则

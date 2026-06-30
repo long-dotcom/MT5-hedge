@@ -15,7 +15,7 @@
 ## 仪表盘
 
 - `GET /api/dashboard/summary`：总权益、PnL、风险模式、对冲组和告警摘要；未实现盈亏使用运行期对冲池和当前平仓价差即时估算，避免数据库旧值显示延迟。
-- `GET /api/dashboard/equity-curve`：账户权益曲线。仪表盘打开后会使用 `channel=dashboard` 页面级 SSE 持续接收摘要和权益曲线更新。
+- `GET /api/dashboard/equity-curve`：账户总权益曲线，后端会把同一同步批次内的 Hyperliquid/MT5 快照合并为一个总权益点，避免单平台快照交替显示成锯齿。仪表盘打开后会使用 `channel=dashboard` 页面级 SSE 持续接收摘要和权益曲线更新。
 - `GET /api/dashboard/risk-summary`：风控配置和最近风控事件。
 
 ## 行情与机会

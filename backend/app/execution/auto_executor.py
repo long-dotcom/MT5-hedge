@@ -1,3 +1,6 @@
+from __future__ import annotations
+
+import logging
 import random
 import time
 from dataclasses import dataclass
@@ -8,8 +11,11 @@ from sqlalchemy.orm import Session
 
 from app.db.models import ArbitrageOpportunity, HedgeGroup, StrategySetting, SystemLog, WorkerRun
 from app.db.retention import prune_table_by_id
+from app.execution.circuit_breaker import is_blocked as breaker_is_blocked
 from app.execution.engine import open_hedge_group
 from app.market.mt5_tradability import mt5_tradability_cache
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -54,6 +60,14 @@ def run_auto_execute(db: Session) -> int:
         confirmed, reason = _confirm(strategy, opportunity)
         if not confirmed:
             opportunity.reject_reason = reason
+            continue
+        blocked, jitter, threshold = breaker_is_blocked(opportunity.symbol)
+        if blocked:
+            logger.info(
+                "断路器 OPEN，跳过开仓: symbol=%s jitter=%.2f threshold=%.2f",
+                opportunity.symbol, jitter, threshold,
+            )
+            opportunity.reject_reason = f"断路器 OPEN: jitter={jitter:.3f} threshold={threshold:.3f}"
             continue
         decision_delay_ms = _decision_delay_ms(strategy)
         if decision_delay_ms > 0:

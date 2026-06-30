@@ -285,7 +285,7 @@ body,
 .tabs-fill-card .ant-tabs,
 .tabs-fill-card .ant-tabs-content-holder,
 .tabs-fill-card .ant-tabs-content,
-.tabs-fill-card .ant-tabs-tabpane {
+.tabs-fill-card .ant-tabs-tabpane:not(.ant-tabs-tabpane-hidden) {
   display: flex;
   flex-direction: column;
   flex: 1 1 auto;

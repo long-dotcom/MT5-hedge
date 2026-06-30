@@ -83,6 +83,12 @@ class StrategySetting(Base, TimestampMixin):
     paper_hyperliquid_latency_ms_max: Mapped[int] = mapped_column(Integer, default=200)
     paper_mt5_latency_ms_min: Mapped[int] = mapped_column(Integer, default=120)
     paper_mt5_latency_ms_max: Mapped[int] = mapped_column(Integer, default=350)
+    # 执行断路器参数
+    cb_cooldown_seconds: Mapped[float] = mapped_column(Float, default=3.0)
+    cb_initial_threshold: Mapped[float] = mapped_column(Float, default=0.75)
+    cb_baseline_multiplier: Mapped[float] = mapped_column(Float, default=2.0)
+    cb_min_baseline_samples: Mapped[int] = mapped_column(Integer, default=50)
+    cb_detection_seconds: Mapped[float] = mapped_column(Float, default=5.0)
 
 
 class RiskSetting(Base, TimestampMixin):

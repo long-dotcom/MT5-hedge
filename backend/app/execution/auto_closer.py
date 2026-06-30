@@ -1,3 +1,6 @@
+from __future__ import annotations
+
+import logging
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -9,6 +12,7 @@ from sqlalchemy.orm import Session
 from app.config.settings import get_settings
 from app.db.models import StrategySetting, SystemLog, WorkerRun
 from app.db.retention import prune_table_by_id
+from app.execution.circuit_breaker import is_blocked as breaker_is_blocked
 from app.execution.engine import (
     _close_sides,
     _execution_adapters,
@@ -33,6 +37,8 @@ from app.market.quotes import quote_synchronizer
 from app.market.scanner import get_strategy_setting
 from app.market.symbols import enabled_mappings
 from app.strategy.spread_math import spreads_for_direction
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -66,6 +72,14 @@ def run_auto_close(db: Session) -> int:
                 continue
             evaluation = evaluate_auto_close(db, strategy, group, mapping=mapping)
             if not evaluation.should_close:
+                hedge_pool.upsert_group(group.with_updates(unrealized_pnl=evaluation.estimated_profit))
+                continue
+            blocked, jitter, threshold = breaker_is_blocked(group.symbol)
+            if blocked:
+                logger.info(
+                    "断路器 OPEN，跳过平仓: symbol=%s jitter=%.2f threshold=%.2f",
+                    group.symbol, jitter, threshold,
+                )
                 hedge_pool.upsert_group(group.with_updates(unrealized_pnl=evaluation.estimated_profit))
                 continue
             if close_hedge_group_from_pool(db, group.id, evaluation.reason, evaluation=evaluation, mapping=mapping, strategy=strategy, auto=True):

@@ -11,7 +11,8 @@ import {
   OrderedListOutlined,
   SafetyCertificateOutlined,
   SettingOutlined,
-  StockOutlined
+  StockOutlined,
+  BarChartOutlined
 } from '@ant-design/icons';
 import { Button, Layout, Menu, Space, Typography } from 'antd';
 import { useState } from 'react';
@@ -23,6 +24,7 @@ const { Header, Sider, Content } = Layout;
 const items = [
   { key: '/', icon: <DashboardOutlined />, label: '仪表盘' },
   { key: '/analytics', icon: <ExperimentOutlined />, label: '价差研究' },
+  { key: '/venue-spreads', icon: <BarChartOutlined />, label: '点差监控' },
   { key: '/funding', icon: <LineChartOutlined />, label: '资金费研究' },
   { key: '/lead-lag', icon: <NodeIndexOutlined />, label: '报价时差' },
   { key: '/pipeline', icon: <PartitionOutlined />, label: '链路监控' },

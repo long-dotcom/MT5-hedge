@@ -18,6 +18,7 @@ from app.market.mt5_tradability import mt5_tradability_cache
 from app.strategy.cost import estimate_cost
 from app.strategy.live_costs import hyperliquid_cost_inputs, mt5_cost_inputs
 from app.strategy.statistical_signal import evaluate_entry_signal
+from app.execution.circuit_breaker import feed_spread as breaker_feed
 from app.strategy.spread_math import DIRECTIONS, LONG_HL_SHORT_MT5, spreads_for_direction
 
 
@@ -205,6 +206,7 @@ def run_scan(db: Session) -> int:
                 for direction in DIRECTIONS:
                     spread_values = spreads_for_direction(direction, hl.bid, hl.ask, mt.bid, mt.ask)
                     gross_spread = spread_values.entry_spread
+                    breaker_feed(mapping.symbol, direction, spread_values.entry_spread)
                     gross_profit = gross_spread * sizing.hyperliquid_quantity
                     quantity = sizing.mt5_quantity
                     notional = sizing.notional_usd

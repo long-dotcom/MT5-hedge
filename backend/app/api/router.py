@@ -42,6 +42,7 @@ from app.db.models import (
 from app.db.session import SessionLocal, get_db
 from app.diagnostics.pipeline import build_pipeline_diagnostics
 from app.execution.carry_costs import run_carry_cost_sync
+from app.execution.circuit_breaker import reload_config as reload_cb_config
 from app.execution.auto_closer import close_hedge_group_from_pool
 from app.execution.engine import open_hedge_group
 from app.execution.hedge_pool import HedgeGroupSnapshot, hedge_pool
@@ -154,8 +155,34 @@ def equity_curve(_: User = Depends(get_current_user), db: Session = Depends(get_
 
 
 def _equity_curve_payload(db: Session) -> list[dict[str, Any]]:
-    rows = db.query(AccountSnapshot).order_by(AccountSnapshot.created_at).limit(100).all()
-    return [{"time": row.created_at.isoformat(), "equity": row.equity, "platform": row.platform} for row in rows]
+    rows = db.query(AccountSnapshot).order_by(desc(AccountSnapshot.created_at), desc(AccountSnapshot.id)).limit(240).all()
+    rows = list(reversed(rows))
+    latest_by_platform: dict[str, AccountSnapshot] = {}
+    points: list[dict[str, Any]] = []
+    batch: list[AccountSnapshot] = []
+
+    def flush_batch() -> None:
+        if not batch:
+            return
+        for snapshot in batch:
+            latest_by_platform[snapshot.platform] = snapshot
+        point_time = max(snapshot.created_at for snapshot in batch)
+        points.append(
+            {
+                "time": point_time.isoformat(),
+                "equity": sum(snapshot.equity for snapshot in latest_by_platform.values()),
+                "platform": "total",
+                "platforms": {platform: snapshot.equity for platform, snapshot in latest_by_platform.items()},
+            }
+        )
+
+    for row in rows:
+        if batch and (row.created_at - batch[-1].created_at).total_seconds() > 2:
+            flush_batch()
+            batch = []
+        batch.append(row)
+    flush_batch()
+    return points[-100:]
 
 
 def _runtime_open_unrealized_pnl(db: Session) -> float:
@@ -407,6 +434,17 @@ def spread_series(
         "summary": summary,
         "items": downsample_spreads(points, range),
     }
+
+
+@router.get("/analytics/venue-spreads")
+def venue_spreads(
+    _: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+    symbol: str = "",
+    range: str = "1h",
+) -> dict[str, Any]:
+    from app.analytics.venue_spreads import venue_spread_report
+    return venue_spread_report(db, symbol.upper(), range)
 
 
 @router.get("/analytics/funding-series")
@@ -804,6 +842,7 @@ def put_strategy(payload: StrategySettingsIn, user: User = Depends(require_admin
     db.commit()
     clear_strategy_setting_cache()
     clear_signal_stats_cache()
+    reload_cb_config(db)
     return as_dict(row)
 
 

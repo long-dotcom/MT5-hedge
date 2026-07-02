@@ -1,5 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { Button, Card, Descriptions, Space, Table, Tag, message } from 'antd';
+import { Button, Card, Descriptions, Popconfirm, Space, Table, Tag, message } from 'antd';
 import type { ColumnsType } from 'antd/es/table';
 import { useState } from 'react';
 import { api } from '../api/client';
@@ -90,7 +90,7 @@ export function HedgeGroupsPage() {
   const [messageApi, contextHolder] = message.useMessage();
   const query = useQuery({ queryKey: ['hedge-groups', page], queryFn: async () => (await api.get('/hedge-groups', { params: { page, page_size: 20 } })).data });
   const close = useMutation({
-    mutationFn: async (id: number) => (await api.post(`/hedge-groups/${id}/close`, { reason: 'manual close from ui' })).data,
+    mutationFn: async (id: number) => (await api.post(`/hedge-groups/${id}/close`, { reason: 'manual force close from ui', force: true })).data,
     onSuccess: () => {
       messageApi.success('对冲组已平仓');
       queryClient.invalidateQueries({ queryKey: ['hedge-groups'] });
@@ -123,7 +123,17 @@ export function HedgeGroupsPage() {
     { title: '资金费', dataIndex: 'funding', width: 92, align: 'right', render: (v, row) => <EllipsisCell value={`${venueLabel(row.leg_a_venue)} ${fmtCarryCost(v)}`} align="right" /> },
     { title: '隔夜费', dataIndex: 'swap', width: 92, align: 'right', render: (v, row) => <EllipsisCell value={`${venueLabel(row.leg_b_venue)} ${fmtCarryCost(v)}`} align="right" /> },
     { title: 'PnL', width: 92, align: 'right', render: (_, row) => <EllipsisCell value={fmtMoney(Number(row.realized_pnl || 0) + Number(row.unrealized_pnl || 0))} align="right" /> },
-    { title: '操作', fixed: 'right', width: 86, render: (_, row) => <Button size="small" disabled={!['open', 'open_partial', 'manual_intervention'].includes(row.status)} onClick={() => close.mutate(row.id)}>平仓</Button> }
+    { title: '操作', fixed: 'right', width: 110, render: (_, row) => (
+      <Popconfirm
+        title={`强制平仓 #${row.id}?`}
+        description="将跳过退出线和最小盈利检查，但仍执行报价、会话和 reduce-only 平仓保护。"
+        okText="强制平仓"
+        cancelText="取消"
+        onConfirm={() => close.mutate(row.id)}
+      >
+        <Button size="small" danger loading={close.isPending} disabled={!['open', 'open_partial', 'manual_intervention'].includes(row.status)}>平仓</Button>
+      </Popconfirm>
+    ) }
   ];
   const rows = query.data?.items || [];
   return (
@@ -152,3 +162,5 @@ export function HedgeGroupsPage() {
     </div>
   );
 }
+
+

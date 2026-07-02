@@ -75,6 +75,12 @@ class LiveTradingIn(BaseModel):
     confirmation: str = ""
 
 
+class ExecutionSettingsIn(BaseModel):
+    paper_live_probe_enabled: bool = False
+    paper_live_parallel_execution: bool = True
+    confirmation: str = ""
+
+
 class ExchangeCredentialIn(BaseModel):
     venue: str
     display_name: str = ""
@@ -95,6 +101,7 @@ class RiskModeIn(BaseModel):
 
 class CloseHedgeGroupIn(BaseModel):
     reason: str = "manual"
+    force: bool = False
 
 
 class AdoptPositionIn(BaseModel):
@@ -198,3 +205,6 @@ class ORMModel(BaseModel):
 class RowResponse(ORMModel):
     id: int
     created_at: datetime
+
+
+

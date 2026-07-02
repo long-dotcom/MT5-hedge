@@ -4,6 +4,7 @@ import base64
 import asyncio
 import hashlib
 import json
+from decimal import Decimal, InvalidOperation, ROUND_CEILING
 from threading import Thread
 from datetime import datetime, timezone
 from typing import Any
@@ -13,6 +14,7 @@ from cryptography.fernet import Fernet, InvalidToken
 from sqlalchemy.orm import Session
 
 from app.config.settings import get_settings
+from app.adapters.base import AdapterOrder, AdapterOrderResult
 from app.db.models import ExchangeCredential
 
 
@@ -176,6 +178,31 @@ def binance_futures_funding_history(row: ExchangeCredential, symbol: str, start_
     ]
 
 
+def binance_futures_probe_order(row: ExchangeCredential, order: AdapterOrder, *, configured_min_base_size: float = 0.0) -> AdapterOrderResult:
+    try:
+        payload = _run_async(_nautilus_binance_futures_probe_order(row, order, configured_min_base_size))
+    except Exception as exc:
+        return AdapterOrderResult(False, "", "rejected", 0.0, 0.0, 0.0, f"Binance Nautilus paper-live 探针下单失败: {exc}")
+    status = str(payload.get("status") or "").lower()
+    order_id = str(payload.get("orderId") or payload.get("clientOrderId") or "")
+    executed_qty = _decimal(payload.get("executedQty"))
+    avg_price = _decimal(payload.get("avgPrice"))
+    cum_quote = _decimal(payload.get("cumQuote"))
+    if avg_price <= 0 and executed_qty > 0 and cum_quote > 0:
+        avg_price = cum_quote / executed_qty
+    if status in {"filled", "partially_filled"} and executed_qty > 0 and avg_price > 0:
+        return AdapterOrderResult(
+            True,
+            order_id,
+            status,
+            float(order.quantity),
+            float(avg_price),
+            0.0,
+            f"Binance paper-live 探针真实成交量 {payload.get('executedQty')}，paper 账本成交量 {order.quantity}",
+        )
+    return AdapterOrderResult(False, order_id, status or "rejected", 0.0, 0.0, 0.0, f"Binance paper-live 探针未立即成交: {payload}")
+
+
 def credential_fields_for_venue(venue: str) -> list[dict[str, Any]]:
     venue = normalize_venue(venue)
     if venue == "okx":
@@ -293,6 +320,80 @@ async def _nautilus_binance_futures_funding_history(row: ExchangeCredential, sym
         raise RuntimeError(f"nautilus futures funding {exc}") from exc
 
 
+async def _nautilus_binance_futures_probe_order(row: ExchangeCredential, order: AdapterOrder, configured_min_base_size: float) -> dict[str, Any]:
+    from nautilus_trader.core.nautilus_pyo3 import HttpMethod
+
+    _, market_api = _nautilus_binance_futures_apis(row)
+    symbol = _binance_symbol(order.venue_symbol or order.symbol)
+    specs = await _binance_futures_symbol_specs(market_api, symbol)
+    ticker = await _nautilus_binance_futures_ticker(row, symbol)
+    bid = _decimal(getattr(ticker, "bidPrice", 0))
+    ask = _decimal(getattr(ticker, "askPrice", 0))
+    mid = ((bid + ask) / Decimal("2")) if bid > 0 and ask > 0 else Decimal("0")
+    quantity = _binance_probe_quantity(specs, mid, configured_min_base_size)
+    payload = {
+        "symbol": symbol,
+        "side": "BUY" if str(order.side).lower() in {"buy", "long"} else "SELL",
+        "type": "MARKET",
+        "quantity": _decimal_text(quantity),
+        "newOrderRespType": "RESULT",
+        "newClientOrderId": f"mt5h_probe_{int(datetime.now(timezone.utc).timestamp() * 1000)}"[:36],
+        "recvWindow": "5000",
+    }
+    if order.reduce_only:
+        payload["reduceOnly"] = "true"
+    raw = await market_api.client.sign_request(HttpMethod.POST, market_api.base_endpoint + "order", payload=payload, ratelimiter_keys=["REQUEST_WEIGHT", "ORDERS"])
+    decoded = msgspec.json.decode(raw) if isinstance(raw, (bytes, bytearray)) else raw
+    if not isinstance(decoded, dict):
+        raise RuntimeError(f"unexpected order response: {decoded}")
+    return decoded
+
+
+async def _binance_futures_symbol_specs(market_api, symbol: str) -> dict[str, Decimal]:
+    info = await market_api.query_futures_exchange_info()
+    symbols = _field(info, "symbols", [])
+    for item in symbols or []:
+        if str(_field(item, "symbol", "")).upper() == symbol:
+            return _parse_binance_futures_filters(item)
+    raise RuntimeError(f"Binance futures symbol not found: {symbol}")
+
+
+def _parse_binance_futures_filters(symbol_info: Any) -> dict[str, Decimal]:
+    filters = _field(symbol_info, "filters", []) or []
+    step = Decimal("0")
+    min_qty = Decimal("0")
+    min_notional = Decimal("0")
+    for item in filters:
+        filter_type = str(_field(item, "filterType", "") or "")
+        if filter_type in {"MARKET_LOT_SIZE", "LOT_SIZE"}:
+            item_step = _decimal(_field(item, "stepSize", 0))
+            item_min_qty = _decimal(_field(item, "minQty", 0))
+            if filter_type == "MARKET_LOT_SIZE" or step <= 0:
+                step = item_step
+            if item_min_qty > min_qty:
+                min_qty = item_min_qty
+        if filter_type in {"MIN_NOTIONAL", "NOTIONAL"}:
+            item_min_notional = max(_decimal(_field(item, "notional", 0)), _decimal(_field(item, "minNotional", 0)))
+            if item_min_notional > min_notional:
+                min_notional = item_min_notional
+    precision_step = Decimal("1") / (Decimal("10") ** int(_field(symbol_info, "quantityPrecision", 0) or 0))
+    if step <= 0:
+        step = precision_step
+    return {"step": step, "min_qty": min_qty, "min_notional": min_notional}
+
+
+def _binance_probe_quantity(specs: dict[str, Decimal], mid_price: Decimal, configured_min_base_size: float) -> Decimal:
+    step = specs.get("step", Decimal("0"))
+    min_qty = max(specs.get("min_qty", Decimal("0")), _decimal(configured_min_base_size))
+    min_notional = specs.get("min_notional", Decimal("0"))
+    if mid_price > 0 and min_notional > 0:
+        min_qty = max(min_qty, min_notional / mid_price)
+    quantity = _ceil_to_step(min_qty if min_qty > 0 else step, step)
+    if quantity <= 0:
+        raise RuntimeError("Binance futures 最小探针数量无法计算")
+    return quantity
+
+
 async def _nautilus_binance_spot_account(row: ExchangeCredential, credentials: dict[str, Any] | None = None):
     account_api = _nautilus_binance_spot_account_api(row, credentials)
     try:
@@ -385,6 +486,30 @@ def _optional_float(value: Any) -> float | None:
     except (TypeError, ValueError):
         return None
     return parsed if parsed > 0 else None
+
+
+def _field(value: Any, name: str, default: Any = None) -> Any:
+    if isinstance(value, dict):
+        return value.get(name, default)
+    return getattr(value, name, default)
+
+
+def _decimal(value: Any) -> Decimal:
+    try:
+        return Decimal(str(value or "0"))
+    except (InvalidOperation, ValueError):
+        return Decimal("0")
+
+
+def _ceil_to_step(value: Decimal, step: Decimal) -> Decimal:
+    if step <= 0:
+        return value
+    units = (value / step).to_integral_value(rounding=ROUND_CEILING)
+    return units * step
+
+
+def _decimal_text(value: Decimal) -> str:
+    return format(value.normalize(), "f")
 
 
 def _float(value: Any) -> float:

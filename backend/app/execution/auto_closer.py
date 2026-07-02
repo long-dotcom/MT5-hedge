@@ -102,6 +102,7 @@ def close_hedge_group_from_pool(
     mapping: SimpleNamespace | None = None,
     strategy: SimpleNamespace | None = None,
     auto: bool = False,
+    force_strategy_checks: bool = False,
 ) -> HedgeGroupSnapshot:
     snapshot = hedge_pool.get(group_id)
     if not snapshot:
@@ -116,14 +117,14 @@ def close_hedge_group_from_pool(
     if not mapping:
         raise ValueError("品种映射不在运行缓存中")
     if evaluation is None:
-        evaluation = evaluate_auto_close(db, strategy, snapshot, mapping=mapping, force=True)
+        evaluation = evaluate_auto_close(db, strategy, snapshot, mapping=mapping, force=force_strategy_checks)
     if not evaluation.should_close:
         raise ValueError(evaluation.reason)
     closing = hedge_pool.try_mark_closing(snapshot.id, reason, evaluation.estimated_profit)
     if not closing:
         raise ValueError("对冲组已经在平仓中")
     try:
-        result = _execute_paper_close_snapshot(closing, mapping, strategy, reason, evaluation, auto=auto)
+        result = _execute_paper_close_snapshot(db, closing, mapping, strategy, reason, evaluation, auto=auto, enforce_strategy_close_checks=not force_strategy_checks)
         hedge_pool.enqueue_close_result(result)
         if result.status == "closed":
             closed = hedge_pool.mark_closed(closing.id, realized_pnl=result.realized_pnl, fees_delta=result.fees_delta, reason=result.close_reason, status="closed")
@@ -180,13 +181,10 @@ def evaluate_auto_close(
     min_profit = float(strategy.auto_close_min_profit or 0.0)
     hold_expired = _hold_expired(group, strategy)
 
+    if force:
+        return CloseEvaluation(True, f"手工强制平仓: 估算利润 {estimated_profit:.2f}", close_spread, exit_target, estimated_profit)
     if estimated_profit < min_profit:
         return CloseEvaluation(False, f"估算平仓利润不足: {estimated_profit:.2f} < {min_profit:.2f}", close_spread, exit_target, estimated_profit)
-    if force:
-        final_ok, final_reason = _final_close_still_executable_snapshot(group, mapping, strategy, close_spread, exit_target, estimated_profit)
-        if not final_ok:
-            return CloseEvaluation(False, final_reason, close_spread, exit_target, estimated_profit)
-        return CloseEvaluation(True, f"手工平仓: {estimated_profit:.2f}", close_spread, exit_target, estimated_profit)
     if exit_target <= 0:
         if close_spread <= 0:
             return CloseEvaluation(True, f"无统计退出线但平仓价差已回到零轴: {close_spread:.2f} <= 0.00", close_spread, exit_target, estimated_profit)
@@ -201,6 +199,7 @@ def evaluate_auto_close(
 
 
 def _execute_paper_close_snapshot(
+    db: Session,
     group: HedgeGroupSnapshot,
     mapping: SimpleNamespace,
     strategy: SimpleNamespace,
@@ -208,24 +207,26 @@ def _execute_paper_close_snapshot(
     evaluation: CloseEvaluation,
     *,
     auto: bool,
+    enforce_strategy_close_checks: bool = True,
 ) -> CloseResultEvent:
     session_state = mt5_session_state(mapping)
     mt5_close_allowed, mt5_close_reason = mt5_action_allowed(session_state, group.direction, "close")
     if not mt5_close_allowed:
         raise ValueError(mt5_close_reason)
-    final_ok, final_reason = _final_close_still_executable_snapshot(group, mapping, strategy, evaluation.close_spread, evaluation.exit_target, evaluation.estimated_profit)
-    if not final_ok:
-        raise ValueError(final_reason)
+    if enforce_strategy_close_checks:
+        final_ok, final_reason = _final_close_still_executable_snapshot(group, mapping, strategy, evaluation.close_spread, evaluation.exit_target, evaluation.estimated_profit)
+        if not final_ok:
+            raise ValueError(final_reason)
 
     hl_side, mt5_side = _close_sides(group.direction)
-    leg_a_adapter, leg_b_adapter = _execution_adapters(live=False, simulated=True, mapping=mapping)
+    leg_a_adapter, leg_b_adapter = _execution_adapters(live=False, simulated=True, mapping=mapping, db=db)
     leg_a_quantity = _platform_close_quantity(group.leg_a_quantity, group.quantity)
     leg_b_quantity = _platform_close_quantity(group.leg_b_quantity, group.quantity)
     if leg_a_quantity <= 0 and leg_b_quantity <= 0:
         raise ValueError("对冲组没有可平仓数量")
 
     results = []
-    if leg_a_quantity > 0 and leg_b_quantity > 0 and _paper_live_parallel_enabled(live=False, simulated=True, hl=leg_a_adapter, mapping=mapping):
+    if leg_a_quantity > 0 and leg_b_quantity > 0 and _paper_live_parallel_enabled(live=False, simulated=True, hl=leg_a_adapter, mapping=mapping, db=db):
         results = _submit_parallel_close(group, mapping, leg_a_adapter, leg_b_adapter, hl_side, mt5_side, leg_a_quantity, leg_b_quantity, strategy)
     elif leg_a_quantity > 0:
         hl_result = _submit_close_leg(group, mapping, leg_a_adapter, mapping.leg_a_venue, hl_side, leg_a_quantity, mapping.hl_close_order_type, mapping.leg_a_venue_symbol, strategy)
@@ -364,3 +365,6 @@ def _log(db: Session, level: str, message: str, context: str = "") -> None:
     db.add(SystemLog(level=level, category="auto_close", message=message, context=context))
     prune_table_by_id(db, SystemLog)
     db.commit()
+
+
+

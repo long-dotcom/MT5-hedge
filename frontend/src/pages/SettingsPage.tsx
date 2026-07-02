@@ -61,6 +61,8 @@ export function SettingsPage() {
   const sessionTemplates = useQuery({ queryKey: ['settings-mt5-session-templates'], queryFn: async () => (await api.get('/settings/mt5-session-templates')).data });
   const live = useQuery({ queryKey: ['settings-live'], queryFn: async () => (await api.get('/settings/live-trading')).data });
   const liveReadiness = useQuery({ queryKey: ['settings-live-readiness'], queryFn: async () => (await api.get('/settings/live-readiness')).data });
+  const execution = useQuery({ queryKey: ['settings-execution'], queryFn: async () => (await api.get('/settings/execution')).data });
+  const paperReadiness = useQuery({ queryKey: ['settings-paper-readiness'], queryFn: async () => (await api.get('/settings/paper-readiness')).data });
   const venueOptions = [
     { value: 'hyperliquid', label: 'Hyperliquid(native)' },
     { value: 'mt5', label: 'MT5(native)' },
@@ -73,6 +75,15 @@ export function SettingsPage() {
   const saveStrategy = useMutation({ mutationFn: async (v: any) => (await api.put('/settings/strategy', v)).data, onSuccess: () => { messageApi.success('策略已保存'); queryClient.invalidateQueries({ queryKey: ['settings-strategy'] }); } });
   const saveRisk = useMutation({ mutationFn: async (v: any) => (await api.put('/settings/risk', v)).data, onSuccess: () => { messageApi.success('风控已保存'); queryClient.invalidateQueries({ queryKey: ['settings-risk'] }); } });
   const saveLive = useMutation({ mutationFn: async (v: any) => (await api.put('/settings/live-trading', v)).data, onSuccess: () => { messageApi.success('实盘开关已保存'); queryClient.invalidateQueries({ queryKey: ['settings-live'] }); queryClient.invalidateQueries({ queryKey: ['settings-live-readiness'] }); } });
+  const saveExecution = useMutation({
+    mutationFn: async (v: any) => (await api.put('/settings/execution', v)).data,
+    onSuccess: () => {
+      messageApi.success('执行开关已保存');
+      queryClient.invalidateQueries({ queryKey: ['settings-execution'] });
+      queryClient.invalidateQueries({ queryKey: ['settings-paper-readiness'] });
+    },
+    onError: (err: any) => messageApi.error(err.response?.data?.detail || '保存失败')
+  });
   const saveExchange = useMutation({
     mutationFn: async (v: any) => editingExchange ? (await api.put(`/settings/exchanges/${editingExchange.venue}`, v)).data : (await api.post('/settings/exchanges', v)).data,
     onSuccess: () => {
@@ -484,6 +495,39 @@ export function SettingsPage() {
               children: (
                 <Space direction="vertical" size={12} className="full-width">
                   <Alert type="warning" showIcon message="真实下单默认关闭。开启前请确认 API 凭证、MT5 登录、风控参数和品种映射。" className="form-alert" />
+                  <Card size="small" title="Paper 真实探针">
+                    <Space direction="vertical" size={12} className="full-width">
+                      <Form
+                        key={execution.data?.paper_live_probe_enabled === undefined ? 'execution-loading' : String(execution.data.paper_live_probe_enabled)}
+                        layout="vertical"
+                        className="settings-form settings-compact-form"
+                        initialValues={{
+                          paper_live_probe_enabled: execution.data?.paper_live_probe_enabled,
+                          paper_live_parallel_execution: execution.data?.paper_live_parallel_execution,
+                          confirmation: ''
+                        }}
+                        onFinish={(v) => saveExecution.mutate(v)}
+                      >
+                        <Form.Item name="paper_live_probe_enabled" label="Paper 使用真实探针" valuePropName="checked"><Switch /></Form.Item>
+                        <Form.Item name="paper_live_parallel_execution" label="探针与 MT5 demo 并发提交" valuePropName="checked"><Switch /></Form.Item>
+                        <Form.Item name="confirmation" label="确认短语"><Input placeholder="ENABLE PAPER LIVE PROBE" /></Form.Item>
+                        <Button danger htmlType="submit" loading={saveExecution.isPending}>保存执行开关</Button>
+                      </Form>
+                      <List
+                        size="small"
+                        loading={paperReadiness.isLoading}
+                        dataSource={paperReadiness.data?.checks || []}
+                        renderItem={(item: any) => (
+                          <List.Item>
+                            <Space className="settings-readiness-line">
+                              <Tag color={item.status === 'ok' ? 'green' : item.status === 'warn' ? 'gold' : 'red'}>{item.status}</Tag>
+                              <EllipsisCell value={item.message} className="settings-readiness-message" />
+                            </Space>
+                          </List.Item>
+                        )}
+                      />
+                    </Space>
+                  </Card>
                   <Card size="small" title="实盘就绪检查">
                     <Space direction="vertical" size={8} className="full-width">
                       <Tag color={liveReadiness.data?.status === 'ready' ? 'green' : liveReadiness.data?.status === 'warning' ? 'gold' : 'red'}>

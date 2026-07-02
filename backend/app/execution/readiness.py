@@ -7,7 +7,9 @@ from sqlalchemy.orm import Session
 
 from app.config.settings import Settings, get_settings, hyperliquid_execution_info_url
 from app.adapters.venue import NATIVE_VENUES
-from app.db.models import HedgeGroup, Position, SymbolMapping, SystemSetting
+from app.db.models import ExchangeCredential, HedgeGroup, Position, SymbolMapping, SystemSetting
+from app.execution.probe import NAUTILUS_PROBE_SUPPORTED_VENUES
+from app.execution.runtime_settings import paper_live_probe_enabled_for_venue, runtime_paper_live_probe_enabled
 
 
 @dataclass(frozen=True)
@@ -85,29 +87,68 @@ def _hyperliquid_paper_checks(db: Session, settings: Settings) -> list[Readiness
             f"Hyperliquid paper 使用本地 QuoteCache 撮合，已启用 {len(mappings)} 个品种",
         )
     ]
-    if not getattr(settings, "hyperliquid_paper_live_order_enabled", False):
-        return checks
-    checks[0] = ReadinessCheck(
-        "hyperliquid_paper_live_probe",
-        "ok",
-        f"Hyperliquid paper-live 探针已开启，paper 账本数量不变，HL 使用最小真实订单取成交价；已启用 {len(mappings)} 个品种",
-    )
-    user = _hyperliquid_user_address(settings)
-    checks.append(
-        ReadinessCheck(
-            "hyperliquid_paper_live_credentials",
-            "ok" if user and getattr(settings, "hyperliquid_secret_key", "") else "block",
-            "Hyperliquid paper-live 账户地址和 API 私钥已配置" if user and getattr(settings, "hyperliquid_secret_key", "") else "HYPERLIQUID_ACCOUNT_ADDRESS 或 HYPERLIQUID_SECRET_KEY 未配置",
+    paper_live_hyperliquid = paper_live_probe_enabled_for_venue(db, settings, "hyperliquid")
+    if paper_live_hyperliquid:
+        checks[0] = ReadinessCheck(
+            "hyperliquid_paper_live_probe",
+            "ok",
+            f"Hyperliquid paper-live 探针已开启，paper 账本数量不变，HL 使用最小真实订单取成交价；已启用 {len(mappings)} 个品种",
         )
-    )
-    try:
-        import_module("hyperliquid.exchange")
-        import_module("eth_account")
-        checks.append(ReadinessCheck("hyperliquid_sdk_import", "ok", "hyperliquid-python-sdk 可导入"))
-    except Exception as exc:
-        checks.append(ReadinessCheck("hyperliquid_sdk_import", "block", f"hyperliquid-python-sdk 不可导入: {exc}"))
+        user = _hyperliquid_user_address(settings)
+        checks.append(
+            ReadinessCheck(
+                "hyperliquid_paper_live_credentials",
+                "ok" if user and getattr(settings, "hyperliquid_secret_key", "") else "block",
+                "Hyperliquid paper-live 账户地址和 API 私钥已配置" if user and getattr(settings, "hyperliquid_secret_key", "") else "HYPERLIQUID_ACCOUNT_ADDRESS 或 HYPERLIQUID_SECRET_KEY 未配置",
+            )
+        )
+        try:
+            import_module("hyperliquid.exchange")
+            import_module("eth_account")
+            checks.append(ReadinessCheck("hyperliquid_sdk_import", "ok", "hyperliquid-python-sdk 可导入"))
+        except Exception as exc:
+            checks.append(ReadinessCheck("hyperliquid_sdk_import", "block", f"hyperliquid-python-sdk 不可导入: {exc}"))
+    checks.extend(_generic_paper_live_probe_checks(db, mappings, settings))
     return checks
 
+
+def _generic_paper_live_probe_checks(db: Session, mappings: list[SymbolMapping], settings: Settings) -> list[ReadinessCheck]:
+    if not runtime_paper_live_probe_enabled(db, settings):
+        return []
+    mapped_venues = {
+        venue
+        for mapping in mappings
+        for venue in (str(mapping.leg_a_venue or "").strip().lower(), str(mapping.leg_b_venue or "").strip().lower())
+        if venue and venue != "mt5"
+    }
+    enabled_mapped = sorted(mapped_venues)
+    checks = [
+        ReadinessCheck(
+            "paper_live_probe_venues",
+            "ok" if enabled_mapped else "warn",
+            f"通用 paper-live 探针 venue 已启用: {', '.join(enabled_mapped)}" if enabled_mapped else "PAPER_LIVE_PROBE_ENABLED 已开启，但当前启用品种映射未命中 PAPER_LIVE_PROBE_VENUES",
+        )
+    ]
+    unsupported = sorted(mapped_venues - {"hyperliquid"} - NAUTILUS_PROBE_SUPPORTED_VENUES)
+    if unsupported:
+        checks.append(
+            ReadinessCheck(
+                "paper_live_probe_adapter_support",
+                "warn",
+                f"以下 venue 已进入通用探针框架，但真实探针下单 adapter 尚未实现: {', '.join(unsupported)}",
+            )
+        )
+    for venue in sorted(mapped_venues & NAUTILUS_PROBE_SUPPORTED_VENUES):
+        credential = db.query(ExchangeCredential).filter(ExchangeCredential.venue == venue, ExchangeCredential.enabled.is_(True)).first()
+        ready = bool(credential and not credential.read_only and credential.encrypted_credentials)
+        checks.append(
+            ReadinessCheck(
+                f"{venue}_paper_live_probe_credentials",
+                "ok" if ready else "block",
+                f"{venue} paper-live 探针凭证已启用且允许交易" if ready else f"{venue} paper-live 探针需要启用交易所配置、填写凭证并关闭只读模式",
+            )
+        )
+    return checks
 
 def _mt5_checks(settings: Settings) -> list[ReadinessCheck]:
     checks = [

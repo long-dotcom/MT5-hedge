@@ -27,6 +27,7 @@
 - `GET /api/markets/trading-sessions`：查看每个品种的 MT5 交易时段状态和动作级权限。
 - `GET /api/diagnostics/pipeline`：查看“链路监控”页面使用的结构化诊断状态，包含每个启用品种的两腿 venue/symbol、双腿报价年龄、同步时间差、扫描状态、候选状态、主阻塞环节、`blockers` 多阻塞原因列表，以及当前活跃对冲组池和生命周期泳道计数。对冲池优先读取运行期内存池，持仓组 `unrealized_pnl` 使用当前 close spread 即时估算，避免数据库异步落库导致显示延迟。`metrics` 中的 `leg_a_age_ms`、`leg_b_age_ms`、`quote_sync_duration_ms`、`symbol_scan_duration_ms`、`cost_duration_ms`、`signal_duration_ms`、`candidate_sync_duration_ms`、`persist_duration_ms` 来自扫描器本轮真实计算耗时；`scan_age_ms` 仅表示结果新鲜度。
 - `GET /api/markets/spreads?page=1&page_size=20`：查看每个品种最新一条最优方向实时价差快照。返回兼容字段 `gross_spread`，其含义等同 `entry_spread`；同时返回 `entry_spread`、`close_spread`、`mid_spread`、`spread_cost`。
+- `POST /api/markets/spreads/{symbol}/execute?direction=long_leg_b_short_leg_a&force=true`：从当前品种指定方向的当前快照创建一次性机会并提交下单。默认只接受 `executable` 快照；`force=true` 用于人工强制下单，会跳过策略入场线、价差和净利润闸门，但仍经过 paper/live readiness、严格行情同步、MT5 session、MT5 订单预检查、风控和账户类保护。未传 `direction` 时使用该品种净利润最高的 `executable` 方向，强制模式下可使用当前方向快照。
 - `GET /api/analytics/spread-summary?symbol=BTC&direction=long_leg_b_short_leg_a&range=1h&basis=entry`：查看价差均值、标准差、Z-Score、分位数、半衰期和回归概率；响应补齐 leg metadata，前端方向标签按 mapping 渲染为“多某交易所 / 空某交易所”；`basis` 支持 `entry/close/mid`，默认 `entry`。
 - `GET /api/analytics/spread-series?symbol=BTC&direction=long_leg_b_short_leg_a&range=1h&basis=entry`：查看后端降采样后的价差曲线，响应补齐 leg metadata，支持 `15m/1h/4h/24h/7d`；`15m/1h/4h` 优先用原始快照统计，`24h/7d` 优先用聚合桶。
 - `GET /api/analytics/funding-series?symbol=JP225&range=7d&bucket=day`：查看单个品种历史资金费率曲线和统计，后端会按品种映射自动定位支持 funding 的永续腿，响应返回 `funding_venue`、`funding_symbol`、`funding_leg` 和 leg metadata。Hyperliquid/HIP-3 走原生 Hyperliquid info API；Binance USDT futures 走 NautilusTrader Binance HTTP client 的 `/fapi/v1/fundingRate` 只读 endpoint。尚未接 funding 的 venue pair 会返回 `supported=false` 和空数据。支持 `24h/7d/30d/90d` 和 `raw/hour/day` 聚合。
@@ -40,7 +41,7 @@
 
 - `GET /api/hedge-groups?page=1&page_size=20`：分页查看对冲组；活跃对冲组会优先使用运行期内存池快照，并用当前平仓价差即时估算未实现盈亏。
 - `GET /api/hedge-groups/{id}`：查看对冲组详情、事件和订单。
-- `POST /api/hedge-groups/{id}/close`：手动平仓。
+- `POST /api/hedge-groups/{id}/close`：手动平仓。请求体支持 `force=true`，用于人工释放资金时跳过退出线和最小盈利检查；仍保留严格报价同步、MT5 平仓权限、reduce-only 平仓和执行 readiness 等安全限制。
 - `POST /api/hedge-groups/{id}/mark-manual`：标记为需要人工处理。
 - Paper 自动平仓由后台调度器执行，不需要前端点击；对冲组会返回 leg metadata、`trigger_spread`、`trigger_hyperliquid_bid`、`trigger_hyperliquid_ask`、`trigger_mt5_bid`、`trigger_mt5_ask`、`entry_spread`、`entry_threshold`、`exit_target`、`overheat_threshold`、`fees`、`funding`、`swap` 和 `close_reason`。其中 `trigger_spread` 是机会触发时的入场价差，四个 `trigger_*` 价格是当前原生执行链路的兼容盘口，`entry_spread` 是双边成交后按 fill 均价回写的真实开仓价差，`entry_threshold` 是统计入场线和品种“最小买入价差”的较高值，`exit_target` 是统计退出线和品种“最大卖出价差”合成后的最终平仓线。`funding` 和 `swap` 按成本口径返回：正数表示付出，负数表示收到，前端按实际 venue 名称展示资金费或隔夜费。
 
@@ -81,7 +82,8 @@
 - Nautilus V1 限制：非 `leg_a=hyperliquid` + `leg_b=mt5` 的 venue pair 只产生只读行情/账户/持仓和观察型价差候选，不会进入 `executable`，自动开仓和平仓仍只允许当前原生 Hyperliquid(A)+MT5(B) 组合。
 - `GET/PUT /api/settings/live-trading`：实盘开关。
 - `GET /api/settings/live-readiness`：实盘执行就绪检查，返回总状态、Hyperliquid 只读账户连通性、MT5、全局实盘开关、品种映射、单腿补偿配置等检查项；当前 Hyperliquid `execution_mode=live` 下单项固定为 block。
-- `GET /api/settings/paper-readiness`：Paper 执行就绪检查，返回 Hyperliquid paper 撮合或 paper-live 探针配置、MT5 demo 开关、demo 账户状态、`MT5_LOGIN`/`MT5_SERVER` 账户锁定和品种映射检查项。存在 `block` 时，paper 开仓和平仓不会提交订单。
+- `GET/PUT /api/settings/execution`：运行态执行开关，当前包含 Paper 真实探针总开关和探针/MT5 demo 并发开关；开启 Paper 真实探针需要确认短语 `ENABLE PAPER LIVE PROBE`。这些开关保存到数据库，优先级高于 env 兜底；Hyperliquid paper-live 探针按该总开关放行，旧 `HYPERLIQUID_PAPER_LIVE_ORDER_ENABLED` 仅作为无数据库记录时的兼容兜底。
+- `GET /api/settings/paper-readiness`：Paper 执行就绪检查，返回 Hyperliquid paper 撮合或 paper-live 探针配置、通用探针命中情况、MT5 demo 开关、demo 账户状态、`MT5_LOGIN`/`MT5_SERVER` 账户锁定和品种映射检查项。存在 `block` 时，paper 开仓和平仓不会提交订单；Binance Futures 已接入 Nautilus paper-live 最小真实探针单，要求交易所配置启用、填写凭证并关闭只读模式；其他 Nautilus venue 若尚未实现真实探针 adapter，会明确提示并拒绝下单。
 - `POST /api/execution/hyperliquid-probe-test`：管理员诊断接口。默认 `submit=false`，只解析品种映射、HL SDK asset、最小探针量和滑点价格，不下单；真实提交必须传 `submit=true` 且 `confirmation=SUBMIT HYPERLIQUID PROBE`。
 
 开启实盘时必须传入确认短语 `ENABLE LIVE TRADING`。
@@ -91,3 +93,4 @@
 - `GET /api/logs`：系统日志分页。日志中心打开后会使用 `channel=logs` 页面级 SSE 持续接收当前日志页更新。
 - `GET /api/alerts`：站内告警分页。日志中心打开后会使用 `channel=logs` 页面级 SSE 持续接收当前告警页更新。
 - `POST /api/alerts/{id}/ack`：确认告警。
+

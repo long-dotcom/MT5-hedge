@@ -8,11 +8,14 @@ from app.config.settings import get_settings
 from app.db.models import ExchangeCredential
 from app.db.session import SessionLocal
 from app.exchanges.credentials import binance_futures_account, binance_futures_positions, binance_ticker_book
+from app.execution.probe import nautilus_probe_supported, place_nautilus_probe_order
 
 
 class NautilusReadOnlyAdapter:
-    def __init__(self, venue: str) -> None:
+    def __init__(self, venue: str, *, live: bool = False) -> None:
         self.platform = venue.strip().lower()
+        self.live = live
+        self.paper_price_probe = False
         self.settings = get_settings()
         self._import_error = _nautilus_import_error()
 
@@ -70,6 +73,22 @@ class NautilusReadOnlyAdapter:
         return {"bids": [], "asks": []}
 
     def place_order(self, order: AdapterOrder) -> AdapterOrderResult:
+        if self.paper_price_probe:
+            if not nautilus_probe_supported(self.platform):
+                return AdapterOrderResult(False, "", "rejected", 0.0, 0.0, 0.0, f"Nautilus venue {self.platform} 尚未实现 paper-live 探针下单")
+            try:
+                self._require_available()
+            except RuntimeError as exc:
+                return AdapterOrderResult(False, "", "rejected", 0.0, 0.0, 0.0, str(exc))
+            with SessionLocal() as db:
+                credential = self._credential(db)
+                if credential is None:
+                    return AdapterOrderResult(False, "", "rejected", 0.0, 0.0, 0.0, f"缺少已启用的 {self.platform} 交易所配置")
+                if credential.read_only:
+                    return AdapterOrderResult(False, "", "rejected", 0.0, 0.0, 0.0, f"{self.platform} 交易所配置仍为只读，禁止 paper-live 探针下单")
+                if not credential.encrypted_credentials:
+                    return AdapterOrderResult(False, "", "rejected", 0.0, 0.0, 0.0, f"{self.platform} 交易所凭证未配置，禁止 paper-live 探针下单")
+                return place_nautilus_probe_order(db, credential, order)
         return AdapterOrderResult(False, "", "rejected", 0.0, 0.0, 0.0, "Nautilus V1 只读模式不支持下单")
 
     def cancel_order(self, order_id: str) -> bool:

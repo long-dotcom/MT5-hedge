@@ -61,7 +61,8 @@ from app.market.mt5_sessions import as_session_dict, mt5_session_state
 from app.market.mt5_schedule import apply_mt5_session_template, mt5_session_templates
 from app.market.symbols import clear_symbol_mapping_cache
 from app.config.settings import get_settings
-from app.schemas import AdoptPositionIn, CloseHedgeGroupIn, ExchangeCredentialIn, VenueProbeTestIn, LiveTradingIn, LoginRequest, RiskModeIn, RiskSettingsIn, StrategySettingsIn, SymbolMappingIn, TokenResponse
+from app.schemas import AdoptPositionIn, CloseHedgeGroupIn, ExchangeCredentialIn, ExecutionSettingsIn, VenueProbeTestIn, LiveTradingIn, LoginRequest, RiskModeIn, RiskSettingsIn, StrategySettingsIn, SymbolMappingIn, TokenResponse
+from app.execution.runtime_settings import execution_settings_payload, set_execution_settings
 from app.strategy.statistical_signal import clear_signal_stats_cache
 
 
@@ -102,6 +103,64 @@ def _row_with_leg_metadata(db: Session, row: Any) -> dict[str, Any]:
     data = as_dict(row) if not isinstance(row, dict) else dict(row)
     data.update(_leg_metadata_for_symbol(db, str(data.get("symbol") or "")))
     return data
+
+
+def _create_current_symbol_opportunity(db: Session, symbol: str, source: str, *, direction: str = "", force: bool = False) -> ArbitrageOpportunity:
+    normalized = symbol.strip().upper()
+    if not normalized:
+        raise HTTPException(status_code=400, detail="symbol 不能为空")
+    mapping = db.query(SymbolMapping).filter(SymbolMapping.symbol == normalized, SymbolMapping.enabled.is_(True)).first()
+    if not mapping:
+        raise HTTPException(status_code=404, detail="品种映射不存在或未启用")
+    query = db.query(SpreadDirectionCurrent).filter(SpreadDirectionCurrent.symbol == normalized)
+    if direction.strip():
+        query = query.filter(SpreadDirectionCurrent.direction == direction.strip())
+    rows = query.order_by(desc(SpreadDirectionCurrent.net_profit), desc(SpreadDirectionCurrent.updated_at)).all()
+    executable = [row for row in rows if row.status == "executable"]
+    if not executable and not force:
+        reason = rows[0].reason if rows else "当前品种没有方向快照"
+        status = rows[0].status if rows else "missing"
+        raise HTTPException(status_code=400, detail=f"当前品种没有 executable 方向，最新状态 {status}: {reason}")
+    if not executable and not rows:
+        raise HTTPException(status_code=400, detail="当前品种没有方向快照")
+    row = executable[0] if executable else rows[0]
+    strategy = db.query(StrategySetting).first() or StrategySetting()
+    opportunity = ArbitrageOpportunity(
+        symbol=normalized,
+        direction=row.direction,
+        notional=_current_row_notional(row, strategy),
+        quantity=row.quantity,
+        leg_b_quantity=row.leg_b_quantity or row.quantity,
+        leg_a_quantity=row.leg_a_quantity or row.quantity,
+        notional_currency=row.notional_currency,
+        fx_rate_to_usd=row.fx_rate_to_usd,
+        gross_spread=row.gross_spread,
+        trigger_leg_a_bid=row.leg_a_bid,
+        trigger_leg_a_ask=row.leg_a_ask,
+        trigger_leg_b_bid=row.leg_b_bid,
+        trigger_leg_b_ask=row.leg_b_ask,
+        unit_cost=row.unit_cost,
+        unit_net_profit=row.unit_net_profit,
+        total_cost=row.total_cost,
+        net_profit=row.net_profit,
+        annualized_return=row.annualized_return,
+        entry_threshold=row.entry_spread,
+        exit_target=row.close_spread,
+        overheat_threshold=0.0,
+        signal_sample_count=0,
+        status="executable",
+        reject_reason=f"{'manual_force_execute_from_spread' if force else 'manual_execute_from_spread'}:{source}; source_status={row.status}; source_reason={row.reason}",
+    )
+    db.add(opportunity)
+    db.flush()
+    return opportunity
+
+
+def _current_row_notional(row: SpreadDirectionCurrent, strategy: StrategySetting) -> float:
+    configured = float(strategy.default_notional or 0.0)
+    leg_a_mid = (float(row.leg_a_bid or 0.0) + float(row.leg_a_ask or 0.0)) / 2
+    estimated = leg_a_mid * float(row.leg_a_quantity or row.quantity or 0.0)
+    return max(configured, estimated, 0.0)
 
 
 def _paginate_rows(rows: list[dict[str, Any]], page: int, page_size: int) -> dict[str, Any]:
@@ -314,6 +373,16 @@ def spreads(_: User = Depends(get_current_user), db: Session = Depends(get_db), 
     total = query.count()
     rows = query.order_by(SpreadCurrent.symbol).offset((page - 1) * page_size).limit(page_size).all()
     return {"total": total, "items": [_row_with_leg_metadata(db, row) for row in rows]}
+
+
+@router.post("/markets/spreads/{symbol}/execute")
+def execute_current_symbol(symbol: str, direction: str = "", force: bool = False, user: User = Depends(require_admin), db: Session = Depends(get_db)) -> dict[str, Any]:
+    opportunity = _create_current_symbol_opportunity(db, symbol, user.username, direction=direction, force=force)
+    try:
+        group = open_hedge_group(db, opportunity.id, source=user.username, force_strategy_checks=force)
+        return as_dict(group)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.get("/stream")
@@ -605,8 +674,8 @@ def _hedge_group_payload(db: Session, group: HedgeGroup | HedgeGroupSnapshot) ->
 @router.post("/hedge-groups/{group_id}/close")
 def close_group(group_id: int, payload: CloseHedgeGroupIn, user: User = Depends(require_admin), db: Session = Depends(get_db)) -> dict[str, Any]:
     try:
-        group = close_hedge_group_from_pool(db, group_id, payload.reason)
-        audit(db, user.id, "close_hedge_group", "hedge_group", str(group_id))
+        group = close_hedge_group_from_pool(db, group_id, payload.reason, force_strategy_checks=payload.force)
+        audit(db, user.id, "close_hedge_group", "hedge_group", f"{group_id}; force={payload.force}")
         db.commit()
         persist_hedge_pool_events(db)
         return as_dict(group)
@@ -1208,6 +1277,26 @@ def get_paper_readiness(_: User = Depends(get_current_user), db: Session = Depen
     return paper_execution_readiness(db)
 
 
+@router.get("/settings/execution")
+def get_execution_settings(_: User = Depends(get_current_user), db: Session = Depends(get_db)) -> dict[str, Any]:
+    return execution_settings_payload(db, get_settings())
+
+
+@router.put("/settings/execution")
+def put_execution_settings(payload: ExecutionSettingsIn, user: User = Depends(require_admin), db: Session = Depends(get_db)) -> dict[str, Any]:
+    current = execution_settings_payload(db, get_settings())
+    if payload.paper_live_probe_enabled and not current["paper_live_probe_enabled"] and payload.confirmation != "ENABLE PAPER LIVE PROBE":
+        raise HTTPException(status_code=400, detail="开启 Paper 真实探针需要输入确认短语")
+    set_execution_settings(
+        db,
+        paper_live_probe_enabled=payload.paper_live_probe_enabled,
+        paper_live_parallel_execution=payload.paper_live_parallel_execution,
+    )
+    audit(db, user.id, "update_execution_settings", "settings", json.dumps(payload.model_dump(exclude={"confirmation"}), ensure_ascii=False))
+    db.commit()
+    return execution_settings_payload(db, get_settings())
+
+
 @router.put("/settings/live-trading")
 def put_live_trading(payload: LiveTradingIn, user: User = Depends(require_admin), db: Session = Depends(get_db)) -> dict[str, Any]:
     if payload.enabled and payload.confirmation != "ENABLE LIVE TRADING":
@@ -1257,3 +1346,6 @@ def ack_alert(alert_id: int, user: User = Depends(require_admin), db: Session = 
     audit(db, user.id, "ack_alert", "alert", str(alert_id))
     db.commit()
     return as_dict(row)
+
+
+

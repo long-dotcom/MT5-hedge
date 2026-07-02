@@ -18,7 +18,7 @@ def build_market_adapter(venue: str, *, live: bool = False) -> ExchangeAdapter:
         return HyperliquidAdapter(live=live)
     if venue == "mt5":
         return MT5Adapter(live=live)
-    return NautilusReadOnlyAdapter(venue)
+    return NautilusReadOnlyAdapter(venue, live=live)
 
 
 def is_native_pair(mapping) -> bool:

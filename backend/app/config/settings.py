@@ -80,6 +80,8 @@ class Settings:
     hyperliquid_fee_round_trips: float = 2.0
     hyperliquid_secret_key: str = ""
     hyperliquid_paper_live_order_enabled: bool = False
+    paper_live_probe_enabled: bool = False
+    paper_live_probe_venues: str = "*"
     paper_live_parallel_execution: bool = True
     hyperliquid_paper_live_slippage: float = 0.01
     mt5_default_commission_rate: float = 0.0
@@ -136,6 +138,7 @@ def runtime_requires_strong_secrets(settings: Settings) -> bool:
         settings.live_trading_enabled
         or settings.mt5_live_order_enabled
         or settings.hyperliquid_paper_live_order_enabled
+        or settings.paper_live_probe_enabled
         or settings.default_execution_mode == "live"
     )
     return environment not in LOCAL_ENVIRONMENTS or live_switch_enabled

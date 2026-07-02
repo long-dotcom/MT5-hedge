@@ -25,8 +25,6 @@ class HyperliquidAdapter(PaperAdapter):
         return AdapterOrderResult(False, "", "failed", 0.0, 0.0, 0.0, "首版未启用 Hyperliquid 真实下单 SDK 调用")
 
     def _place_paper_live_probe(self, order: AdapterOrder) -> AdapterOrderResult:
-        if not getattr(self.settings, "hyperliquid_paper_live_order_enabled", False):
-            return AdapterOrderResult(False, "", "failed", 0.0, 0.0, 0.0, "Hyperliquid paper-live 探针下单开关未开启")
         if not self.settings.hyperliquid_account_address or not getattr(self.settings, "hyperliquid_secret_key", ""):
             return AdapterOrderResult(False, "", "failed", 0.0, 0.0, 0.0, "Hyperliquid paper-live 探针需要账户地址和 API 私钥")
         venue_symbol = order.venue_symbol or order.symbol

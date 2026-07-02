@@ -41,7 +41,7 @@ from app.market.quotes import QuoteCache, QuoteSynchronizer, quote_cache
 from app.adapters.paper import PaperAdapter
 from app.adapters.base import AdapterOrder, AdapterOrderResult
 from app.adapters.hyperliquid import HyperliquidAdapter
-from app.adapters.mt5 import MT5Adapter, mt5_demo_order_check
+from app.adapters.mt5 import MT5Adapter, mt5_demo_order_check, mt5_market_order_check
 from app.adapters.nautilus import NautilusReadOnlyAdapter
 from app.adapters.venue import build_market_adapter, is_native_pair
 from app.schemas import AdoptPositionIn
@@ -469,6 +469,65 @@ def test_mt5_demo_order_check_requires_demo_account_and_configured_identity() ->
     assert not mt5_demo_order_check(FakeMT5(server="broker-real"), settings).allowed
 
 
+def test_mt5_order_check_falls_back_when_filling_mode_unsupported(monkeypatch) -> None:
+    attempts = []
+
+    class FakeResult:
+        def __init__(self, retcode: int, comment: str) -> None:
+            self.retcode = retcode
+            self.comment = comment
+
+    class FakeTick:
+        ask = 100.1
+        bid = 100.0
+
+    class FakeInfo:
+        filling_mode = 0
+
+    class FakeMT5:
+        TRADE_ACTION_DEAL = 1
+        ORDER_TYPE_BUY = 0
+        ORDER_TYPE_SELL = 1
+        ORDER_TIME_GTC = 0
+        ORDER_FILLING_IOC = 1
+        ORDER_FILLING_RETURN = 2
+        ORDER_FILLING_FOK = 4
+        TRADE_RETCODE_INVALID_FILL = 10030
+        TRADE_RETCODE_DONE = 10009
+        TRADE_RETCODE_DONE_PARTIAL = 10010
+        TRADE_RETCODE_PLACED = 10008
+
+        def initialize(self, **kwargs):
+            return True
+
+        def symbol_select(self, symbol, enabled):
+            return True
+
+        def symbol_info_tick(self, symbol):
+            return FakeTick()
+
+        def symbol_info(self, symbol):
+            return FakeInfo()
+
+        def order_check(self, request):
+            attempts.append(request["type_filling"])
+            if request["type_filling"] == self.ORDER_FILLING_IOC:
+                return FakeResult(10030, "Unsupported filling mode")
+            return FakeResult(0, "Done")
+
+        def last_error(self):
+            return (0, "")
+
+    monkeypatch.setattr("app.adapters.mt5.get_settings", lambda: SimpleNamespace(mt5_login="", mt5_password="", mt5_server="", mt5_order_deviation_points=20, mt5_order_magic=202402))
+    monkeypatch.setitem(sys.modules, "MetaTrader5", FakeMT5())
+
+    result = mt5_market_order_check("JP225", "buy", 1.0)
+
+    assert result.allowed
+    assert attempts[:2] == [FakeMT5.ORDER_FILLING_IOC, FakeMT5.ORDER_FILLING_RETURN]
+    assert "filling=2" in result.message
+
+
 def test_mt5_live_market_order_maps_order_send(monkeypatch) -> None:
     sent_requests = []
 
@@ -878,6 +937,47 @@ def test_hyperliquid_paper_live_probe_uses_minimum_real_order_and_paper_quantity
     assert "探针真实成交量" in result.error_message
 
 
+def test_hyperliquid_paper_live_probe_trusts_runtime_adapter_switch(monkeypatch) -> None:
+    submitted = []
+
+    class FakeExchange:
+        def market_open(self, name, is_buy, sz, px, slippage):
+            submitted.append((name, is_buy, sz))
+            return {
+                "status": "ok",
+                "response": {
+                    "data": {
+                        "statuses": [
+                            {"filled": {"totalSz": str(sz), "avgPx": "100.5", "oid": 67890}},
+                        ]
+                    }
+                },
+            }
+
+    adapter = HyperliquidAdapter(live=True)
+    adapter.paper_price_probe = True
+    adapter.settings = SimpleNamespace(
+        hyperliquid_paper_live_order_enabled=False,
+        paper_live_probe_enabled=False,
+        hyperliquid_account_address="0xabc",
+        hyperliquid_secret_key="0xkey",
+        hyperliquid_default_min_notional=10.0,
+        hyperliquid_paper_live_slippage=0.01,
+        hyperliquid_info_url="https://example.test/info",
+    )
+    adapter._post_info = lambda payload: (
+        {"universe": [{"name": "BTC", "szDecimals": 5}]} if payload["type"] == "meta" else {"BTC": "65000"}
+    )
+    adapter._fee_rate = lambda order: 0.0
+    monkeypatch.setattr("app.adapters.hyperliquid._load_hyperliquid_exchange", lambda settings: FakeExchange())
+
+    result = adapter.place_order(AdapterOrder(platform="hyperliquid", symbol="BTC", side="buy", quantity=0.25, venue_symbol="BTC"))
+
+    assert submitted == [("BTC", True, 0.00016)]
+    assert result.success
+    assert result.external_order_id == "67890"
+
+
 def test_execution_adapters_enable_hyperliquid_probe_only_for_paper_switch(monkeypatch) -> None:
     monkeypatch.setattr("app.execution.engine.get_settings", lambda: SimpleNamespace(hyperliquid_paper_live_order_enabled=True))
 
@@ -887,6 +987,215 @@ def test_execution_adapters_enable_hyperliquid_probe_only_for_paper_switch(monke
     assert hl.paper_price_probe is True
     assert getattr(hl, "simulated") is True
     assert mt5.demo is True
+
+
+def test_execution_adapters_enable_generic_paper_live_probe_for_configured_venue(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "app.execution.engine.get_settings",
+        lambda: SimpleNamespace(
+            hyperliquid_paper_live_order_enabled=False,
+            paper_live_probe_enabled=True,
+            paper_live_probe_venues="binance,okx",
+        ),
+    )
+    mapping = SymbolMapping(
+        symbol="BTC",
+        leg_a_venue="binance",
+        leg_a_symbol="BTCUSDT",
+        leg_a_venue_symbol="BTCUSDT",
+        leg_b_venue="mt5",
+        leg_b_symbol="BTCUSD",
+        mt5_symbol="BTCUSD",
+    )
+
+    leg_a, leg_b = _execution_adapters(live=False, simulated=True, mapping=mapping)
+
+    assert leg_a.platform == "binance"
+    assert leg_a.live is True
+    assert leg_a.paper_price_probe is True
+    assert getattr(leg_a, "simulated") is True
+    assert leg_b.demo is True
+
+
+def test_execution_adapters_db_probe_switch_applies_to_all_non_mt5_venues(monkeypatch) -> None:
+    engine = create_engine("sqlite:///:memory:", future=True)
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine, future=True)
+    db = Session()
+    db.add(SystemSetting(key="paper_live_probe_enabled", value="true"))
+    db.commit()
+    monkeypatch.setattr(
+        "app.execution.engine.get_settings",
+        lambda: SimpleNamespace(
+            hyperliquid_paper_live_order_enabled=False,
+            paper_live_probe_enabled=False,
+            paper_live_probe_venues="hyperliquid",
+        ),
+    )
+    mapping = SymbolMapping(
+        symbol="ETH",
+        leg_a_venue="okx",
+        leg_a_symbol="ETH-USDT-SWAP",
+        leg_a_venue_symbol="ETH-USDT-SWAP",
+        leg_b_venue="mt5",
+        leg_b_symbol="ETHUSD",
+        mt5_symbol="ETHUSD",
+    )
+
+    leg_a, leg_b = _execution_adapters(live=False, simulated=True, mapping=mapping, db=db)
+
+    assert leg_a.platform == "okx"
+    assert leg_a.live is True
+    assert leg_a.paper_price_probe is True
+    assert leg_b.demo is True
+
+
+def test_execution_adapters_db_probe_switch_overrides_legacy_hyperliquid_env(monkeypatch) -> None:
+    engine = create_engine("sqlite:///:memory:", future=True)
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine, future=True)
+    db = Session()
+    db.add(SystemSetting(key="paper_live_probe_enabled", value="false"))
+    db.commit()
+    monkeypatch.setattr(
+        "app.execution.engine.get_settings",
+        lambda: SimpleNamespace(
+            hyperliquid_paper_live_order_enabled=True,
+            paper_live_probe_enabled=False,
+            paper_live_probe_venues="*",
+        ),
+    )
+
+    leg_a, _ = _execution_adapters(live=False, simulated=True, db=db)
+
+    assert leg_a.platform == "hyperliquid"
+    assert leg_a.live is False
+    assert leg_a.paper_price_probe is False
+
+
+def test_nautilus_probe_rejects_until_real_order_adapter_exists() -> None:
+    adapter = NautilusReadOnlyAdapter("okx", live=True)
+    adapter.paper_price_probe = True
+
+    result = adapter.place_order(AdapterOrder(platform="okx", symbol="BTC", side="buy", quantity=1.0, venue_symbol="BTC-USDT-SWAP"))
+
+    assert not result.success
+    assert result.status == "rejected"
+    assert "尚未实现 paper-live 探针下单" in result.error_message
+
+
+def test_create_current_symbol_opportunity_uses_best_executable_direction() -> None:
+    engine = create_engine("sqlite:///:memory:", future=True)
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine, future=True)
+    db = Session()
+    db.add(StrategySetting(default_notional=1000.0))
+    db.add(SymbolMapping(symbol="BTC", leg_a_venue_symbol="BTCUSDT", mt5_symbol="BTCUSD", enabled=True))
+    db.add(
+        SpreadDirectionCurrent(
+            symbol="BTC",
+            direction="long_leg_a_short_leg_b",
+            leg_a_bid=65000,
+            leg_a_ask=65010,
+            leg_b_bid=65020,
+            leg_b_ask=65030,
+            quantity=0.1,
+            leg_a_quantity=0.1,
+            leg_b_quantity=0.1,
+            gross_spread=10,
+            entry_spread=10,
+            close_spread=5,
+            unit_cost=1,
+            unit_net_profit=9,
+            total_cost=1,
+            net_profit=9,
+            annualized_return=0.1,
+            status="candidate",
+            reason="未达入场线",
+        )
+    )
+    db.add(
+        SpreadDirectionCurrent(
+            symbol="BTC",
+            direction="long_leg_b_short_leg_a",
+            leg_a_bid=65000,
+            leg_a_ask=65010,
+            leg_b_bid=65020,
+            leg_b_ask=65030,
+            quantity=0.2,
+            leg_a_quantity=0.2,
+            leg_b_quantity=0.2,
+            gross_spread=20,
+            entry_spread=20,
+            close_spread=6,
+            unit_cost=2,
+            unit_net_profit=18,
+            total_cost=2,
+            net_profit=18,
+            annualized_return=0.2,
+            status="executable",
+            reason="ready",
+        )
+    )
+    db.commit()
+
+    opportunity = api_router._create_current_symbol_opportunity(db, "btc", "tester")
+
+    assert opportunity.direction == "long_leg_b_short_leg_a"
+    assert opportunity.status == "executable"
+    assert opportunity.entry_threshold == 20
+    assert opportunity.exit_target == 6
+    assert opportunity.reject_reason == "manual_execute_from_spread:tester"
+
+
+def test_binance_nautilus_probe_uses_exchange_minimum_and_paper_quantity(monkeypatch) -> None:
+    from app.exchanges.credentials import binance_futures_probe_order
+
+    submitted = []
+
+    class FakeClient:
+        async def sign_request(self, http_method, url_path, payload=None, ratelimiter_keys=None):
+            submitted.append((str(http_method), url_path, payload, ratelimiter_keys))
+            return json.dumps({"orderId": 987, "status": "FILLED", "executedQty": payload["quantity"], "avgPrice": "65010"}).encode("utf-8")
+
+    class FakeMarketApi:
+        client = FakeClient()
+        base_endpoint = "/fapi/v1/"
+
+        async def query_futures_exchange_info(self):
+            return {
+                "symbols": [
+                    {
+                        "symbol": "BTCUSDT",
+                        "quantityPrecision": 3,
+                        "filters": [
+                            {"filterType": "LOT_SIZE", "minQty": "0.001", "stepSize": "0.001"},
+                            {"filterType": "MIN_NOTIONAL", "notional": "100"},
+                        ],
+                    }
+                ]
+            }
+
+    async def fake_ticker(row, symbol):
+        return SimpleNamespace(bidPrice="65000", askPrice="65020")
+
+    monkeypatch.setattr("app.exchanges.credentials._nautilus_binance_futures_apis", lambda row: (None, FakeMarketApi()))
+    monkeypatch.setattr("app.exchanges.credentials._nautilus_binance_futures_ticker", fake_ticker)
+    row = ExchangeCredential(venue="binance", environment="test", enabled=True, read_only=False, encrypted_credentials="x")
+
+    result = binance_futures_probe_order(
+        row,
+        AdapterOrder(platform="binance", symbol="BTC", side="buy", quantity=0.25, venue_symbol="BTCUSDT"),
+        configured_min_base_size=0.0,
+    )
+
+    assert result.success
+    assert result.external_order_id == "987"
+    assert result.filled_quantity == 0.25
+    assert result.average_price == 65010.0
+    assert submitted[0][2]["quantity"] == "0.002"
+    assert submitted[0][2]["newOrderRespType"] == "RESULT"
+    assert "paper 账本成交量 0.25" in result.error_message
 
 
 def test_symbol_mapping_rejects_empty_leg_a_venue_symbol() -> None:

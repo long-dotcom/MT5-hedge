@@ -16,6 +16,7 @@ from app.execution.gateway import LegOrderIntent, build_execution_gateway
 from app.execution.hedge_pool import hedge_pool
 from app.execution.pnl import actual_entry_spread_from_fills, pnl_from_close_spread, realized_pnl_from_fills
 from app.execution.readiness import live_execution_readiness, paper_execution_readiness
+from app.execution.runtime_settings import paper_live_probe_enabled_for_venue, runtime_paper_live_parallel_execution
 from app.market.active_refresh import refresh_execution_quotes
 from app.market.mt5_sessions import mt5_action_allowed, mt5_session_state
 from app.market.mt5_tradability import block_mt5_tradability, mt5_tradability_cache
@@ -29,7 +30,7 @@ def live_trading_enabled(db: Session) -> bool:
     return bool(row and row.value == "true")
 
 
-def open_hedge_group(db: Session, opportunity_id: int, source: str = "system") -> HedgeGroup:
+def open_hedge_group(db: Session, opportunity_id: int, source: str = "system", *, force_strategy_checks: bool = False) -> HedgeGroup:
     opportunity = db.get(ArbitrageOpportunity, opportunity_id)
     if not opportunity:
         raise ValueError("机会不存在")
@@ -108,11 +109,11 @@ def open_hedge_group(db: Session, opportunity_id: int, source: str = "system") -
     db.flush()
 
     leg_a_side = "buy" if opportunity.direction == "long_leg_a_short_leg_b" else "sell"
-    leg_a_adapter, leg_b_adapter = _execution_adapters(live=live, simulated=simulated, mapping=mapping)
+    leg_a_adapter, leg_b_adapter = _execution_adapters(live=live, simulated=simulated, mapping=mapping, db=db)
     leg_a_quantity = opportunity.leg_a_quantity or opportunity.quantity
     if mapping.execution_style == "hyper_maker_mt5_taker":
         results = _execute_hyper_maker_then_mt5(db, group.id, mapping, opportunity.symbol, leg_a_adapter, leg_b_adapter, leg_a_side, leg_b_side, leg_a_quantity, leg_b_quantity, synced)
-    elif _paper_live_parallel_enabled(live=live, simulated=simulated, hl=leg_a_adapter, mapping=mapping):
+    elif _paper_live_parallel_enabled(live=live, simulated=simulated, hl=leg_a_adapter, mapping=mapping, db=db):
         results = _execute_parallel_legs_with_compensation(
             db,
             group.id,
@@ -479,7 +480,7 @@ def _compensate_parallel_single_leg(db: Session, group_id: int, mapping: SymbolM
     if quantity <= 0:
         return None
     adapter_live, simulated = (False, True)
-    leg_a_adapter, leg_b_adapter = _execution_adapters(live=adapter_live, simulated=simulated, mapping=mapping)
+    leg_a_adapter, leg_b_adapter = _execution_adapters(live=adapter_live, simulated=simulated, mapping=mapping, db=db)
     compensation_reduce_only = not reduce_only
     if platform == mapping.leg_a_venue:
         db.add(HedgeGroupEvent(hedge_group_id=group_id, event_type="parallel_single_leg_compensation", detail=f"Leg B 腿失败，反向冲销 {mapping.leg_a_venue} {quantity:g}"))
@@ -718,12 +719,12 @@ def _execute_close_hedge_group(
     hl_side, mt5_side = _close_sides(group.direction)
     if simulated:
         _ensure_paper_execution_ready(db)
-    leg_a_adapter, leg_b_adapter = _execution_adapters(live=live, simulated=simulated, mapping=mapping)
+    leg_a_adapter, leg_b_adapter = _execution_adapters(live=live, simulated=simulated, mapping=mapping, db=db)
     leg_a_quantity = _platform_close_quantity(group.leg_a_quantity, group.quantity)
     leg_b_quantity = _platform_close_quantity(group.leg_b_quantity, group.quantity)
     results = []
     if leg_a_quantity > 0:
-        if _paper_live_parallel_enabled(live=live, simulated=simulated, hl=leg_a_adapter, mapping=mapping):
+        if _paper_live_parallel_enabled(live=live, simulated=simulated, hl=leg_a_adapter, mapping=mapping, db=db):
             results = _execute_parallel_legs_with_compensation(
                 db,
                 group.id,
@@ -823,32 +824,37 @@ def _ensure_paper_execution_ready(db: Session) -> None:
         raise ValueError(f"paper 完整模拟执行就绪检查未通过: {detail}")
 
 
-def _execution_adapters(*, live: bool, simulated: bool, mapping: SymbolMapping | None = None):
+def _execution_adapters(*, live: bool, simulated: bool, mapping: SymbolMapping | None = None, db: Session | None = None):
     leg_a_venue = mapping.leg_a_venue if mapping else "hyperliquid"
     leg_b_venue = mapping.leg_b_venue if mapping else "mt5"
     settings = get_settings()
+    paper_live_leg_a = simulated and paper_live_probe_enabled_for_venue(db, settings, leg_a_venue)
+    paper_live_leg_b = simulated and paper_live_probe_enabled_for_venue(db, settings, leg_b_venue)
     if leg_a_venue == "hyperliquid":
-        paper_live_hl = simulated and bool(getattr(settings, "hyperliquid_paper_live_order_enabled", False))
-        leg_a_adapter = HyperliquidAdapter(live=live or paper_live_hl)
-        setattr(leg_a_adapter, "simulated", bool(simulated))
-        setattr(leg_a_adapter, "paper_price_probe", bool(paper_live_hl))
+        leg_a_adapter = HyperliquidAdapter(live=live or paper_live_leg_a)
     else:
-        leg_a_adapter = build_market_adapter(leg_a_venue, live=live)
+        leg_a_adapter = build_market_adapter(leg_a_venue, live=live or paper_live_leg_a)
+    _configure_paper_live_adapter(leg_a_adapter, simulated=simulated, paper_live_probe=paper_live_leg_a)
     if leg_b_venue == "mt5":
         leg_b_adapter = MT5Adapter(live=live, demo=simulated)
     else:
-        leg_b_adapter = build_market_adapter(leg_b_venue, live=live)
+        leg_b_adapter = build_market_adapter(leg_b_venue, live=live or paper_live_leg_b)
+    _configure_paper_live_adapter(leg_b_adapter, simulated=simulated, paper_live_probe=paper_live_leg_b)
     return leg_a_adapter, leg_b_adapter
 
 
-def _paper_live_parallel_enabled(*, live: bool, simulated: bool, hl, mapping: SymbolMapping) -> bool:
+def _paper_live_parallel_enabled(*, live: bool, simulated: bool, hl, mapping: SymbolMapping, db: Session | None = None) -> bool:
     if live or not simulated:
         return False
     if mapping.execution_style == "hyper_maker_mt5_taker":
         return False
     settings = get_settings()
-    return bool(getattr(settings, "hyperliquid_paper_live_order_enabled", False) and getattr(settings, "paper_live_parallel_execution", True) and getattr(hl, "paper_price_probe", False))
+    return bool(runtime_paper_live_parallel_execution(db, settings) and getattr(hl, "paper_price_probe", False))
 
+
+def _configure_paper_live_adapter(adapter, *, simulated: bool, paper_live_probe: bool) -> None:
+    setattr(adapter, "simulated", bool(simulated))
+    setattr(adapter, "paper_price_probe", bool(paper_live_probe))
 
 def _has_position_effect(result) -> bool:
     return bool(result.success and result.filled_quantity > 0 and result.status in {"filled", "partially_filled"})
@@ -856,3 +862,4 @@ def _has_position_effect(result) -> bool:
 
 def _is_pending_result(result) -> bool:
     return result.status in {"accepted", "submitted", "pending", "open", "new"}
+

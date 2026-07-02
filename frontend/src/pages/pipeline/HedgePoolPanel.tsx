@@ -1,5 +1,6 @@
 import { Card, Col, Row, Space, Tag, Tooltip, Typography } from 'antd';
 import { fmtAdaptive, fmtCompact } from '../../utils/format';
+import { directionLabel } from '../../utils/venues';
 import type { HedgePoolItem, PipelineDiagnostics } from './types';
 
 const STAGE_COLOR: Record<string, string> = {
@@ -11,15 +12,9 @@ const STAGE_COLOR: Record<string, string> = {
   manual: 'red'
 };
 
-function directionText(value: string) {
-  if (value === 'long_hyperliquid_short_mt5') return 'HL多 / MT5空';
-  if (value === 'long_mt5_short_hyperliquid') return 'MT5多 / HL空';
-  return value || '-';
-}
-
 function PoolItemCard({ item }: { item: HedgePoolItem }) {
   return (
-    <Tooltip title={item.close_reason || directionText(item.direction)}>
+    <Tooltip title={item.close_reason || directionLabel(item.direction, item)}>
       <div className={`pool-chip pool-stage-${item.stage}`}>
         <div className="pool-chip-title">
           <strong>{item.symbol}</strong>

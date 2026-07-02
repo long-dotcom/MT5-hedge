@@ -6,11 +6,17 @@ from typing import Any
 from app.db.models import HedgeGroup
 from app.market.quotes import quote_cache
 from app.strategy.spread_math import spreads_for_direction
+from app.adapters.venue import mapping_leg
 
 
-def hedge_group_spreads(group: HedgeGroup) -> dict[str, Any]:
-    hl = quote_cache.latest("hyperliquid", group.symbol)
-    mt5 = quote_cache.latest("mt5", group.symbol)
+def hedge_group_spreads(group: HedgeGroup, mapping=None) -> dict[str, Any]:
+    if mapping is not None:
+        leg_a_venue, _ = mapping_leg(mapping, "a")
+        leg_b_venue, _ = mapping_leg(mapping, "b")
+    else:
+        leg_a_venue, leg_b_venue = "hyperliquid", "mt5"
+    hl = quote_cache.latest(leg_a_venue, group.symbol)
+    mt5 = quote_cache.latest(leg_b_venue, group.symbol)
     if not hl or not mt5:
         return {
             "current_entry_spread": None,

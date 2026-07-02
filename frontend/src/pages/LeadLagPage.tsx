@@ -8,6 +8,7 @@ import { EllipsisCell } from '../components/EllipsisCell';
 import { useHeaderStreamStatus } from '../components/HeaderStreamStatus';
 import { usePageStream } from '../hooks/useLiveStream';
 import { fmtAdaptive, fmtChartTime, fmtLocalTime } from '../utils/format';
+import { legMeta, venueColor, venueLabel } from '../utils/venues';
 
 function fmtMs(value?: number | null) {
   if (value === undefined || value === null || Number.isNaN(value)) return '-';
@@ -22,12 +23,6 @@ function fmtPct(value?: number | null) {
 function fmtMid(value?: number | null) {
   if (value === undefined || value === null || Number.isNaN(value) || value === 0) return '-';
   return value.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 6 });
-}
-
-function platformLabel(platform?: string) {
-  if (platform === 'hyperliquid') return 'HL';
-  if (platform === 'mt5') return 'MT5';
-  return platform || '-';
 }
 
 function DirectionPanel({
@@ -45,7 +40,7 @@ function DirectionPanel({
     <div className="leadlag-direction-card">
       <div className="leadlag-direction-head">
         <strong>{title}</strong>
-        <span><Tag color="cyan">{leader}</Tag><i /> <Tag color="geekblue">{follower}</Tag></span>
+        <span><Tag color={venueColor(leader)}>{venueLabel(leader)}</Tag><i /> <Tag color={venueColor(follower)}>{venueLabel(follower)}</Tag></span>
       </div>
       <div className="leadlag-direction-metrics">
         <div><span>平均滞后</span><strong>{fmtMs(data.avg_lag_ms)}</strong></div>
@@ -86,13 +81,17 @@ export function LeadLagPage() {
   const series = query.data?.series || [];
   const summary = query.data?.summary || {};
   const latest = query.data?.latest || {};
+  const activeMapping = query.data || (symbols.data || []).find((row: any) => row.symbol === activeSymbol);
+  const meta = legMeta(activeMapping);
+  const legALabel = venueLabel(meta.leg_a_venue);
+  const legBLabel = venueLabel(meta.leg_b_venue);
   const option = useMemo(() => {
     const times = series.map((row: any) => fmtChartTime(row.time));
-    const hlBase = series.find((row: any) => row.hyperliquid_mid)?.hyperliquid_mid || 1;
-    const mt5Base = series.find((row: any) => row.mt5_mid)?.mt5_mid || 1;
+    const hlBase = series.find((row: any) => row.leg_a_mid)?.leg_a_mid || 1;
+    const mt5Base = series.find((row: any) => row.leg_b_mid)?.leg_b_mid || 1;
     return {
       tooltip: { trigger: 'axis' },
-      legend: { top: 0, data: ['HL 标准化', 'MT5 标准化', 'Mid差'] },
+      legend: { top: 0, data: [`${legALabel} 标准化`, `${legBLabel} 标准化`, 'Mid差'] },
       grid: { left: 48, right: 52, top: 48, bottom: 64, containLabel: true },
       xAxis: {
         type: 'category',
@@ -108,16 +107,16 @@ export function LeadLagPage() {
       ],
       dataZoom: [{ type: 'inside' }, { type: 'slider', height: 20, bottom: 10 }],
       series: [
-        { name: 'HL 标准化', type: 'line', showSymbol: false, data: series.map((row: any) => row.hyperliquid_mid ? row.hyperliquid_mid / hlBase * 10000 : null), lineStyle: { color: '#1677ff', width: 2 } },
-        { name: 'MT5 标准化', type: 'line', showSymbol: false, data: series.map((row: any) => row.mt5_mid ? row.mt5_mid / mt5Base * 10000 : null), lineStyle: { color: '#52c41a', width: 2 } },
+        { name: `${legALabel} 标准化`, type: 'line', showSymbol: false, data: series.map((row: any) => row.leg_a_mid ? row.leg_a_mid / hlBase * 10000 : null), lineStyle: { color: '#1677ff', width: 2 } },
+        { name: `${legBLabel} 标准化`, type: 'line', showSymbol: false, data: series.map((row: any) => row.leg_b_mid ? row.leg_b_mid / mt5Base * 10000 : null), lineStyle: { color: '#52c41a', width: 2 } },
         { name: 'Mid差', type: 'line', yAxisIndex: 1, showSymbol: false, data: series.map((row: any) => row.mid_diff), lineStyle: { color: '#fa8c16', width: 1, type: 'dashed' } }
       ]
     };
-  }, [series]);
+  }, [series, legALabel, legBLabel]);
   const eventColumns: ColumnsType<any> = [
     { title: '时间', dataIndex: 'leader_time', width: 190, render: fmtLocalTime },
-    { title: '领先方', dataIndex: 'leader_platform', width: 120, render: (v) => <Tag color={v === 'hyperliquid' ? 'cyan' : 'geekblue'}>{platformLabel(v)}</Tag> },
-    { title: '跟随方', dataIndex: 'follower_platform', width: 120, render: (v) => <Tag color={v === 'hyperliquid' ? 'cyan' : 'geekblue'}>{platformLabel(v)}</Tag> },
+    { title: '领先方', dataIndex: 'leader_platform', width: 120, render: (v) => <Tag color={venueColor(v)}>{venueLabel(v)}</Tag> },
+    { title: '跟随方', dataIndex: 'follower_platform', width: 120, render: (v) => <Tag color={venueColor(v)}>{venueLabel(v)}</Tag> },
     { title: '方向', dataIndex: 'direction', width: 80, ellipsis: true, render: (v) => <EllipsisCell value={v} /> },
     { title: '跟随', dataIndex: 'followed', width: 80, render: (v) => <Tag color={v ? 'green' : 'gold'}>{v ? '是' : '否'}</Tag> },
     { title: '滞后', dataIndex: 'lag_ms', width: 100, render: fmtMs },
@@ -126,8 +125,8 @@ export function LeadLagPage() {
     { title: '跟随跳动', dataIndex: 'follower_move', width: 110, render: (v) => fmtAdaptive(v, 2, 6) },
     { title: '期间最大Mid差', dataIndex: 'max_mid_diff', width: 130, render: (v) => fmtAdaptive(v, 2, 6) }
   ];
-  const hlToMt5 = summary.hyperliquid_to_mt5 || {};
-  const mt5ToHl = summary.mt5_to_hyperliquid || {};
+  const legAToLegB = summary.leg_a_to_leg_b || {};
+  const legBToLegA = summary.leg_b_to_leg_a || {};
   return (
     <div className="leadlag-page">
       <Card className="leadlag-toolbar">
@@ -155,8 +154,8 @@ export function LeadLagPage() {
           <div className="leadlag-card-head">
             <strong>{activeSymbol || '-'}</strong>
             <Space size={8}>
-              <Tag color="cyan">HL Mid {fmtMid(latest.hyperliquid?.mid)}</Tag>
-              <Tag color="geekblue">MT5 Mid {fmtMid(latest.mt5?.mid)}</Tag>
+              <Tag color={venueColor(meta.leg_a_venue)}>{legALabel} Mid {fmtMid(latest[meta.leg_a_venue]?.mid)}</Tag>
+              <Tag color={venueColor(meta.leg_b_venue)}>{legBLabel} Mid {fmtMid(latest[meta.leg_b_venue]?.mid)}</Tag>
             </Space>
           </div>
           {series.length ? <ReactECharts option={option} style={{ height: 430 }} /> : <Empty description="暂无报价历史" />}
@@ -165,20 +164,20 @@ export function LeadLagPage() {
         <aside className="leadlag-side">
           <Card className="leadlag-latest-card">
             <div className="leadlag-latest-row">
-              <span>HL 来源</span>
-              <strong><EllipsisCell value={latest.hyperliquid?.source} /></strong>
+              <span>{legALabel} 来源</span>
+              <strong><EllipsisCell value={latest[meta.leg_a_venue]?.source} /></strong>
             </div>
             <div className="leadlag-latest-row">
-              <span>MT5 来源</span>
-              <strong><EllipsisCell value={latest.mt5?.source} /></strong>
+              <span>{legBLabel} 来源</span>
+              <strong><EllipsisCell value={latest[meta.leg_b_venue]?.source} /></strong>
             </div>
             <div className="leadlag-latest-row">
               <span>样本点</span>
               <strong>{series.length}</strong>
             </div>
           </Card>
-          <DirectionPanel title="HL 领先 MT5" leader="HL" follower="MT5" data={hlToMt5} />
-          <DirectionPanel title="MT5 领先 HL" leader="MT5" follower="HL" data={mt5ToHl} />
+          <DirectionPanel title={`${legALabel} 领先 ${legBLabel}`} leader={meta.leg_a_venue} follower={meta.leg_b_venue} data={legAToLegB} />
+          <DirectionPanel title={`${legBLabel} 领先 ${legALabel}`} leader={meta.leg_b_venue} follower={meta.leg_a_venue} data={legBToLegA} />
         </aside>
       </div>
 

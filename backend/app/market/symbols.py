@@ -28,8 +28,12 @@ def seed_symbol_mappings_from_file(db: Session) -> int:
         if row:
             continue
         payload = {
-            "hyperliquid_symbol": item.get("hyperliquid_symbol", symbol),
+            "leg_a_venue_symbol": item.get("leg_a_venue_symbol", item.get("hyperliquid_symbol", symbol)),
             "mt5_symbol": item.get("mt5_symbol", symbol),
+            "leg_a_venue": item.get("leg_a_venue", "hyperliquid"),
+            "leg_a_symbol": item.get("leg_a_symbol", item.get("leg_a_venue_symbol", item.get("hyperliquid_symbol", symbol))),
+            "leg_b_venue": item.get("leg_b_venue", "mt5"),
+            "leg_b_symbol": item.get("leg_b_symbol", item.get("mt5_symbol", symbol)),
             "base_asset": item.get("base_asset", symbol),
             "quote_asset": item.get("quote_asset", "USD"),
             "contract_multiplier": float(item.get("contract_multiplier", 1.0)),
@@ -44,8 +48,8 @@ def seed_symbol_mappings_from_file(db: Session) -> int:
             "mt5_currency_margin": item.get("mt5_currency_margin", item.get("quote_asset", "USD")),
             "mt5_calc_mode": int(item.get("mt5_calc_mode", 0)),
             "mt5_min_base_size": float(item.get("mt5_min_base_size", 0.0)),
-            "hyperliquid_min_base_size": float(item.get("hyperliquid_min_base_size", 0.0)),
-            "hyperliquid_min_notional": float(item.get("hyperliquid_min_notional", 10.0)),
+            "leg_a_min_base_size": float(item.get("leg_a_min_base_size", item.get("hyperliquid_min_base_size", 0.0))),
+            "leg_a_min_notional": float(item.get("leg_a_min_notional", item.get("hyperliquid_min_notional", 10.0))),
             "execution_style": item.get("execution_style", "taker_taker"),
             "hl_open_order_type": item.get("hl_open_order_type", "market"),
             "hl_close_order_type": item.get("hl_close_order_type", "market"),
@@ -90,4 +94,9 @@ def enabled_mappings(db: Session) -> list[SimpleNamespace]:
 
 
 def _snapshot_mapping(row: SymbolMapping) -> SimpleNamespace:
-    return SimpleNamespace(**{column.name: getattr(row, column.name) for column in row.__table__.columns})
+    values = {column.name: getattr(row, column.name) for column in row.__table__.columns}
+    values["leg_a_venue"] = values.get("leg_a_venue") or "hyperliquid"
+    values["leg_a_symbol"] = values.get("leg_a_symbol") or values.get("leg_a_venue_symbol") or values.get("hyperliquid_symbol") or values.get("symbol")
+    values["leg_b_venue"] = values.get("leg_b_venue") or "mt5"
+    values["leg_b_symbol"] = values.get("leg_b_symbol") or values.get("mt5_symbol") or values.get("symbol")
+    return SimpleNamespace(**values)

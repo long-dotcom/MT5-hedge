@@ -1,10 +1,14 @@
 export type V2NodeStatus = 'active' | 'blocked' | 'warning' | 'inactive';
-export type V2Direction = 'long_mt5_short_hyperliquid' | 'long_hyperliquid_short_mt5';
+export type V2Direction = 'long_leg_b_short_leg_a' | 'long_leg_a_short_leg_b';
 export type V2HedgeStatus = 'holding' | 'closable' | 'manual' | 'building' | 'closing';
 
 export type V2PipelineSymbol = {
   symbol: string;
   direction: V2Direction;
+  leg_a_venue?: string;
+  leg_a_symbol?: string;
+  leg_b_venue?: string;
+  leg_b_symbol?: string;
   spread: number;
   pipelineStatus: 'normal' | 'blocked';
   blockReason?: string;

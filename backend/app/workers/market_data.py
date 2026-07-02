@@ -12,6 +12,7 @@ from sqlalchemy.exc import OperationalError
 
 from app.adapters.hyperliquid import HyperliquidAdapter
 from app.adapters.mt5 import MT5Adapter
+from app.adapters.venue import build_market_adapter, mapping_leg
 from app.config.settings import get_settings
 from app.db.session import SessionLocal
 from app.market.orderbook import order_book_cache, parse_hyperliquid_levels
@@ -33,6 +34,8 @@ class MarketDataManager:
         if settings.quote_source_mode == "live":
             self._start_thread("hyperliquid-ws", self._hyperliquid_ws_loop)
             self._start_thread("mt5-polling", self._mt5_polling_loop)
+            if getattr(settings, "nautilus_read_only_sync_enabled", True):
+                self._start_thread("nautilus-polling", self._nautilus_polling_loop)
         else:
             self._start_thread("paper-quotes", self._paper_loop)
 
@@ -45,14 +48,16 @@ class MarketDataManager:
         while time.time() < deadline:
             db = SessionLocal()
             try:
-                symbols = [item.symbol for item in enabled_mappings(db)]
+                mappings = enabled_mappings(db)
+                symbols = [item.symbol for item in mappings]
             except OperationalError as exc:
                 logger.warning(f"启动等待行情时读取品种映射失败，继续等待: {exc}")
                 db.rollback()
+                mappings = []
                 symbols = []
             finally:
                 db.close()
-            if symbols and all(quote_cache.latest("hyperliquid", symbol) and quote_cache.latest("mt5", symbol) for symbol in symbols):
+            if symbols and all(_mapping_quotes_seeded(item) for item in mappings):
                 return
             time.sleep(0.05)
 
@@ -79,11 +84,14 @@ class MarketDataManager:
                 db.close()
             for mapping in mappings:
                 try:
-                    hl = hyperliquid.get_ticker(mapping.hyperliquid_symbol)
-                    mt = mt5.get_ticker(mapping.mt5_symbol)
-                    _put_synthetic_l2(mapping.symbol, hl.bid, hl.ask, hl.depth_notional, "paper")
-                    quote_cache.put("hyperliquid", mapping.symbol, hl.bid, hl.ask, hl.depth_notional, "paper", hl.timestamp)
-                    quote_cache.put("mt5", mapping.symbol, mt.bid, mt.ask, mt.depth_notional, "paper", mt.timestamp)
+                    leg_a_venue, leg_a_symbol = mapping_leg(mapping, "a")
+                    leg_b_venue, leg_b_symbol = mapping_leg(mapping, "b")
+                    leg_a = hyperliquid.get_ticker(leg_a_symbol) if leg_a_venue == "hyperliquid" else mt5.get_ticker(leg_a_symbol) if leg_a_venue == "mt5" else build_market_adapter(leg_a_venue).get_ticker(leg_a_symbol)
+                    leg_b = hyperliquid.get_ticker(leg_b_symbol) if leg_b_venue == "hyperliquid" else mt5.get_ticker(leg_b_symbol) if leg_b_venue == "mt5" else build_market_adapter(leg_b_venue).get_ticker(leg_b_symbol)
+                    if leg_a_venue == "hyperliquid":
+                        _put_synthetic_l2(mapping.symbol, leg_a.bid, leg_a.ask, leg_a.depth_notional, "paper")
+                    quote_cache.put(leg_a_venue, mapping.symbol, leg_a.bid, leg_a.ask, leg_a.depth_notional, "paper", leg_a.timestamp)
+                    quote_cache.put(leg_b_venue, mapping.symbol, leg_b.bid, leg_b.ask, leg_b.depth_notional, "paper", leg_b.timestamp)
                 except Exception as exc:
                     logger.warning(f"Paper 行情更新失败: {mapping.symbol}; {exc}")
             time.sleep(interval)
@@ -112,15 +120,18 @@ class MarketDataManager:
                 finally:
                     db.close()
                 for mapping in mappings:
+                    if "mt5" not in {mapping.leg_a_venue, mapping.leg_b_venue}:
+                        continue
+                    mt5_symbol = mapping.leg_a_symbol if mapping.leg_a_venue == "mt5" else mapping.leg_b_symbol
                     try:
-                        mt5.symbol_select(mapping.mt5_symbol, True)
-                        tick = mt5.symbol_info_tick(mapping.mt5_symbol)
+                        mt5.symbol_select(mt5_symbol, True)
+                        tick = mt5.symbol_info_tick(mt5_symbol)
                         if not tick:
                             continue
                         exchange_ts = datetime.utcfromtimestamp(getattr(tick, "time_msc", 0) / 1000) if getattr(tick, "time_msc", 0) else None
                         quote_cache.put("mt5", mapping.symbol, tick.bid, tick.ask, 0.0, "mt5_symbol_info_tick", exchange_ts)
                     except Exception as exc:
-                        logger.warning(f"MT5 行情更新失败: {mapping.symbol} {mapping.mt5_symbol}; {exc}")
+                        logger.warning(f"MT5 行情更新失败: {mapping.symbol} {mt5_symbol}; {exc}")
                 time.sleep(interval)
         finally:
             mt5.shutdown()
@@ -208,6 +219,32 @@ class MarketDataManager:
         finally:
             db.close()
 
+    def _nautilus_polling_loop(self) -> None:
+        settings = get_settings()
+        interval = max(getattr(settings, "nautilus_quote_poll_interval_ms", 1000), 250) / 1000
+        while not self._stop.is_set():
+            db = SessionLocal()
+            try:
+                mappings = enabled_mappings(db)
+            except OperationalError as exc:
+                logger.warning(f"Nautilus 行情线程读取品种映射失败，下一轮重试: {exc}")
+                db.rollback()
+                time.sleep(interval)
+                continue
+            finally:
+                db.close()
+            for mapping in mappings:
+                for index in ("a", "b"):
+                    venue, venue_symbol = mapping_leg(mapping, index)
+                    if venue in {"hyperliquid", "mt5"}:
+                        continue
+                    try:
+                        ticker = build_market_adapter(venue, live=True).get_ticker(venue_symbol)
+                        quote_cache.put(venue, mapping.symbol, ticker.bid, ticker.ask, ticker.depth_notional, "nautilus_read_only", ticker.timestamp)
+                    except Exception as exc:
+                        logger.warning(f"Nautilus 行情更新失败: {mapping.symbol} {venue}:{venue_symbol}; {exc}")
+            time.sleep(interval)
+
     def _handle_hyperliquid_message(self, payload: dict[str, Any], by_hl_symbol: dict[str, str], source: str = "hyperliquid_l2Book") -> None:
         channel = payload.get("channel")
         data = payload.get("data") or {}
@@ -248,11 +285,16 @@ def l2book_subscription(coin: str, *, fast: bool) -> dict[str, Any]:
 
 
 def hyperliquid_symbol_map(mappings, *, hip3_only: bool) -> dict[str, str]:
-    return {
-        item.hyperliquid_symbol: item.symbol
-        for item in mappings
-        if not hip3_only or ":" in item.hyperliquid_symbol
-    }
+    rows: dict[str, str] = {}
+    for item in mappings:
+        for index in ("a", "b"):
+            venue, venue_symbol = mapping_leg(item, index)
+            if venue != "hyperliquid":
+                continue
+            if hip3_only and ":" not in venue_symbol:
+                continue
+            rows[venue_symbol] = item.symbol
+    return rows
 
 
 market_data_manager = MarketDataManager()
@@ -266,3 +308,9 @@ def _put_synthetic_l2(symbol: str, bid: float, ask: float, depth_notional: float
     bids = [(bid - step * index, level_notional / max(bid - step * index, 1e-12)) for index in range(levels)]
     asks = [(ask + step * index, level_notional / max(ask + step * index, 1e-12)) for index in range(levels)]
     order_book_cache.put("hyperliquid", symbol, bids, asks, source)
+
+
+def _mapping_quotes_seeded(mapping) -> bool:
+    leg_a_venue, _ = mapping_leg(mapping, "a")
+    leg_b_venue, _ = mapping_leg(mapping, "b")
+    return bool(quote_cache.latest(leg_a_venue, mapping.symbol) and quote_cache.latest(leg_b_venue, mapping.symbol))

@@ -7,11 +7,10 @@ import { useHeaderStreamStatus } from '../components/HeaderStreamStatus';
 import { usePageStream } from '../hooks/useLiveStream';
 import { fmtAdaptive, fmtMoney, fmtPnlColor, fmtPnlSigned } from '../utils/format';
 import { tableScrollAutoY } from '../utils/tableScroll';
+import { venueColor, venueLabel } from '../utils/venues';
 
 function platformTag(platform?: string) {
-  if (platform === 'hyperliquid') return <Tag color="cyan">HL</Tag>;
-  if (platform === 'mt5') return <Tag color="geekblue">MT5</Tag>;
-  return <Tag>{platform || '-'}</Tag>;
+  return <Tag color={venueColor(platform)}>{venueLabel(platform)}</Tag>;
 }
 
 function sideTag(side?: string) {

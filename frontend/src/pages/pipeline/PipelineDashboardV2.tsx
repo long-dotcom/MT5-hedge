@@ -1,4 +1,5 @@
 import { fmtAdaptive, fmtSpread } from '../../utils/format';
+import { directionLabel, venueLabel } from '../../utils/venues';
 import type { V2DashboardData, V2HedgeGroup, V2NodeStatus, V2PipelineSymbol } from './v2Types';
 
 function delayClass(ms: number) {
@@ -40,12 +41,6 @@ function segmentStatus(from: V2NodeStatus, to: V2NodeStatus): 'normal' | 'blocke
   return 'normal';
 }
 
-function directionText(value: string) {
-  if (value === 'long_mt5_short_hyperliquid') return 'long MT5 · short HL';
-  if (value === 'long_hyperliquid_short_mt5') return 'long HL · short MT5';
-  return value;
-}
-
 function PipelineRow({ data }: { data: V2PipelineSymbol }) {
   const isBlocked = data.pipelineStatus === 'blocked';
   const stages = [
@@ -59,14 +54,14 @@ function PipelineRow({ data }: { data: V2PipelineSymbol }) {
       <div className="v2-row-header">
         <div className="v2-row-title">
           <strong>{data.symbol}</strong>
-          <span>{directionText(data.direction)}</span>
+          <span>{directionLabel(data.direction, data)}</span>
         </div>
         <div className={`v2-spread ${data.spread >= 0 ? 'positive' : 'negative'}`}>价差 {data.spread >= 0 ? '+' : ''}{fmtSpread(data.spread)}</div>
       </div>
       <div className="v2-row-flow">
         <div className="v2-sources">
-          <div className="v2-source hl"><i />HL</div>
-          <div className="v2-source mt5"><i />MT5</div>
+          <div className="v2-source hl"><i />{venueLabel(data.leg_a_venue)}</div>
+          <div className="v2-source mt5"><i />{venueLabel(data.leg_b_venue)}</div>
         </div>
         <svg className="v2-merge-svg" viewBox="0 0 56 76">
           <line x1="0" y1="18" x2="24" y2="18" className={`v2-merge-line ${isBlocked ? 'blocked' : 'hl'}`} />
@@ -109,7 +104,7 @@ function PipelinePanelV2({ pipelines }: { pipelines: V2PipelineSymbol[] }) {
     <section className="v2-panel v2-pipeline-panel">
       <div className="v2-panel-header green">
         <h2>行情管道</h2>
-        <span>Hyperliquid ←→ MT5</span>
+        <span>按品种映射双腿同步</span>
       </div>
       <div className="v2-legend">
         <span><i className="normal" />正常流动</span>

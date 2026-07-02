@@ -25,8 +25,6 @@ class HyperliquidAdapter(PaperAdapter):
         return AdapterOrderResult(False, "", "failed", 0.0, 0.0, 0.0, "首版未启用 Hyperliquid 真实下单 SDK 调用")
 
     def _place_paper_live_probe(self, order: AdapterOrder) -> AdapterOrderResult:
-        if not getattr(self.settings, "hyperliquid_paper_live_order_enabled", False):
-            return AdapterOrderResult(False, "", "failed", 0.0, 0.0, 0.0, "Hyperliquid paper-live 探针下单开关未开启")
         if not self.settings.hyperliquid_account_address or not getattr(self.settings, "hyperliquid_secret_key", ""):
             return AdapterOrderResult(False, "", "failed", 0.0, 0.0, 0.0, "Hyperliquid paper-live 探针需要账户地址和 API 私钥")
         venue_symbol = order.venue_symbol or order.symbol
@@ -245,8 +243,8 @@ def _configured_hyperliquid_min_base_size(symbol: str) -> float:
         from app.db.session import SessionLocal
 
         with SessionLocal() as db:
-            row = db.query(SymbolMapping).filter(SymbolMapping.hyperliquid_symbol == symbol).first()
-            return float(getattr(row, "hyperliquid_min_base_size", 0.0) or 0.0) if row else 0.0
+            row = db.query(SymbolMapping).filter(SymbolMapping.leg_a_venue_symbol == symbol).first()
+            return float(getattr(row, "leg_a_min_base_size", 0.0) or 0.0) if row else 0.0
     except Exception:
         return 0.0
 
@@ -258,7 +256,7 @@ def _configured_perp_dexs() -> list[str]:
         from app.db.session import SessionLocal
 
         with SessionLocal() as db:
-            rows = db.query(SymbolMapping.hyperliquid_symbol).filter(SymbolMapping.hyperliquid_symbol.like("%:%")).all()
+            rows = db.query(SymbolMapping.leg_a_venue_symbol).filter(SymbolMapping.leg_a_venue_symbol.like("%:%")).all()
         for (symbol,) in rows:
             dex = str(symbol or "").split(":", 1)[0].strip()
             if dex and dex not in values:

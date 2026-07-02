@@ -106,10 +106,14 @@ def simulate_market_fill(book: OrderBook, side: str, quantity: float) -> Simulat
     )
 
 
-def parse_hyperliquid_levels(levels: Any) -> tuple[list[tuple[float, float]], list[tuple[float, float]]]:
+def parse_l2_levels(levels: Any) -> tuple[list[tuple[float, float]], list[tuple[float, float]]]:
     if not levels or len(levels) < 2:
         return [], []
     return _parse_side(levels[0]), _parse_side(levels[1])
+
+
+# Backward-compatible alias
+parse_hyperliquid_levels = parse_l2_levels
 
 
 def _parse_side(rows: Any) -> list[tuple[float, float]]:

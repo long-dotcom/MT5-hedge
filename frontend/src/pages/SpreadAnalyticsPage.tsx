@@ -1,16 +1,12 @@
 import { ExperimentOutlined } from '@ant-design/icons';
-import { useQuery } from '@tanstack/react-query';
-import { Card, Col, Empty, Row, Select, Space, Statistic, Tag } from 'antd';
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import { Button, Card, Col, Empty, Popconfirm, Row, Select, Space, Statistic, Tag, message } from 'antd';
 import ReactECharts from 'echarts-for-react';
 import { useMemo, useState } from 'react';
 import { api } from '../api/client';
 import { EllipsisCell } from '../components/EllipsisCell';
 import { fmtAdaptive, fmtChartTime, fmtNum, fmtPct } from '../utils/format';
-
-const directions = [
-  { value: 'long_mt5_short_hyperliquid', label: 'MT5 多 / HL 空' },
-  { value: 'long_hyperliquid_short_mt5', label: 'HL 多 / MT5 空' }
-];
+import { directionLabel } from '../utils/venues';
 
 const ranges = [
   { value: '15m', label: '15分钟' },
@@ -48,18 +44,38 @@ function fmtChartValue(value: unknown) {
 }
 
 export function SpreadAnalyticsPage() {
+  const queryClient = useQueryClient();
+  const [messageApi, contextHolder] = message.useMessage();
   const symbols = useQuery({ queryKey: ['symbols'], queryFn: async () => (await api.get('/markets/symbols')).data });
   const defaultSymbol = symbols.data?.[0]?.symbol || 'BTC';
   const [symbol, setSymbol] = useState(defaultSymbol);
-  const [direction, setDirection] = useState('long_mt5_short_hyperliquid');
+  const [direction, setDirection] = useState('long_leg_b_short_leg_a');
   const [range, setRange] = useState('1h');
   const [basis, setBasis] = useState('entry');
 
   const activeSymbol = symbol || defaultSymbol;
+  const activeMapping = (symbols.data || []).find((row: any) => row.symbol === activeSymbol);
+  const directions = [
+    { value: 'long_leg_b_short_leg_a', label: directionLabel('long_leg_b_short_leg_a', activeMapping) },
+    { value: 'long_leg_a_short_leg_b', label: directionLabel('long_leg_a_short_leg_b', activeMapping) }
+  ];
   const query = useQuery({
     queryKey: ['spread-analytics', activeSymbol, direction, range, basis],
     enabled: Boolean(activeSymbol),
     queryFn: async () => (await api.get('/analytics/spread-series', { params: { symbol: activeSymbol, direction, range, basis } })).data
+  });
+  const executeCurrent = useMutation({
+    mutationFn: async () => (await api.post(`/markets/spreads/${activeSymbol}/execute`, null, { params: { direction, force: true } })).data,
+    onSuccess: (data) => {
+      messageApi.success(`已提交 ${activeSymbol} 下单，对冲组 #${data.id}`);
+      queryClient.invalidateQueries({ queryKey: ['hedge-groups'] });
+      queryClient.invalidateQueries({ queryKey: ['orders'] });
+      queryClient.invalidateQueries({ queryKey: ['fills'] });
+      queryClient.invalidateQueries({ queryKey: ['spread-analytics'] });
+    },
+    onError: (error: any) => {
+      messageApi.error(error?.response?.data?.detail || '下单失败');
+    }
   });
 
   const summary = query.data?.summary;
@@ -100,6 +116,7 @@ export function SpreadAnalyticsPage() {
 
   return (
     <Space direction="vertical" size={16} className="full-width">
+      {contextHolder}
       <Card>
         <Space wrap>
           <Select className="analytics-control" value={activeSymbol} options={symbolOptions} loading={symbols.isLoading} onChange={setSymbol} />
@@ -110,6 +127,17 @@ export function SpreadAnalyticsPage() {
             {summary?.analytics_status || 'no_data'}
           </Tag>
           <EllipsisCell value={summary?.reason || '等待数据'} className="analytics-reason" />
+          <Popconfirm
+            title={`确认下单 ${activeSymbol}?`}
+            description={`方向：${directions.find((item) => item.value === direction)?.label || direction}。将跳过策略价差/盈利闸门，提交前仍会执行风控、行情同步、MT5 会话和订单预检查。`}
+            okText="强制下单"
+            cancelText="取消"
+            onConfirm={() => executeCurrent.mutate()}
+          >
+            <Button type="primary" loading={executeCurrent.isPending} disabled={!activeSymbol || query.isLoading}>
+              强制下单
+            </Button>
+          </Popconfirm>
         </Space>
       </Card>
 
@@ -184,3 +212,4 @@ export function SpreadAnalyticsPage() {
     </Space>
   );
 }
+

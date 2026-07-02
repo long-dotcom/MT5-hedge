@@ -71,7 +71,6 @@ class MT5Adapter(PaperAdapter):
             "magic": int(self.settings.mt5_order_magic),
             "comment": "mt5-hedge",
             "type_time": mt5.ORDER_TIME_GTC,
-            "type_filling": _mt5_filling_mode(mt5, symbol),
         }
         if order.reduce_only:
             position = _matching_reduce_position(mt5, symbol, side, float(order.quantity))
@@ -81,9 +80,20 @@ class MT5Adapter(PaperAdapter):
             if float(order.quantity) > position_volume + 1e-9:
                 return AdapterOrderResult(False, "", "failed", 0.0, 0.0, 0.0, f"MT5 reduce-only 平仓数量超过持仓: request={order.quantity}, position={position_volume}")
             request["position"] = int(getattr(position, "ticket", 0) or 0)
-        result = mt5.order_send(request)
+        result = None
+        rejected_messages: list[str] = []
+        for filling_mode in _mt5_filling_modes(mt5, symbol):
+            result = mt5.order_send({**request, "type_filling": filling_mode})
+            if result is None:
+                rejected_messages.append(f"filling={filling_mode}: {mt5.last_error()}")
+                continue
+            retcode = int(getattr(result, "retcode", 0))
+            if retcode == int(getattr(mt5, "TRADE_RETCODE_INVALID_FILL", 10030)):
+                rejected_messages.append(f"filling={filling_mode}: {getattr(result, 'comment', '')}")
+                continue
+            break
         if result is None:
-            return AdapterOrderResult(False, "", "failed", 0.0, 0.0, 0.0, f"MT5 order_send 无返回: {mt5.last_error()}")
+            return AdapterOrderResult(False, "", "failed", 0.0, 0.0, 0.0, f"MT5 order_send 无返回: {'; '.join(rejected_messages) or mt5.last_error()}")
         retcode = int(getattr(result, "retcode", 0))
         done_codes = {mt5.TRADE_RETCODE_DONE, mt5.TRADE_RETCODE_DONE_PARTIAL, mt5.TRADE_RETCODE_PLACED}
         if retcode not in done_codes:
@@ -259,7 +269,6 @@ def mt5_market_order_check(symbol: str, side: str, quantity: float, *, demo: boo
         "magic": int(settings.mt5_order_magic),
         "comment": "mt5-hedge-check",
         "type_time": mt5.ORDER_TIME_GTC,
-        "type_filling": _mt5_filling_mode(mt5, symbol),
     }
     if reduce_only:
         position = _matching_reduce_position(mt5, symbol, normalized_side, float(quantity))
@@ -267,30 +276,48 @@ def mt5_market_order_check(symbol: str, side: str, quantity: float, *, demo: boo
             return MT5OrderCheck(False, f"MT5 reduce-only 未找到可平仓持仓: {symbol} {side} {quantity}")
         request["position"] = int(getattr(position, "ticket", 0) or 0)
 
-    result = mt5.order_check(request)
-    if result is None:
-        return MT5OrderCheck(False, f"MT5 order_check 无返回: {mt5.last_error()}")
-    retcode = int(getattr(result, "retcode", -1))
     done_codes = {
         0,
         int(getattr(mt5, "TRADE_RETCODE_DONE", 10009)),
         int(getattr(mt5, "TRADE_RETCODE_DONE_PARTIAL", 10010)),
         int(getattr(mt5, "TRADE_RETCODE_PLACED", 10008)),
     }
-    comment = str(getattr(result, "comment", "") or "")
-    if retcode not in done_codes:
-        return MT5OrderCheck(False, f"MT5 order_check 失败 retcode={retcode}: {comment}", retcode)
-    return MT5OrderCheck(True, comment or "MT5 order_check 通过", retcode)
+    invalid_fill = int(getattr(mt5, "TRADE_RETCODE_INVALID_FILL", 10030))
+    failures: list[str] = []
+    last_retcode: int | None = None
+    for filling_mode in _mt5_filling_modes(mt5, symbol):
+        result = mt5.order_check({**request, "type_filling": filling_mode})
+        if result is None:
+            failures.append(f"filling={filling_mode}: {mt5.last_error()}")
+            continue
+        retcode = int(getattr(result, "retcode", -1))
+        last_retcode = retcode
+        comment = str(getattr(result, "comment", "") or "")
+        if retcode in done_codes:
+            return MT5OrderCheck(True, f"{comment or 'MT5 order_check 通过'}; filling={filling_mode}", retcode)
+        failures.append(f"filling={filling_mode}: retcode={retcode} {comment}".strip())
+        if retcode != invalid_fill:
+            break
+    return MT5OrderCheck(False, f"MT5 order_check 失败: {'; '.join(failures)}", last_retcode)
 
 
 def _mt5_filling_mode(mt5, symbol: str) -> int:
+    return _mt5_filling_modes(mt5, symbol)[0]
+
+
+def _mt5_filling_modes(mt5, symbol: str) -> list[int]:
     info = mt5.symbol_info(symbol)
     filling = int(getattr(info, "filling_mode", 0) or 0) if info else 0
+    modes: list[int] = []
     for mode in ("ORDER_FILLING_IOC", "ORDER_FILLING_RETURN", "ORDER_FILLING_FOK"):
         value = getattr(mt5, mode, None)
         if value is not None and (filling == 0 or filling & int(value)):
-            return int(value)
-    return int(getattr(mt5, "ORDER_FILLING_IOC", 1))
+            modes.append(int(value))
+    for mode in ("ORDER_FILLING_IOC", "ORDER_FILLING_FOK", "ORDER_FILLING_RETURN"):
+        value = getattr(mt5, mode, None)
+        if value is not None and int(value) not in modes:
+            modes.append(int(value))
+    return modes or [int(getattr(mt5, "ORDER_FILLING_IOC", 1))]
 
 
 def _matching_reduce_position(mt5, symbol: str, close_side: str, quantity: float):

@@ -56,6 +56,7 @@
 - MT5：使用 `account_info()` 的 `margin_free` 作为可用保证金。
 - 新订单估算保证金 = `notional / new_order_leverage`。
 - 默认单笔最多使用 `free_collateral * max_new_margin_fraction`，当前默认 30%。
+- MT5 下单前会先执行 `order_check`；如果券商对当前品种拒绝某个 `type_filling` 并返回 10030，系统会自动按 IOC/FOK/RETURN 的可用组合继续尝试，通过的 filling mode 会用于后续真实 `order_send` 回退。
 
 该口径偏保守，用于避免把支撑现有仓位的保证金误当作可自由使用余额。
 - MT5 spread rebate 当前按 `MT5_SPREAD_REBATE_RATE=0.20` 抵扣点差成本。

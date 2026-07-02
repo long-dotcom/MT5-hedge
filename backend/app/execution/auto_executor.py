@@ -9,11 +9,12 @@ from datetime import datetime, timedelta
 from sqlalchemy import desc
 from sqlalchemy.orm import Session
 
-from app.db.models import ArbitrageOpportunity, HedgeGroup, StrategySetting, SystemLog, WorkerRun
+from app.db.models import ArbitrageOpportunity, HedgeGroup, StrategySetting, SymbolMapping, SystemLog, WorkerRun
 from app.db.retention import prune_table_by_id
 from app.execution.circuit_breaker import is_blocked as breaker_is_blocked
 from app.execution.engine import open_hedge_group
 from app.market.mt5_tradability import mt5_tradability_cache
+from app.adapters.venue import is_native_hyper_mt5_pair
 
 logger = logging.getLogger(__name__)
 
@@ -102,6 +103,9 @@ def run_auto_execute(db: Session) -> int:
 
 
 def _eligible(db: Session, strategy: StrategySetting, opportunity: ArbitrageOpportunity) -> tuple[bool, str]:
+    mapping = db.query(SymbolMapping).filter(SymbolMapping.symbol == opportunity.symbol).first()
+    if mapping and not is_native_hyper_mt5_pair(mapping):
+        return False, "Nautilus V1 只读 venue pair 不允许自动执行"
     min_profit = strategy.auto_execute_min_net_profit or strategy.min_net_profit
     if opportunity.net_profit < min_profit:
         return False, f"自动执行净利润不足: {opportunity.net_profit:.2f} < {min_profit:.2f}"

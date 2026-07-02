@@ -9,12 +9,14 @@ from sqlalchemy.orm import Session
 from app.adapters.hyperliquid import HyperliquidAdapter
 from app.adapters.mt5 import MT5Adapter
 from app.adapters.mt5 import mt5_market_order_check
+from app.adapters.venue import build_market_adapter, NATIVE_VENUES
 from app.config.settings import get_settings
 from app.db.models import Alert, ArbitrageOpportunity, Fill, HedgeGroup, HedgeGroupEvent, Order, StrategySetting, SymbolMapping, SystemSetting
 from app.execution.gateway import LegOrderIntent, build_execution_gateway
 from app.execution.hedge_pool import hedge_pool
 from app.execution.pnl import actual_entry_spread_from_fills, pnl_from_close_spread, realized_pnl_from_fills
 from app.execution.readiness import live_execution_readiness, paper_execution_readiness
+from app.execution.runtime_settings import paper_live_probe_enabled_for_venue, runtime_paper_live_parallel_execution
 from app.market.active_refresh import refresh_execution_quotes
 from app.market.mt5_sessions import mt5_action_allowed, mt5_session_state
 from app.market.mt5_tradability import block_mt5_tradability, mt5_tradability_cache
@@ -28,7 +30,7 @@ def live_trading_enabled(db: Session) -> bool:
     return bool(row and row.value == "true")
 
 
-def open_hedge_group(db: Session, opportunity_id: int, source: str = "system") -> HedgeGroup:
+def open_hedge_group(db: Session, opportunity_id: int, source: str = "system", *, force_strategy_checks: bool = False) -> HedgeGroup:
     opportunity = db.get(ArbitrageOpportunity, opportunity_id)
     if not opportunity:
         raise ValueError("机会不存在")
@@ -46,19 +48,19 @@ def open_hedge_group(db: Session, opportunity_id: int, source: str = "system") -
     mapping = db.query(SymbolMapping).filter(SymbolMapping.symbol == opportunity.symbol).first()
     if not mapping:
         raise ValueError("品种映射不存在")
-    mt5_side = "sell" if opportunity.direction == "long_hyperliquid_short_mt5" else "buy"
-    mt5_quantity = opportunity.mt5_quantity or opportunity.quantity
+    leg_b_side = "sell" if opportunity.direction == "long_leg_a_short_leg_b" else "buy"
+    leg_b_quantity = opportunity.leg_b_quantity or opportunity.quantity
     session_state = mt5_session_state(mapping)
-    mt5_open_allowed, mt5_open_reason = mt5_action_allowed(session_state, opportunity.direction, "open")
-    if not mt5_open_allowed:
-        opportunity.reject_reason = mt5_open_reason
+    leg_b_open_allowed, leg_b_open_reason = mt5_action_allowed(session_state, opportunity.direction, "open")
+    if not leg_b_open_allowed:
+        opportunity.reject_reason = leg_b_open_reason
         db.add(opportunity)
-        record_risk_event(db, "mt5_session_open", mt5_open_reason, opportunity.symbol)
+        record_risk_event(db, "mt5_session_open", leg_b_open_reason, opportunity.symbol)
         db.commit()
-        raise ValueError(mt5_open_reason)
+        raise ValueError(leg_b_open_reason)
     if live or simulated:
-        mt5_check = mt5_market_order_check(mapping.mt5_symbol, mt5_side, mt5_quantity, demo=simulated)
-        mt5_tradability_cache.update(opportunity.symbol, mapping.mt5_symbol, mt5_side, mt5_quantity, mt5_check, "execution")
+        mt5_check = mt5_market_order_check(mapping.mt5_symbol, leg_b_side, leg_b_quantity, demo=simulated)
+        mt5_tradability_cache.update(opportunity.symbol, mapping.mt5_symbol, leg_b_side, leg_b_quantity, mt5_check, "execution")
         if not mt5_check.allowed:
             reason = f"MT5 当前订单预检查失败: {mt5_check.message}"
             opportunity.reject_reason = reason
@@ -77,7 +79,7 @@ def open_hedge_group(db: Session, opportunity_id: int, source: str = "system") -
             raise ValueError(reason)
     use_live_account_risk = live or (mode == "paper" and strategy.paper_use_live_account_risk)
     slippage_bps = settings.default_slippage_bps if refreshed else synced.time_diff_ms / 10
-    decision = pre_trade_check(db, opportunity.symbol, opportunity.notional, slippage_bps, synced.hyperliquid.local_recv_ts, use_live_account_risk=use_live_account_risk)
+    decision = pre_trade_check(db, opportunity.symbol, opportunity.notional, slippage_bps, synced.leg_a.local_recv_ts, use_live_account_risk=use_live_account_risk)
     if not decision.allowed:
         record_risk_event(db, "pre_trade", decision.reason, opportunity.symbol)
         raise ValueError(decision.reason)
@@ -89,14 +91,14 @@ def open_hedge_group(db: Session, opportunity_id: int, source: str = "system") -
         execution_mode="live" if live else mode,
         notional=opportunity.notional,
         quantity=opportunity.quantity,
-        mt5_quantity=opportunity.mt5_quantity or opportunity.quantity,
-        hyperliquid_quantity=opportunity.hyperliquid_quantity or opportunity.quantity,
+        leg_b_quantity=opportunity.leg_b_quantity or opportunity.quantity,
+        leg_a_quantity=opportunity.leg_a_quantity or opportunity.quantity,
         open_cost=opportunity.total_cost,
         trigger_spread=opportunity.gross_spread,
-        trigger_hyperliquid_bid=opportunity.trigger_hyperliquid_bid,
-        trigger_hyperliquid_ask=opportunity.trigger_hyperliquid_ask,
-        trigger_mt5_bid=opportunity.trigger_mt5_bid,
-        trigger_mt5_ask=opportunity.trigger_mt5_ask,
+        trigger_leg_a_bid=opportunity.trigger_leg_a_bid,
+        trigger_leg_a_ask=opportunity.trigger_leg_a_ask,
+        trigger_leg_b_bid=opportunity.trigger_leg_b_bid,
+        trigger_leg_b_ask=opportunity.trigger_leg_b_ask,
         entry_spread=opportunity.gross_spread,
         entry_threshold=opportunity.entry_threshold,
         exit_target=opportunity.exit_target,
@@ -106,23 +108,23 @@ def open_hedge_group(db: Session, opportunity_id: int, source: str = "system") -
     db.add(group)
     db.flush()
 
-    hl_side = "buy" if opportunity.direction == "long_hyperliquid_short_mt5" else "sell"
-    hl, mt5 = _execution_adapters(live=live, simulated=simulated)
-    hl_quantity = opportunity.hyperliquid_quantity or opportunity.quantity
+    leg_a_side = "buy" if opportunity.direction == "long_leg_a_short_leg_b" else "sell"
+    leg_a_adapter, leg_b_adapter = _execution_adapters(live=live, simulated=simulated, mapping=mapping, db=db)
+    leg_a_quantity = opportunity.leg_a_quantity or opportunity.quantity
     if mapping.execution_style == "hyper_maker_mt5_taker":
-        results = _execute_hyper_maker_then_mt5(db, group.id, mapping, opportunity.symbol, hl, mt5, hl_side, mt5_side, hl_quantity, mt5_quantity, synced)
-    elif _paper_live_parallel_enabled(live=live, simulated=simulated, hl=hl, mapping=mapping):
+        results = _execute_hyper_maker_then_mt5(db, group.id, mapping, opportunity.symbol, leg_a_adapter, leg_b_adapter, leg_a_side, leg_b_side, leg_a_quantity, leg_b_quantity, synced)
+    elif _paper_live_parallel_enabled(live=live, simulated=simulated, hl=leg_a_adapter, mapping=mapping, db=db):
         results = _execute_parallel_legs_with_compensation(
             db,
             group.id,
             mapping,
             opportunity.symbol,
-            hl,
-            mt5,
-            hl_side,
-            mt5_side,
-            hl_quantity,
-            mt5_quantity,
+            leg_a_adapter,
+            leg_b_adapter,
+            leg_a_side,
+            leg_b_side,
+            leg_a_quantity,
+            leg_b_quantity,
             mapping.hl_open_order_type,
             mapping.mt5_open_order_type,
             strategy,
@@ -134,17 +136,17 @@ def open_hedge_group(db: Session, opportunity_id: int, source: str = "system") -
             group.id,
             mapping,
             opportunity.symbol,
-            hl,
-            mt5,
-            hl_side,
-            mt5_side,
-            hl_quantity,
-            mt5_quantity,
+            leg_a_adapter,
+            leg_b_adapter,
+            leg_a_side,
+            leg_b_side,
+            leg_a_quantity,
+            leg_b_quantity,
             mapping.hl_open_order_type,
             mapping.mt5_open_order_type,
             strategy,
         )
-    _quarantine_mt5_send_rejects(db, opportunity.symbol, mapping, mt5_side, mt5_quantity, results)
+    _quarantine_mt5_send_rejects(db, opportunity.symbol, mapping, leg_b_side, leg_b_quantity, results)
 
     if all(_has_position_effect(result) for result in results):
         group.status = "open"
@@ -211,15 +213,15 @@ def _strict_sync_for_execution(mapping: SymbolMapping, symbol: str, settings) ->
 def _refreshed_opportunity_still_executable(opportunity: ArbitrageOpportunity, synced, strategy: StrategySetting) -> tuple[bool, str]:
     refreshed_spread = spreads_for_direction(
         opportunity.direction,
-        synced.hyperliquid.bid,
-        synced.hyperliquid.ask,
-        synced.mt5.bid,
-        synced.mt5.ask,
+        synced.leg_a.bid,
+        synced.leg_a.ask,
+        synced.leg_b.bid,
+        synced.leg_b.ask,
     ).entry_spread
     entry_threshold = float(opportunity.entry_threshold or 0.0)
     if entry_threshold > 0 and refreshed_spread < entry_threshold:
         return False, f"主动刷新后价差不再满足入场线: {refreshed_spread:.6f} < {entry_threshold:.6f}"
-    quantity = float(opportunity.hyperliquid_quantity or opportunity.quantity or 0.0)
+    quantity = float(opportunity.leg_a_quantity or opportunity.quantity or 0.0)
     unit_cost = float(opportunity.unit_cost or 0.0)
     refreshed_net_profit = (refreshed_spread - unit_cost) * quantity
     min_profit = max(float(strategy.min_total_profit or 0.0), float(strategy.min_net_profit or 0.0))
@@ -235,10 +237,10 @@ def _final_close_still_executable(db: Session, group: HedgeGroup, mapping: Symbo
         return False, sync_reason
     close_spread = spreads_for_direction(
         group.direction,
-        synced.hyperliquid.bid,
-        synced.hyperliquid.ask,
-        synced.mt5.bid,
-        synced.mt5.ask,
+        synced.leg_a.bid,
+        synced.leg_a.ask,
+        synced.leg_b.bid,
+        synced.leg_b.ask,
     ).close_spread
     exit_target = _effective_close_exit_target(group, mapping)
     hold_expired = "超过最大持仓时间" in reason
@@ -283,10 +285,10 @@ def _execute_hyper_then_mt5_after_fill(
     hl_result = _place_and_record(
         db,
         group_id,
-        "hyperliquid",
+        mapping.leg_a_venue,
         hl,
         symbol,
-        mapping.hyperliquid_symbol,
+        mapping.leg_a_venue_symbol,
         hl_side,
         hl_quantity,
         hl_order_type,
@@ -303,7 +305,7 @@ def _execute_hyper_then_mt5_after_fill(
     mt5_result = _place_and_record(
         db,
         group_id,
-        "mt5",
+        mapping.leg_b_venue,
         mt5,
         symbol,
         mapping.mt5_symbol,
@@ -340,12 +342,12 @@ def _execute_parallel_legs_with_compensation(
     strategy_for_threads = _strategy_latency_snapshot(strategy)
     with ThreadPoolExecutor(max_workers=2) as pool:
         futures = {
-            "hyperliquid": pool.submit(
+            mapping.leg_a_venue: pool.submit(
                 _submit_leg_order,
                 hl,
-                "hyperliquid",
+                mapping.leg_a_venue,
                 symbol,
-                mapping.hyperliquid_symbol,
+                mapping.leg_a_venue_symbol,
                 hl_side,
                 hl_quantity,
                 hl_order_type,
@@ -354,11 +356,12 @@ def _execute_parallel_legs_with_compensation(
                 0,
                 strategy_for_threads,
                 reduce_only,
+                mapping,
             ),
-            "mt5": pool.submit(
+            mapping.leg_b_venue: pool.submit(
                 _submit_leg_order,
                 mt5,
-                "mt5",
+                mapping.leg_b_venue,
                 symbol,
                 mapping.mt5_symbol,
                 mt5_side,
@@ -369,15 +372,16 @@ def _execute_parallel_legs_with_compensation(
                 0,
                 strategy_for_threads,
                 reduce_only,
+                mapping,
             ),
         }
         gateway_results = {platform: future.result() for platform, future in futures.items()}
 
     results = {
-        "hyperliquid": _record_gateway_result(db, group_id, "hyperliquid", symbol, hl_side, hl_quantity, hl_order_type, None, False, 0, reduce_only, gateway_results["hyperliquid"]),
-        "mt5": _record_gateway_result(db, group_id, "mt5", symbol, mt5_side, mt5_quantity, mt5_order_type, None, False, 0, reduce_only, gateway_results["mt5"]),
+        mapping.leg_a_venue: _record_gateway_result(db, group_id, mapping.leg_a_venue, symbol, hl_side, hl_quantity, hl_order_type, None, False, 0, reduce_only, gateway_results[mapping.leg_a_venue]),
+        mapping.leg_b_venue: _record_gateway_result(db, group_id, mapping.leg_b_venue, symbol, mt5_side, mt5_quantity, mt5_order_type, None, False, 0, reduce_only, gateway_results[mapping.leg_b_venue]),
     }
-    ordered_results = [results["hyperliquid"], results["mt5"]]
+    ordered_results = [results[mapping.leg_a_venue], results[mapping.leg_b_venue]]
     filled = {platform: result for platform, result in results.items() if _has_position_effect(result)}
     if len(filled) == 1:
         platform, result = next(iter(filled.items()))
@@ -400,6 +404,7 @@ def _submit_leg_order(
     ttl_seconds: int,
     strategy: StrategySetting,
     reduce_only: bool,
+    mapping: SymbolMapping | None = None,
 ):
     gateway = build_execution_gateway(adapter)
     return gateway.submit_order(
@@ -415,7 +420,7 @@ def _submit_leg_order(
             reduce_only=reduce_only,
             ttl_seconds=ttl_seconds,
         ),
-        paper_latency_ms=_paper_latency_ms(strategy, platform, adapter),
+        paper_latency_ms=_paper_latency_ms(strategy, platform, adapter, mapping=mapping),
     )
 
 
@@ -475,13 +480,13 @@ def _compensate_parallel_single_leg(db: Session, group_id: int, mapping: SymbolM
     if quantity <= 0:
         return None
     adapter_live, simulated = (False, True)
-    hl, mt5 = _execution_adapters(live=adapter_live, simulated=simulated)
+    leg_a_adapter, leg_b_adapter = _execution_adapters(live=adapter_live, simulated=simulated, mapping=mapping, db=db)
     compensation_reduce_only = not reduce_only
-    if platform == "hyperliquid":
-        db.add(HedgeGroupEvent(hedge_group_id=group_id, event_type="parallel_single_leg_compensation", detail=f"MT5 腿失败，反向冲销 Hyperliquid {quantity:g}"))
-        return _place_and_record(db, group_id, "hyperliquid", hl, symbol, mapping.hyperliquid_symbol, side, quantity, "market", None, False, 0, db.query(StrategySetting).first() or StrategySetting(), reduce_only=compensation_reduce_only, mapping=mapping)
-    db.add(HedgeGroupEvent(hedge_group_id=group_id, event_type="parallel_single_leg_compensation", detail=f"Hyperliquid 腿失败，反向冲销 MT5 {quantity:g}"))
-    return _place_and_record(db, group_id, "mt5", mt5, symbol, mapping.mt5_symbol, side, quantity, "market", None, False, 0, db.query(StrategySetting).first() or StrategySetting(), reduce_only=compensation_reduce_only, mapping=mapping)
+    if platform == mapping.leg_a_venue:
+        db.add(HedgeGroupEvent(hedge_group_id=group_id, event_type="parallel_single_leg_compensation", detail=f"Leg B 腿失败，反向冲销 {mapping.leg_a_venue} {quantity:g}"))
+        return _place_and_record(db, group_id, mapping.leg_a_venue, leg_a_adapter, symbol, mapping.leg_a_venue_symbol, side, quantity, "market", None, False, 0, db.query(StrategySetting).first() or StrategySetting(), reduce_only=compensation_reduce_only, mapping=mapping)
+    db.add(HedgeGroupEvent(hedge_group_id=group_id, event_type="parallel_single_leg_compensation", detail=f"{mapping.leg_a_venue} 腿失败，反向冲销 {mapping.leg_b_venue} {quantity:g}"))
+    return _place_and_record(db, group_id, mapping.leg_b_venue, leg_b_adapter, symbol, mapping.mt5_symbol, side, quantity, "market", None, False, 0, db.query(StrategySetting).first() or StrategySetting(), reduce_only=compensation_reduce_only, mapping=mapping)
 
 
 def _latest_filled_order_side(db: Session, group_id: int, platform: str) -> str:
@@ -491,14 +496,14 @@ def _latest_filled_order_side(db: Session, group_id: int, platform: str) -> str:
 
 def _execute_hyper_maker_then_mt5(db: Session, group_id: int, mapping: SymbolMapping, symbol: str, hl, mt5, hl_side: str, mt5_side: str, hl_quantity: float, mt5_quantity: float, synced) -> list:
     strategy = db.query(StrategySetting).first() or StrategySetting()
-    hl_price = _maker_price(hl_side, synced.hyperliquid.bid, synced.hyperliquid.ask, mapping.hl_maker_offset_bps, mapping)
+    hl_price = _maker_price(hl_side, synced.leg_a.bid, synced.leg_a.ask, mapping.hl_maker_offset_bps, mapping)
     hl_result = _place_and_record(
         db,
         group_id,
-        "hyperliquid",
+        mapping.leg_a_venue,
         hl,
         symbol,
-        mapping.hyperliquid_symbol,
+        mapping.leg_a_venue_symbol,
         hl_side,
         hl_quantity,
         "limit",
@@ -510,10 +515,10 @@ def _execute_hyper_maker_then_mt5(db: Session, group_id: int, mapping: SymbolMap
     )
     if not _has_position_effect(hl_result):
         event_type = "maker_pending" if _is_pending_result(hl_result) else "maker_unfilled"
-        db.add(HedgeGroupEvent(hedge_group_id=group_id, event_type=event_type, detail=hl_result.error_message or "Hyperliquid maker 未成交"))
+        db.add(HedgeGroupEvent(hedge_group_id=group_id, event_type=event_type, detail=hl_result.error_message or f"{mapping.leg_a_venue} maker 未成交"))
         return [hl_result]
     fill_ratio = hl_result.filled_quantity / hl_quantity if hl_quantity > 0 else 0.0
-    mt5_result = _place_and_record(db, group_id, "mt5", mt5, symbol, mapping.mt5_symbol, mt5_side, mt5_quantity * fill_ratio, "market", None, False, 0, strategy)
+    mt5_result = _place_and_record(db, group_id, mapping.leg_b_venue, mt5, symbol, mapping.mt5_symbol, mt5_side, mt5_quantity * fill_ratio, "market", None, False, 0, strategy, mapping=mapping)
     return [hl_result, mt5_result]
 
 
@@ -554,7 +559,7 @@ def _place_and_record(
     reduce_only: bool = False,
     mapping: SymbolMapping | None = None,
 ):
-    if platform == "hyperliquid" and mapping is not None and getattr(adapter, "simulated", False):
+    if mapping is not None and platform == mapping.leg_a_venue and getattr(adapter, "simulated", False):
         refresh_execution_quotes(mapping, refresh_mt5=False)
     order = Order(
         hedge_group_id=group_id,
@@ -586,7 +591,7 @@ def _place_and_record(
             ttl_seconds=ttl_seconds,
             hedge_group_id=group_id,
         ),
-        paper_latency_ms=_paper_latency_ms(strategy, platform, adapter),
+        paper_latency_ms=_paper_latency_ms(strategy, platform, adapter, mapping=mapping),
     )
     result = gateway_result.adapter_result
     order.status = result.status
@@ -609,15 +614,20 @@ def _place_and_record(
     return result
 
 
-def _paper_latency_ms(strategy: StrategySetting, platform: str, adapter) -> int:
+def _paper_latency_ms(strategy: StrategySetting, platform: str, adapter, *, mapping: SymbolMapping | None = None) -> int:
     if getattr(adapter, "live", False):
         return 0
-    if platform == "hyperliquid":
-        low = strategy.paper_hyperliquid_latency_ms_min
-        high = strategy.paper_hyperliquid_latency_ms_max
+    is_leg_a = mapping is not None and platform == mapping.leg_a_venue
+    is_leg_b = mapping is not None and platform == mapping.leg_b_venue
+    if is_leg_a or (mapping is None and platform == "hyperliquid"):
+        low = strategy.paper_leg_a_latency_ms_min
+        high = strategy.paper_leg_a_latency_ms_max
+    elif is_leg_b or mapping is None:
+        low = strategy.paper_leg_b_latency_ms_min
+        high = strategy.paper_leg_b_latency_ms_max
     else:
-        low = strategy.paper_mt5_latency_ms_min
-        high = strategy.paper_mt5_latency_ms_max
+        low = strategy.paper_leg_b_latency_ms_min
+        high = strategy.paper_leg_b_latency_ms_max
     low = max(int(low), 0)
     high = max(int(high), low)
     return random.randint(low, high)
@@ -625,10 +635,10 @@ def _paper_latency_ms(strategy: StrategySetting, platform: str, adapter) -> int:
 
 def _strategy_latency_snapshot(strategy: StrategySetting):
     return SimpleNamespace(
-        paper_hyperliquid_latency_ms_min=int(strategy.paper_hyperliquid_latency_ms_min or 0),
-        paper_hyperliquid_latency_ms_max=int(strategy.paper_hyperliquid_latency_ms_max or 0),
-        paper_mt5_latency_ms_min=int(strategy.paper_mt5_latency_ms_min or 0),
-        paper_mt5_latency_ms_max=int(strategy.paper_mt5_latency_ms_max or 0),
+        paper_leg_a_latency_ms_min=int(strategy.paper_leg_a_latency_ms_min or 0),
+        paper_leg_a_latency_ms_max=int(strategy.paper_leg_a_latency_ms_max or 0),
+        paper_leg_b_latency_ms_min=int(strategy.paper_leg_b_latency_ms_min or 0),
+        paper_leg_b_latency_ms_max=int(strategy.paper_leg_b_latency_ms_max or 0),
     )
 
 
@@ -709,23 +719,23 @@ def _execute_close_hedge_group(
     hl_side, mt5_side = _close_sides(group.direction)
     if simulated:
         _ensure_paper_execution_ready(db)
-    hl, mt5 = _execution_adapters(live=live, simulated=simulated)
-    hl_quantity = _platform_close_quantity(group.hyperliquid_quantity, group.quantity)
-    mt5_quantity = _platform_close_quantity(group.mt5_quantity, group.quantity)
+    leg_a_adapter, leg_b_adapter = _execution_adapters(live=live, simulated=simulated, mapping=mapping, db=db)
+    leg_a_quantity = _platform_close_quantity(group.leg_a_quantity, group.quantity)
+    leg_b_quantity = _platform_close_quantity(group.leg_b_quantity, group.quantity)
     results = []
-    if hl_quantity > 0:
-        if _paper_live_parallel_enabled(live=live, simulated=simulated, hl=hl, mapping=mapping):
+    if leg_a_quantity > 0:
+        if _paper_live_parallel_enabled(live=live, simulated=simulated, hl=leg_a_adapter, mapping=mapping, db=db):
             results = _execute_parallel_legs_with_compensation(
                 db,
                 group.id,
                 mapping,
                 group.symbol,
-                hl,
-                mt5,
+                leg_a_adapter,
+                leg_b_adapter,
                 hl_side,
                 mt5_side,
-                hl_quantity,
-                mt5_quantity,
+                leg_a_quantity,
+                leg_b_quantity,
                 mapping.hl_close_order_type,
                 mapping.mt5_close_order_type,
                 strategy,
@@ -737,19 +747,19 @@ def _execute_close_hedge_group(
                 group.id,
                 mapping,
                 group.symbol,
-                hl,
-                mt5,
+                leg_a_adapter,
+                leg_b_adapter,
                 hl_side,
                 mt5_side,
-                hl_quantity,
-                mt5_quantity,
+                leg_a_quantity,
+                leg_b_quantity,
                 mapping.hl_close_order_type,
                 mapping.mt5_close_order_type,
                 strategy,
                 reduce_only=True,
             )
-    elif mt5_quantity > 0:
-        result = _place_and_record(db, group.id, "mt5", mt5, group.symbol, mapping.mt5_symbol, mt5_side, mt5_quantity, mapping.mt5_close_order_type, None, False, 0, strategy, reduce_only=True)
+    elif leg_b_quantity > 0:
+        result = _place_and_record(db, group.id, mapping.leg_b_venue, leg_b_adapter, group.symbol, mapping.mt5_symbol, mt5_side, leg_b_quantity, mapping.mt5_close_order_type, None, False, 0, strategy, reduce_only=True, mapping=mapping)
         results.append(result)
     if not results:
         raise ValueError("对冲组没有可平仓数量")
@@ -787,7 +797,7 @@ def _execute_close_hedge_group(
 
 
 def _close_sides(direction: str) -> tuple[str, str]:
-    if direction == "long_hyperliquid_short_mt5":
+    if direction == "long_leg_a_short_leg_b":
         return "sell", "buy"
     return "buy", "sell"
 
@@ -814,24 +824,37 @@ def _ensure_paper_execution_ready(db: Session) -> None:
         raise ValueError(f"paper 完整模拟执行就绪检查未通过: {detail}")
 
 
-def _execution_adapters(*, live: bool, simulated: bool):
+def _execution_adapters(*, live: bool, simulated: bool, mapping: SymbolMapping | None = None, db: Session | None = None):
+    leg_a_venue = mapping.leg_a_venue if mapping else "hyperliquid"
+    leg_b_venue = mapping.leg_b_venue if mapping else "mt5"
     settings = get_settings()
-    paper_live_hl = simulated and bool(getattr(settings, "hyperliquid_paper_live_order_enabled", False))
-    hl = HyperliquidAdapter(live=live or paper_live_hl)
-    setattr(hl, "simulated", bool(simulated))
-    setattr(hl, "paper_price_probe", bool(paper_live_hl))
-    mt5 = MT5Adapter(live=live, demo=simulated)
-    return hl, mt5
+    paper_live_leg_a = simulated and paper_live_probe_enabled_for_venue(db, settings, leg_a_venue)
+    paper_live_leg_b = simulated and paper_live_probe_enabled_for_venue(db, settings, leg_b_venue)
+    if leg_a_venue == "hyperliquid":
+        leg_a_adapter = HyperliquidAdapter(live=live or paper_live_leg_a)
+    else:
+        leg_a_adapter = build_market_adapter(leg_a_venue, live=live or paper_live_leg_a)
+    _configure_paper_live_adapter(leg_a_adapter, simulated=simulated, paper_live_probe=paper_live_leg_a)
+    if leg_b_venue == "mt5":
+        leg_b_adapter = MT5Adapter(live=live, demo=simulated)
+    else:
+        leg_b_adapter = build_market_adapter(leg_b_venue, live=live or paper_live_leg_b)
+    _configure_paper_live_adapter(leg_b_adapter, simulated=simulated, paper_live_probe=paper_live_leg_b)
+    return leg_a_adapter, leg_b_adapter
 
 
-def _paper_live_parallel_enabled(*, live: bool, simulated: bool, hl, mapping: SymbolMapping) -> bool:
+def _paper_live_parallel_enabled(*, live: bool, simulated: bool, hl, mapping: SymbolMapping, db: Session | None = None) -> bool:
     if live or not simulated:
         return False
     if mapping.execution_style == "hyper_maker_mt5_taker":
         return False
     settings = get_settings()
-    return bool(getattr(settings, "hyperliquid_paper_live_order_enabled", False) and getattr(settings, "paper_live_parallel_execution", True) and getattr(hl, "paper_price_probe", False))
+    return bool(runtime_paper_live_parallel_execution(db, settings) and getattr(hl, "paper_price_probe", False))
 
+
+def _configure_paper_live_adapter(adapter, *, simulated: bool, paper_live_probe: bool) -> None:
+    setattr(adapter, "simulated", bool(simulated))
+    setattr(adapter, "paper_price_probe", bool(paper_live_probe))
 
 def _has_position_effect(result) -> bool:
     return bool(result.success and result.filled_quantity > 0 and result.status in {"filled", "partially_filled"})
@@ -839,3 +862,4 @@ def _has_position_effect(result) -> bool:
 
 def _is_pending_result(result) -> bool:
     return result.status in {"accepted", "submitted", "pending", "open", "new"}
+

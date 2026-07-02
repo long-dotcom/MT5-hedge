@@ -11,15 +11,15 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from app.analytics.spreads import SpreadPoint, downsample_spreads, load_spread_points, summarize_spreads
-from app.analytics.funding import FundingPoint, bucket_funding_points, summarize_funding
+from app.analytics.funding import FundingPoint, bucket_funding_points, funding_history, summarize_funding
 from app.analytics.lead_lag import lead_lag_report
 from app.auth.security import hash_password
 from app.market import scanner as scanner_module
 from app.market import symbols as symbol_module
 from app.db import init_db as init_db_module
-from app.db.models import AccountSnapshot, Alert, ArbitrageOpportunity, AuditLog, Base, Fill, HedgeGroup, HedgeGroupEvent, Order, Position, RiskEvent, RiskSetting, SpreadCurrent, SpreadDirectionCurrent, StrategySetting, SymbolMapping, SystemLog, SystemSetting, User
+from app.db.models import AccountSnapshot, Alert, ArbitrageOpportunity, AuditLog, Base, ExchangeCredential, Fill, HedgeGroup, HedgeGroupEvent, Order, Position, RiskEvent, RiskSetting, SpreadCurrent, SpreadDirectionCurrent, StrategySetting, SymbolMapping, SystemLog, SystemSetting, User
 from app.execution.auto_closer import evaluate_auto_close, run_auto_close
-from app.execution.auto_executor import run_auto_execute
+from app.execution.auto_executor import _eligible, run_auto_execute
 from app.execution.carry_costs import _mt5_swap_cost, _paper_hyperliquid_funding_cost
 from app.execution import gateway as gateway_module
 from app.execution.engine import _effective_close_exit_target, _execution_adapters, _final_close_still_executable, _has_position_effect, _is_pending_result, _maker_price, close_hedge_group, open_hedge_group
@@ -28,6 +28,7 @@ from app.execution.hedge_pool import HedgeGroupSnapshot, hedge_pool
 from app.execution.persistence import persist_hedge_pool_events
 from app.execution.readiness import live_execution_readiness, paper_execution_readiness
 from app.execution.reconciler import reconcile_hedge_group, reconcile_orphan_positions, reconcile_residual_positions, sync_live_positions
+from app.exchanges.credentials import decrypt_credentials, public_exchange_credential, upsert_exchange_credential
 from app.config.settings import HYPERLIQUID_MAINNET_INFO_URL, HYPERLIQUID_TESTNET_INFO_URL, Settings, enforce_runtime_security, hyperliquid_execution_info_url, insecure_runtime_reasons
 from app.api import router as api_router
 from app.diagnostics.pipeline import _pool_payload
@@ -40,7 +41,9 @@ from app.market.quotes import QuoteCache, QuoteSynchronizer, quote_cache
 from app.adapters.paper import PaperAdapter
 from app.adapters.base import AdapterOrder, AdapterOrderResult
 from app.adapters.hyperliquid import HyperliquidAdapter
-from app.adapters.mt5 import MT5Adapter, mt5_demo_order_check
+from app.adapters.mt5 import MT5Adapter, mt5_demo_order_check, mt5_market_order_check
+from app.adapters.nautilus import NautilusReadOnlyAdapter
+from app.adapters.venue import build_market_adapter, is_native_pair
 from app.schemas import AdoptPositionIn
 from app.schemas import SymbolMappingIn
 from app.strategy.cost import estimate_cost
@@ -54,7 +57,7 @@ from app.workers.market_data import MarketDataManager, _exchange_time_from_hyper
 def test_cost_model_positive_total() -> None:
     cost = estimate_cost(1000, 64990, 65010, 8)
     assert cost.total > 0
-    assert cost.mt5_spread > 0
+    assert cost.leg_b_spread > 0
 
 
 def test_relative_sqlite_database_url_resolves_from_project_root(monkeypatch) -> None:
@@ -140,22 +143,22 @@ def test_stream_auth_reads_bearer_header_without_query_token() -> None:
     assert api_router.bearer_token_from_request(request) == "secure-token"
 
 
-def test_mt5_spread_rebate_reduces_spread_cost() -> None:
+def test_leg_b_spread_rebate_reduces_spread_cost() -> None:
     cost = estimate_cost(
         notional=1000,
-        mt5_bid=100,
-        mt5_ask=101,
+        leg_b_bid=100,
+        leg_b_ask=101,
         max_slippage_bps=0,
         quantity=1,
-        hyperliquid_bid=100,
-        hyperliquid_ask=101,
-        hyperliquid_fee_rate=0,
-        hyperliquid_funding_rate=0,
-        mt5_commission_rate=0,
-        mt5_swap_cost=0,
-        mt5_spread_rebate_rate=0.2,
+        leg_a_bid=100,
+        leg_a_ask=101,
+        leg_a_fee_rate=0,
+        leg_a_funding_rate=0,
+        leg_b_commission_rate=0,
+        leg_b_swap_cost=0,
+        leg_b_spread_rebate_rate=0.2,
     )
-    assert round(cost.mt5_spread, 6) == round((1 / 100.5) * 1000 * 0.8, 6)
+    assert round(cost.leg_b_spread, 6) == round((1 / 100.5) * 1000 * 0.8, 6)
 
 
 def test_signal_rejects_unprofitable() -> None:
@@ -170,7 +173,7 @@ def test_risk_blocks_paused_mode() -> None:
     with Session() as db:
         db.add(StrategySetting())
         db.add(RiskSetting(mode="paused"))
-        db.add(SymbolMapping(symbol="BTC", hyperliquid_symbol="BTC", mt5_symbol="BTCUSD"))
+        db.add(SymbolMapping(symbol="BTC", leg_a_venue_symbol="BTC", mt5_symbol="BTCUSD"))
         db.commit()
         decision = pre_trade_check(db, "BTC", 1000, 1, datetime.now(timezone.utc).replace(tzinfo=None))
         assert not decision.allowed
@@ -204,8 +207,8 @@ def test_hyperliquid_fast_l2book_subscription_includes_fast_flag() -> None:
 
 def test_hyperliquid_symbol_map_can_include_standard_and_hip3_symbols() -> None:
     mappings = [
-        SimpleNamespace(symbol="BTC", hyperliquid_symbol="BTC"),
-        SimpleNamespace(symbol="JP225", hyperliquid_symbol="xyz:JP225"),
+        SimpleNamespace(symbol="BTC", leg_a_venue="hyperliquid", leg_a_venue_symbol="BTC"),
+        SimpleNamespace(symbol="JP225", leg_a_venue="hyperliquid", leg_a_venue_symbol="xyz:JP225"),
     ]
 
     assert hyperliquid_symbol_map(mappings, hip3_only=False) == {"BTC": "BTC", "xyz:JP225": "JP225"}
@@ -270,8 +273,8 @@ def test_scanner_liquidity_uses_l2_before_top_depth() -> None:
         source="test",
     )
 
-    enough = scanner_module._hyperliquid_liquidity_reason("OIL-L2", "sell", 70.0, 5000.0, 100.0)
-    not_enough = scanner_module._hyperliquid_liquidity_reason("OIL-L2", "sell", 200.0, 5000.0, 100.0)
+    enough = scanner_module._leg_a_liquidity_reason("OIL-L2", "sell", 70.0, 5000.0, 100.0)
+    not_enough = scanner_module._leg_a_liquidity_reason("OIL-L2", "sell", 200.0, 5000.0, 100.0)
 
     assert enough == ""
     assert "L2 深度不足" in not_enough
@@ -288,7 +291,7 @@ def test_live_market_data_starts_hyperliquid_ws_without_http_polling(monkeypatch
     monkeypatch.setattr(manager, "_start_thread", lambda name, target: started.append(name))
     try:
         manager.start()
-        assert started == ["hyperliquid-ws", "mt5-polling"]
+        assert started == ["hyperliquid-ws", "mt5-polling", "nautilus-polling"]
     finally:
         manager.stop()
 
@@ -306,54 +309,54 @@ def test_mt5_positive_swap_reduces_cost() -> None:
 def test_hyperliquid_short_positive_funding_reduces_cost() -> None:
     cost = estimate_cost(
         notional=1000,
-        mt5_bid=100,
-        mt5_ask=100.1,
+        leg_b_bid=100,
+        leg_b_ask=100.1,
         max_slippage_bps=0,
         quantity=0,
-        hyperliquid_bid=0,
-        hyperliquid_ask=0,
-        hyperliquid_fee_rate=0,
-        hyperliquid_funding_rate=0.001,
-        hyperliquid_side="sell",
-        mt5_commission_rate=0,
-        mt5_swap_cost=0,
+        leg_a_bid=0,
+        leg_a_ask=0,
+        leg_a_fee_rate=0,
+        leg_a_funding_rate=0.001,
+        leg_a_side="sell",
+        leg_b_commission_rate=0,
+        leg_b_swap_cost=0,
         holding_hours=1,
     )
-    assert cost.hyperliquid_funding == -1
+    assert cost.leg_a_funding == -1
 
 
 def test_hyperliquid_roundtrip_fee_and_spread() -> None:
     cost = estimate_cost(
         notional=1000,
-        mt5_bid=100,
-        mt5_ask=100,
+        leg_b_bid=100,
+        leg_b_ask=100,
         max_slippage_bps=0,
         quantity=0.01,
-        hyperliquid_bid=64272,
-        hyperliquid_ask=64273,
-        hyperliquid_fee_rate=0.00045,
-        hyperliquid_fee_round_trips=2,
-        hyperliquid_funding_rate=0,
-        mt5_commission_rate=0,
-        mt5_swap_cost=0,
+        leg_a_bid=64272,
+        leg_a_ask=64273,
+        leg_a_fee_rate=0.00045,
+        leg_a_fee_round_trips=2,
+        leg_a_funding_rate=0,
+        leg_b_commission_rate=0,
+        leg_b_swap_cost=0,
     )
-    assert cost.hyperliquid_fee == 0.9
-    assert cost.hyperliquid_spread == 0.01
+    assert cost.leg_a_fee == 0.9
+    assert cost.leg_a_spread == 0.01
 
 
 def test_hyperliquid_maker_open_taker_close_fee() -> None:
     cost = estimate_cost(
         notional=1000,
-        mt5_bid=100,
-        mt5_ask=100,
+        leg_b_bid=100,
+        leg_b_ask=100,
         max_slippage_bps=0,
-        hyperliquid_fee_rate=0.00015,
-        hyperliquid_close_fee_rate=0.00045,
-        hyperliquid_funding_rate=0,
-        mt5_commission_rate=0,
-        mt5_swap_cost=0,
+        leg_a_fee_rate=0.00015,
+        leg_a_close_fee_rate=0.00045,
+        leg_a_funding_rate=0,
+        leg_b_commission_rate=0,
+        leg_b_swap_cost=0,
     )
-    assert cost.hyperliquid_fee == 0.6
+    assert cost.leg_a_fee == 0.6
 
 
 def test_execution_gateway_maps_adapter_fill_event() -> None:
@@ -464,6 +467,65 @@ def test_mt5_demo_order_check_requires_demo_account_and_configured_identity() ->
     assert "不是 DEMO" in mt5_demo_order_check(FakeMT5(trade_mode=2), settings).message
     assert not mt5_demo_order_check(FakeMT5(login=999), settings).allowed
     assert not mt5_demo_order_check(FakeMT5(server="broker-real"), settings).allowed
+
+
+def test_mt5_order_check_falls_back_when_filling_mode_unsupported(monkeypatch) -> None:
+    attempts = []
+
+    class FakeResult:
+        def __init__(self, retcode: int, comment: str) -> None:
+            self.retcode = retcode
+            self.comment = comment
+
+    class FakeTick:
+        ask = 100.1
+        bid = 100.0
+
+    class FakeInfo:
+        filling_mode = 0
+
+    class FakeMT5:
+        TRADE_ACTION_DEAL = 1
+        ORDER_TYPE_BUY = 0
+        ORDER_TYPE_SELL = 1
+        ORDER_TIME_GTC = 0
+        ORDER_FILLING_IOC = 1
+        ORDER_FILLING_RETURN = 2
+        ORDER_FILLING_FOK = 4
+        TRADE_RETCODE_INVALID_FILL = 10030
+        TRADE_RETCODE_DONE = 10009
+        TRADE_RETCODE_DONE_PARTIAL = 10010
+        TRADE_RETCODE_PLACED = 10008
+
+        def initialize(self, **kwargs):
+            return True
+
+        def symbol_select(self, symbol, enabled):
+            return True
+
+        def symbol_info_tick(self, symbol):
+            return FakeTick()
+
+        def symbol_info(self, symbol):
+            return FakeInfo()
+
+        def order_check(self, request):
+            attempts.append(request["type_filling"])
+            if request["type_filling"] == self.ORDER_FILLING_IOC:
+                return FakeResult(10030, "Unsupported filling mode")
+            return FakeResult(0, "Done")
+
+        def last_error(self):
+            return (0, "")
+
+    monkeypatch.setattr("app.adapters.mt5.get_settings", lambda: SimpleNamespace(mt5_login="", mt5_password="", mt5_server="", mt5_order_deviation_points=20, mt5_order_magic=202402))
+    monkeypatch.setitem(sys.modules, "MetaTrader5", FakeMT5())
+
+    result = mt5_market_order_check("JP225", "buy", 1.0)
+
+    assert result.allowed
+    assert attempts[:2] == [FakeMT5.ORDER_FILLING_IOC, FakeMT5.ORDER_FILLING_RETURN]
+    assert "filling=2" in result.message
 
 
 def test_mt5_live_market_order_maps_order_send(monkeypatch) -> None:
@@ -875,6 +937,47 @@ def test_hyperliquid_paper_live_probe_uses_minimum_real_order_and_paper_quantity
     assert "探针真实成交量" in result.error_message
 
 
+def test_hyperliquid_paper_live_probe_trusts_runtime_adapter_switch(monkeypatch) -> None:
+    submitted = []
+
+    class FakeExchange:
+        def market_open(self, name, is_buy, sz, px, slippage):
+            submitted.append((name, is_buy, sz))
+            return {
+                "status": "ok",
+                "response": {
+                    "data": {
+                        "statuses": [
+                            {"filled": {"totalSz": str(sz), "avgPx": "100.5", "oid": 67890}},
+                        ]
+                    }
+                },
+            }
+
+    adapter = HyperliquidAdapter(live=True)
+    adapter.paper_price_probe = True
+    adapter.settings = SimpleNamespace(
+        hyperliquid_paper_live_order_enabled=False,
+        paper_live_probe_enabled=False,
+        hyperliquid_account_address="0xabc",
+        hyperliquid_secret_key="0xkey",
+        hyperliquid_default_min_notional=10.0,
+        hyperliquid_paper_live_slippage=0.01,
+        hyperliquid_info_url="https://example.test/info",
+    )
+    adapter._post_info = lambda payload: (
+        {"universe": [{"name": "BTC", "szDecimals": 5}]} if payload["type"] == "meta" else {"BTC": "65000"}
+    )
+    adapter._fee_rate = lambda order: 0.0
+    monkeypatch.setattr("app.adapters.hyperliquid._load_hyperliquid_exchange", lambda settings: FakeExchange())
+
+    result = adapter.place_order(AdapterOrder(platform="hyperliquid", symbol="BTC", side="buy", quantity=0.25, venue_symbol="BTC"))
+
+    assert submitted == [("BTC", True, 0.00016)]
+    assert result.success
+    assert result.external_order_id == "67890"
+
+
 def test_execution_adapters_enable_hyperliquid_probe_only_for_paper_switch(monkeypatch) -> None:
     monkeypatch.setattr("app.execution.engine.get_settings", lambda: SimpleNamespace(hyperliquid_paper_live_order_enabled=True))
 
@@ -886,9 +989,218 @@ def test_execution_adapters_enable_hyperliquid_probe_only_for_paper_switch(monke
     assert mt5.demo is True
 
 
-def test_symbol_mapping_rejects_mt5_style_hyperliquid_symbol() -> None:
-    with pytest.raises(ValueError, match="Hyperliquid 标准永续"):
-        SymbolMappingIn(symbol="BTC", hyperliquid_symbol="BTCUSD", mt5_symbol="BTCUSD")
+def test_execution_adapters_enable_generic_paper_live_probe_for_configured_venue(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "app.execution.engine.get_settings",
+        lambda: SimpleNamespace(
+            hyperliquid_paper_live_order_enabled=False,
+            paper_live_probe_enabled=True,
+            paper_live_probe_venues="binance,okx",
+        ),
+    )
+    mapping = SymbolMapping(
+        symbol="BTC",
+        leg_a_venue="binance",
+        leg_a_symbol="BTCUSDT",
+        leg_a_venue_symbol="BTCUSDT",
+        leg_b_venue="mt5",
+        leg_b_symbol="BTCUSD",
+        mt5_symbol="BTCUSD",
+    )
+
+    leg_a, leg_b = _execution_adapters(live=False, simulated=True, mapping=mapping)
+
+    assert leg_a.platform == "binance"
+    assert leg_a.live is True
+    assert leg_a.paper_price_probe is True
+    assert getattr(leg_a, "simulated") is True
+    assert leg_b.demo is True
+
+
+def test_execution_adapters_db_probe_switch_applies_to_all_non_mt5_venues(monkeypatch) -> None:
+    engine = create_engine("sqlite:///:memory:", future=True)
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine, future=True)
+    db = Session()
+    db.add(SystemSetting(key="paper_live_probe_enabled", value="true"))
+    db.commit()
+    monkeypatch.setattr(
+        "app.execution.engine.get_settings",
+        lambda: SimpleNamespace(
+            hyperliquid_paper_live_order_enabled=False,
+            paper_live_probe_enabled=False,
+            paper_live_probe_venues="hyperliquid",
+        ),
+    )
+    mapping = SymbolMapping(
+        symbol="ETH",
+        leg_a_venue="okx",
+        leg_a_symbol="ETH-USDT-SWAP",
+        leg_a_venue_symbol="ETH-USDT-SWAP",
+        leg_b_venue="mt5",
+        leg_b_symbol="ETHUSD",
+        mt5_symbol="ETHUSD",
+    )
+
+    leg_a, leg_b = _execution_adapters(live=False, simulated=True, mapping=mapping, db=db)
+
+    assert leg_a.platform == "okx"
+    assert leg_a.live is True
+    assert leg_a.paper_price_probe is True
+    assert leg_b.demo is True
+
+
+def test_execution_adapters_db_probe_switch_overrides_legacy_hyperliquid_env(monkeypatch) -> None:
+    engine = create_engine("sqlite:///:memory:", future=True)
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine, future=True)
+    db = Session()
+    db.add(SystemSetting(key="paper_live_probe_enabled", value="false"))
+    db.commit()
+    monkeypatch.setattr(
+        "app.execution.engine.get_settings",
+        lambda: SimpleNamespace(
+            hyperliquid_paper_live_order_enabled=True,
+            paper_live_probe_enabled=False,
+            paper_live_probe_venues="*",
+        ),
+    )
+
+    leg_a, _ = _execution_adapters(live=False, simulated=True, db=db)
+
+    assert leg_a.platform == "hyperliquid"
+    assert leg_a.live is False
+    assert leg_a.paper_price_probe is False
+
+
+def test_nautilus_probe_rejects_until_real_order_adapter_exists() -> None:
+    adapter = NautilusReadOnlyAdapter("okx", live=True)
+    adapter.paper_price_probe = True
+
+    result = adapter.place_order(AdapterOrder(platform="okx", symbol="BTC", side="buy", quantity=1.0, venue_symbol="BTC-USDT-SWAP"))
+
+    assert not result.success
+    assert result.status == "rejected"
+    assert "尚未实现 paper-live 探针下单" in result.error_message
+
+
+def test_create_current_symbol_opportunity_uses_best_executable_direction() -> None:
+    engine = create_engine("sqlite:///:memory:", future=True)
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine, future=True)
+    db = Session()
+    db.add(StrategySetting(default_notional=1000.0))
+    db.add(SymbolMapping(symbol="BTC", leg_a_venue_symbol="BTCUSDT", mt5_symbol="BTCUSD", enabled=True))
+    db.add(
+        SpreadDirectionCurrent(
+            symbol="BTC",
+            direction="long_leg_a_short_leg_b",
+            leg_a_bid=65000,
+            leg_a_ask=65010,
+            leg_b_bid=65020,
+            leg_b_ask=65030,
+            quantity=0.1,
+            leg_a_quantity=0.1,
+            leg_b_quantity=0.1,
+            gross_spread=10,
+            entry_spread=10,
+            close_spread=5,
+            unit_cost=1,
+            unit_net_profit=9,
+            total_cost=1,
+            net_profit=9,
+            annualized_return=0.1,
+            status="candidate",
+            reason="未达入场线",
+        )
+    )
+    db.add(
+        SpreadDirectionCurrent(
+            symbol="BTC",
+            direction="long_leg_b_short_leg_a",
+            leg_a_bid=65000,
+            leg_a_ask=65010,
+            leg_b_bid=65020,
+            leg_b_ask=65030,
+            quantity=0.2,
+            leg_a_quantity=0.2,
+            leg_b_quantity=0.2,
+            gross_spread=20,
+            entry_spread=20,
+            close_spread=6,
+            unit_cost=2,
+            unit_net_profit=18,
+            total_cost=2,
+            net_profit=18,
+            annualized_return=0.2,
+            status="executable",
+            reason="ready",
+        )
+    )
+    db.commit()
+
+    opportunity = api_router._create_current_symbol_opportunity(db, "btc", "tester")
+
+    assert opportunity.direction == "long_leg_b_short_leg_a"
+    assert opportunity.status == "executable"
+    assert opportunity.entry_threshold == 20
+    assert opportunity.exit_target == 6
+    assert opportunity.reject_reason == "manual_execute_from_spread:tester"
+
+
+def test_binance_nautilus_probe_uses_exchange_minimum_and_paper_quantity(monkeypatch) -> None:
+    from app.exchanges.credentials import binance_futures_probe_order
+
+    submitted = []
+
+    class FakeClient:
+        async def sign_request(self, http_method, url_path, payload=None, ratelimiter_keys=None):
+            submitted.append((str(http_method), url_path, payload, ratelimiter_keys))
+            return json.dumps({"orderId": 987, "status": "FILLED", "executedQty": payload["quantity"], "avgPrice": "65010"}).encode("utf-8")
+
+    class FakeMarketApi:
+        client = FakeClient()
+        base_endpoint = "/fapi/v1/"
+
+        async def query_futures_exchange_info(self):
+            return {
+                "symbols": [
+                    {
+                        "symbol": "BTCUSDT",
+                        "quantityPrecision": 3,
+                        "filters": [
+                            {"filterType": "LOT_SIZE", "minQty": "0.001", "stepSize": "0.001"},
+                            {"filterType": "MIN_NOTIONAL", "notional": "100"},
+                        ],
+                    }
+                ]
+            }
+
+    async def fake_ticker(row, symbol):
+        return SimpleNamespace(bidPrice="65000", askPrice="65020")
+
+    monkeypatch.setattr("app.exchanges.credentials._nautilus_binance_futures_apis", lambda row: (None, FakeMarketApi()))
+    monkeypatch.setattr("app.exchanges.credentials._nautilus_binance_futures_ticker", fake_ticker)
+    row = ExchangeCredential(venue="binance", environment="test", enabled=True, read_only=False, encrypted_credentials="x")
+
+    result = binance_futures_probe_order(
+        row,
+        AdapterOrder(platform="binance", symbol="BTC", side="buy", quantity=0.25, venue_symbol="BTCUSDT"),
+        configured_min_base_size=0.0,
+    )
+
+    assert result.success
+    assert result.external_order_id == "987"
+    assert result.filled_quantity == 0.25
+    assert result.average_price == 65010.0
+    assert submitted[0][2]["quantity"] == "0.002"
+    assert submitted[0][2]["newOrderRespType"] == "RESULT"
+    assert "paper 账本成交量 0.25" in result.error_message
+
+
+def test_symbol_mapping_rejects_empty_leg_a_venue_symbol() -> None:
+    with pytest.raises(ValueError, match="venue symbol"):
+        SymbolMappingIn(symbol="BTC", leg_a_venue_symbol="", mt5_symbol="BTCUSD", leg_a_venue="hyperliquid")
 
 
 def test_accepted_order_without_fill_is_pending_not_position_effect() -> None:
@@ -969,20 +1281,20 @@ def test_live_open_blocks_when_readiness_has_blockers(monkeypatch) -> None:
     db = Session()
     db.add(StrategySetting(execution_mode="live"))
     db.add(SystemSetting(key="live_trading_enabled", value="true"))
-    db.add(SymbolMapping(symbol="OIL", hyperliquid_symbol="OIL", mt5_symbol="USOIL"))
+    db.add(SymbolMapping(symbol="OIL", leg_a_venue_symbol="OIL", mt5_symbol="USOIL"))
     opportunity = ArbitrageOpportunity(
         symbol="OIL",
-        direction="long_hyperliquid_short_mt5",
+        direction="long_leg_a_short_leg_b",
         status="executable",
         notional=1000,
         quantity=1.0,
-        hyperliquid_quantity=1.0,
-        mt5_quantity=0.1,
+        leg_a_quantity=1.0,
+        leg_b_quantity=0.1,
         gross_spread=10,
-        trigger_hyperliquid_bid=99.0,
-        trigger_hyperliquid_ask=101.0,
-        trigger_mt5_bid=110.0,
-        trigger_mt5_ask=111.0,
+        trigger_leg_a_bid=99.0,
+        trigger_leg_a_ask=101.0,
+        trigger_leg_b_bid=110.0,
+        trigger_leg_b_ask=111.0,
         unit_cost=1,
         unit_net_profit=9,
         entry_threshold=8,
@@ -1009,20 +1321,20 @@ def test_live_open_orders_are_not_reduce_only(monkeypatch) -> None:
     db = Session()
     db.add(StrategySetting(execution_mode="live"))
     db.add(SystemSetting(key="live_trading_enabled", value="true"))
-    db.add(SymbolMapping(symbol="OIL", hyperliquid_symbol="OIL", mt5_symbol="USOIL"))
+    db.add(SymbolMapping(symbol="OIL", leg_a_venue_symbol="OIL", mt5_symbol="USOIL"))
     opportunity = ArbitrageOpportunity(
         symbol="OIL",
-        direction="long_hyperliquid_short_mt5",
+        direction="long_leg_a_short_leg_b",
         status="executable",
         notional=1000,
         quantity=1.0,
-        hyperliquid_quantity=1.0,
-        mt5_quantity=0.1,
+        leg_a_quantity=1.0,
+        leg_b_quantity=0.1,
         gross_spread=10,
-        trigger_hyperliquid_bid=99.0,
-        trigger_hyperliquid_ask=101.0,
-        trigger_mt5_bid=110.0,
-        trigger_mt5_ask=111.0,
+        trigger_leg_a_bid=99.0,
+        trigger_leg_a_ask=101.0,
+        trigger_leg_b_bid=110.0,
+        trigger_leg_b_ask=111.0,
         unit_cost=1,
         unit_net_profit=9,
         entry_threshold=8,
@@ -1049,22 +1361,22 @@ def test_live_open_orders_are_not_reduce_only(monkeypatch) -> None:
     monkeypatch.setattr("app.execution.engine.live_execution_readiness", lambda db: {"checks": []})
     monkeypatch.setattr("app.execution.engine.mt5_session_state", lambda mapping: MT5SessionState(mapping.symbol, "normal_trade", "", True, True, True, True, True))
     monkeypatch.setattr("app.execution.engine.mt5_market_order_check", lambda *args, **kwargs: SimpleNamespace(allowed=True, message="ok"))
-    monkeypatch.setattr("app.execution.engine.quote_synchronizer.synchronized", lambda *args, **kwargs: (SimpleNamespace(hyperliquid=SimpleNamespace(local_recv_ts=datetime.now(timezone.utc).replace(tzinfo=None)), time_diff_ms=0), ""))
+    monkeypatch.setattr("app.execution.engine.quote_synchronizer.synchronized", lambda *args, **kwargs: (SimpleNamespace(leg_a=SimpleNamespace(local_recv_ts=datetime.now(timezone.utc).replace(tzinfo=None), bid=99.0, ask=101.0), leg_b=SimpleNamespace(bid=110.0, ask=111.0), time_diff_ms=0), ""))
     monkeypatch.setattr("app.execution.engine.pre_trade_check", lambda *args, **kwargs: SimpleNamespace(allowed=True, reason=""))
 
     group = open_hedge_group(db, opportunity.id)
 
     assert group.status == "open"
-    assert group.trigger_hyperliquid_bid == 99.0
-    assert group.trigger_hyperliquid_ask == 101.0
-    assert group.trigger_mt5_bid == 110.0
-    assert group.trigger_mt5_ask == 111.0
+    assert group.trigger_leg_a_bid == 99.0
+    assert group.trigger_leg_a_ask == 101.0
+    assert group.trigger_leg_b_bid == 110.0
+    assert group.trigger_leg_b_ask == 111.0
     assert [intent.reduce_only for intent in submitted] == [False, False]
     assert {order.reduce_only for order in db.query(Order).filter(Order.hedge_group_id == group.id).all()} == {False}
 
 
 def test_hyper_maker_price_is_normalized_to_tick_and_precision() -> None:
-    mapping = SymbolMapping(symbol="EUR", hyperliquid_symbol="xyz:EUR", mt5_symbol="EURUSD", price_precision=5, min_tick=0.00001)
+    mapping = SymbolMapping(symbol="EUR", leg_a_venue_symbol="xyz:EUR", mt5_symbol="EURUSD", price_precision=5, min_tick=0.00001)
 
     sell_price = _maker_price("sell", bid=1.1459, ask=1.1459, offset_bps=1.0, mapping=mapping)
     buy_price = _maker_price("buy", bid=1.1459, ask=1.1460, offset_bps=1.0, mapping=mapping)
@@ -1080,15 +1392,15 @@ def test_paper_open_uses_hyperliquid_sim_and_mt5_demo_adapters(monkeypatch) -> N
     Session = sessionmaker(bind=engine, future=True)
     db = Session()
     db.add(StrategySetting(execution_mode="paper"))
-    db.add(SymbolMapping(symbol="OIL", hyperliquid_symbol="OIL", mt5_symbol="USOIL"))
+    db.add(SymbolMapping(symbol="OIL", leg_a_venue_symbol="OIL", mt5_symbol="USOIL"))
     opportunity = ArbitrageOpportunity(
         symbol="OIL",
-        direction="long_hyperliquid_short_mt5",
+        direction="long_leg_a_short_leg_b",
         status="executable",
         notional=1000,
         quantity=1.0,
-        hyperliquid_quantity=1.0,
-        mt5_quantity=0.1,
+        leg_a_quantity=1.0,
+        leg_b_quantity=0.1,
         gross_spread=10,
         unit_cost=1,
         unit_net_profit=9,
@@ -1116,7 +1428,7 @@ def test_paper_open_uses_hyperliquid_sim_and_mt5_demo_adapters(monkeypatch) -> N
     monkeypatch.setattr("app.execution.engine.mt5_session_state", lambda mapping: MT5SessionState(mapping.symbol, "normal_trade", "", True, True, True, True, True))
     monkeypatch.setattr("app.execution.engine.mt5_market_order_check", lambda *args, **kwargs: SimpleNamespace(allowed=True, message="ok"))
     monkeypatch.setattr("app.execution.engine.build_execution_gateway", lambda adapter: FakeGateway(adapter))
-    monkeypatch.setattr("app.execution.engine.quote_synchronizer.synchronized", lambda *args, **kwargs: (SimpleNamespace(hyperliquid=SimpleNamespace(local_recv_ts=datetime.now(timezone.utc).replace(tzinfo=None)), time_diff_ms=0), ""))
+    monkeypatch.setattr("app.execution.engine.quote_synchronizer.synchronized", lambda *args, **kwargs: (SimpleNamespace(leg_a=SimpleNamespace(local_recv_ts=datetime.now(timezone.utc).replace(tzinfo=None), bid=99.0, ask=101.0), leg_b=SimpleNamespace(bid=110.0, ask=111.0), time_diff_ms=0), ""))
     monkeypatch.setattr("app.execution.engine.pre_trade_check", lambda *args, **kwargs: SimpleNamespace(allowed=True, reason=""))
     monkeypatch.setattr("app.execution.engine.get_settings", lambda: SimpleNamespace(hyperliquid_paper_live_order_enabled=False, paper_live_parallel_execution=False, strict_quote_sync_ms=500, quote_stale_ms=1500, default_slippage_bps=0))
     monkeypatch.setattr("app.execution.engine.get_settings", lambda: SimpleNamespace(hyperliquid_paper_live_order_enabled=False, strict_quote_sync_ms=500, quote_stale_ms=1500, default_slippage_bps=0))
@@ -1134,15 +1446,15 @@ def test_open_blocks_when_mt5_session_disallows_open_before_hyperliquid_leg(monk
     Session = sessionmaker(bind=engine, future=True)
     db = Session()
     db.add(StrategySetting(execution_mode="paper"))
-    db.add(SymbolMapping(symbol="SPCX", hyperliquid_symbol="xyz:SPCX", mt5_symbol="SPCXz"))
+    db.add(SymbolMapping(symbol="SPCX", leg_a_venue_symbol="xyz:SPCX", mt5_symbol="SPCXz"))
     opportunity = ArbitrageOpportunity(
         symbol="SPCX",
-        direction="long_mt5_short_hyperliquid",
+        direction="long_leg_b_short_leg_a",
         status="executable",
         notional=500,
         quantity=34.0,
-        hyperliquid_quantity=34.0,
-        mt5_quantity=0.34,
+        leg_a_quantity=34.0,
+        leg_b_quantity=0.34,
         gross_spread=0.2,
         unit_cost=0.01,
         unit_net_profit=0.19,
@@ -1183,15 +1495,15 @@ def test_open_blocks_when_mt5_order_check_rejects_before_hyperliquid_leg(monkeyp
     Session = sessionmaker(bind=engine, future=True)
     db = Session()
     db.add(StrategySetting(execution_mode="paper"))
-    db.add(SymbolMapping(symbol="SPCX", hyperliquid_symbol="xyz:SPCX", mt5_symbol="SPCXz"))
+    db.add(SymbolMapping(symbol="SPCX", leg_a_venue_symbol="xyz:SPCX", mt5_symbol="SPCXz"))
     opportunity = ArbitrageOpportunity(
         symbol="SPCX",
-        direction="long_mt5_short_hyperliquid",
+        direction="long_leg_b_short_leg_a",
         status="executable",
         notional=500,
         quantity=34.0,
-        hyperliquid_quantity=34.0,
-        mt5_quantity=0.34,
+        leg_a_quantity=34.0,
+        leg_b_quantity=0.34,
         gross_spread=0.2,
         unit_cost=0.01,
         unit_net_profit=0.19,
@@ -1234,12 +1546,12 @@ def test_auto_execute_waits_for_mt5_tradability_cache(monkeypatch) -> None:
     db.add(
         ArbitrageOpportunity(
             symbol="SPCX",
-            direction="long_mt5_short_hyperliquid",
+            direction="long_leg_b_short_leg_a",
             status="executable",
             notional=500,
             quantity=34.0,
-            hyperliquid_quantity=34.0,
-            mt5_quantity=0.34,
+            leg_a_quantity=34.0,
+            leg_b_quantity=0.34,
             gross_spread=0.2,
             unit_cost=0.01,
             unit_net_profit=0.19,
@@ -1267,15 +1579,15 @@ def test_open_quarantines_mt5_side_after_order_send_10044(monkeypatch) -> None:
     Session = sessionmaker(bind=engine, future=True)
     db = Session()
     db.add(StrategySetting(execution_mode="paper"))
-    db.add(SymbolMapping(symbol="SPCX", hyperliquid_symbol="xyz:SPCX", mt5_symbol="SPCXz"))
+    db.add(SymbolMapping(symbol="SPCX", leg_a_venue_symbol="xyz:SPCX", mt5_symbol="SPCXz"))
     opportunity = ArbitrageOpportunity(
         symbol="SPCX",
-        direction="long_mt5_short_hyperliquid",
+        direction="long_leg_b_short_leg_a",
         status="executable",
         notional=500,
         quantity=34.0,
-        hyperliquid_quantity=34.0,
-        mt5_quantity=0.34,
+        leg_a_quantity=34.0,
+        leg_b_quantity=0.34,
         gross_spread=0.2,
         unit_cost=0.01,
         unit_net_profit=0.19,
@@ -1306,7 +1618,7 @@ def test_open_quarantines_mt5_side_after_order_send_10044(monkeypatch) -> None:
     monkeypatch.setattr("app.execution.engine.mt5_session_state", lambda mapping: MT5SessionState(mapping.symbol, "normal_trade", "", True, True, True, True, True))
     monkeypatch.setattr("app.execution.engine.mt5_market_order_check", lambda *args, **kwargs: SimpleNamespace(allowed=True, message="Done"))
     monkeypatch.setattr("app.execution.engine.build_execution_gateway", lambda adapter: FakeGateway(adapter))
-    monkeypatch.setattr("app.execution.engine.quote_synchronizer.synchronized", lambda *args, **kwargs: (SimpleNamespace(hyperliquid=SimpleNamespace(local_recv_ts=datetime.now(timezone.utc).replace(tzinfo=None)), time_diff_ms=0), ""))
+    monkeypatch.setattr("app.execution.engine.quote_synchronizer.synchronized", lambda *args, **kwargs: (SimpleNamespace(leg_a=SimpleNamespace(local_recv_ts=datetime.now(timezone.utc).replace(tzinfo=None), bid=99.0, ask=101.0), leg_b=SimpleNamespace(bid=110.0, ask=111.0), time_diff_ms=0), ""))
     monkeypatch.setattr("app.execution.engine.pre_trade_check", lambda *args, **kwargs: SimpleNamespace(allowed=True, reason=""))
     monkeypatch.setattr("app.execution.engine.get_settings", lambda: SimpleNamespace(hyperliquid_paper_live_order_enabled=False, paper_live_parallel_execution=False, strict_quote_sync_ms=500, quote_stale_ms=1500, default_slippage_bps=0))
 
@@ -1325,15 +1637,15 @@ def test_paper_open_records_actual_entry_spread_from_fills(monkeypatch) -> None:
     Session = sessionmaker(bind=engine, future=True)
     db = Session()
     db.add(StrategySetting(execution_mode="paper"))
-    db.add(SymbolMapping(symbol="OIL", hyperliquid_symbol="OIL", mt5_symbol="USOIL"))
+    db.add(SymbolMapping(symbol="OIL", leg_a_venue_symbol="OIL", mt5_symbol="USOIL"))
     opportunity = ArbitrageOpportunity(
         symbol="OIL",
-        direction="long_hyperliquid_short_mt5",
+        direction="long_leg_a_short_leg_b",
         status="executable",
         notional=1000,
         quantity=1.0,
-        hyperliquid_quantity=1.0,
-        mt5_quantity=0.1,
+        leg_a_quantity=1.0,
+        leg_b_quantity=0.1,
         gross_spread=10,
         unit_cost=1,
         unit_net_profit=9,
@@ -1362,7 +1674,7 @@ def test_paper_open_records_actual_entry_spread_from_fills(monkeypatch) -> None:
     monkeypatch.setattr("app.execution.engine.mt5_session_state", lambda mapping: MT5SessionState(mapping.symbol, "normal_trade", "", True, True, True, True, True))
     monkeypatch.setattr("app.execution.engine.mt5_market_order_check", lambda *args, **kwargs: SimpleNamespace(allowed=True, message="ok"))
     monkeypatch.setattr("app.execution.engine.build_execution_gateway", lambda adapter: FakeGateway(adapter))
-    monkeypatch.setattr("app.execution.engine.quote_synchronizer.synchronized", lambda *args, **kwargs: (SimpleNamespace(hyperliquid=SimpleNamespace(local_recv_ts=datetime.now(timezone.utc).replace(tzinfo=None)), time_diff_ms=0), ""))
+    monkeypatch.setattr("app.execution.engine.quote_synchronizer.synchronized", lambda *args, **kwargs: (SimpleNamespace(leg_a=SimpleNamespace(local_recv_ts=datetime.now(timezone.utc).replace(tzinfo=None), bid=99.0, ask=101.0), leg_b=SimpleNamespace(bid=110.0, ask=111.0), time_diff_ms=0), ""))
     monkeypatch.setattr("app.execution.engine.pre_trade_check", lambda *args, **kwargs: SimpleNamespace(allowed=True, reason=""))
 
     group = open_hedge_group(db, opportunity.id)
@@ -1379,15 +1691,15 @@ def test_paper_open_waits_for_hyperliquid_fill_before_mt5(monkeypatch) -> None:
     Session = sessionmaker(bind=engine, future=True)
     db = Session()
     db.add(StrategySetting(execution_mode="paper"))
-    db.add(SymbolMapping(symbol="JP225", hyperliquid_symbol="xyz:JP225", mt5_symbol="JP225z"))
+    db.add(SymbolMapping(symbol="JP225", leg_a_venue_symbol="xyz:JP225", mt5_symbol="JP225z"))
     opportunity = ArbitrageOpportunity(
         symbol="JP225",
-        direction="long_hyperliquid_short_mt5",
+        direction="long_leg_a_short_leg_b",
         status="executable",
         notional=450,
         quantity=1.0,
-        hyperliquid_quantity=0.00625,
-        mt5_quantity=1.0,
+        leg_a_quantity=0.00625,
+        leg_b_quantity=1.0,
         gross_spread=10,
         unit_cost=1,
         unit_net_profit=9,
@@ -1415,7 +1727,7 @@ def test_paper_open_waits_for_hyperliquid_fill_before_mt5(monkeypatch) -> None:
     monkeypatch.setattr("app.execution.engine.mt5_session_state", lambda mapping: MT5SessionState(mapping.symbol, "normal_trade", "", True, True, True, True, True))
     monkeypatch.setattr("app.execution.engine.mt5_market_order_check", lambda *args, **kwargs: SimpleNamespace(allowed=True, message="ok"))
     monkeypatch.setattr("app.execution.engine.build_execution_gateway", lambda adapter: FakeGateway(adapter))
-    monkeypatch.setattr("app.execution.engine.quote_synchronizer.synchronized", lambda *args, **kwargs: (SimpleNamespace(hyperliquid=SimpleNamespace(local_recv_ts=datetime.now(timezone.utc).replace(tzinfo=None)), time_diff_ms=0), ""))
+    monkeypatch.setattr("app.execution.engine.quote_synchronizer.synchronized", lambda *args, **kwargs: (SimpleNamespace(leg_a=SimpleNamespace(local_recv_ts=datetime.now(timezone.utc).replace(tzinfo=None), bid=99.0, ask=101.0), leg_b=SimpleNamespace(bid=110.0, ask=111.0), time_diff_ms=0), ""))
     monkeypatch.setattr("app.execution.engine.pre_trade_check", lambda *args, **kwargs: SimpleNamespace(allowed=True, reason=""))
     monkeypatch.setattr("app.execution.engine.get_settings", lambda: SimpleNamespace(hyperliquid_paper_live_order_enabled=False, paper_live_parallel_execution=False, strict_quote_sync_ms=500, quote_stale_ms=1500, default_slippage_bps=0))
 
@@ -1434,16 +1746,16 @@ def test_open_refreshes_execution_quotes_after_strict_sync_failure(monkeypatch) 
     Base.metadata.create_all(engine)
     Session = sessionmaker(bind=engine, future=True)
     db = Session()
-    db.add(StrategySetting(execution_mode="paper", paper_hyperliquid_latency_ms_min=0, paper_hyperliquid_latency_ms_max=0, paper_mt5_latency_ms_min=0, paper_mt5_latency_ms_max=0))
-    db.add(SymbolMapping(symbol="JP225", hyperliquid_symbol="xyz:JP225", mt5_symbol="JP225z"))
+    db.add(StrategySetting(execution_mode="paper", paper_leg_a_latency_ms_min=0, paper_leg_a_latency_ms_max=0, paper_leg_b_latency_ms_min=0, paper_leg_b_latency_ms_max=0))
+    db.add(SymbolMapping(symbol="JP225", leg_a_venue_symbol="xyz:JP225", mt5_symbol="JP225z"))
     opportunity = ArbitrageOpportunity(
         symbol="JP225",
-        direction="long_hyperliquid_short_mt5",
+        direction="long_leg_a_short_leg_b",
         status="executable",
         notional=450,
         quantity=1.0,
-        hyperliquid_quantity=1.0,
-        mt5_quantity=1.0,
+        leg_a_quantity=1.0,
+        leg_b_quantity=1.0,
         gross_spread=20,
         unit_cost=1,
         unit_net_profit=19,
@@ -1456,8 +1768,8 @@ def test_open_refreshes_execution_quotes_after_strict_sync_failure(monkeypatch) 
     db.add(opportunity)
     db.commit()
     synced = SimpleNamespace(
-        hyperliquid=SimpleNamespace(ask=100.0, bid=99.0, local_recv_ts=datetime.now(timezone.utc).replace(tzinfo=None)),
-        mt5=SimpleNamespace(ask=121.0, bid=120.0),
+        leg_a=SimpleNamespace(ask=100.0, bid=99.0, local_recv_ts=datetime.now(timezone.utc).replace(tzinfo=None)),
+        leg_b=SimpleNamespace(ask=121.0, bid=120.0),
         time_diff_ms=300,
     )
     sync_results = [(None, "行情过期，最大延迟 3000ms"), (synced, "")]
@@ -1490,16 +1802,16 @@ def test_paper_live_parallel_submits_hyperliquid_and_mt5_without_waiting(monkeyp
     Base.metadata.create_all(engine)
     Session = sessionmaker(bind=engine, future=True)
     db = Session()
-    db.add(StrategySetting(execution_mode="paper", paper_hyperliquid_latency_ms_min=0, paper_hyperliquid_latency_ms_max=0, paper_mt5_latency_ms_min=0, paper_mt5_latency_ms_max=0))
-    db.add(SymbolMapping(symbol="JP225", hyperliquid_symbol="xyz:JP225", mt5_symbol="JP225z"))
+    db.add(StrategySetting(execution_mode="paper", paper_leg_a_latency_ms_min=0, paper_leg_a_latency_ms_max=0, paper_leg_b_latency_ms_min=0, paper_leg_b_latency_ms_max=0))
+    db.add(SymbolMapping(symbol="JP225", leg_a_venue_symbol="xyz:JP225", mt5_symbol="JP225z"))
     opportunity = ArbitrageOpportunity(
         symbol="JP225",
-        direction="long_hyperliquid_short_mt5",
+        direction="long_leg_a_short_leg_b",
         status="executable",
         notional=450,
         quantity=1.0,
-        hyperliquid_quantity=0.00015,
-        mt5_quantity=1.0,
+        leg_a_quantity=0.00015,
+        leg_b_quantity=1.0,
         gross_spread=20,
         unit_cost=1,
         unit_net_profit=19,
@@ -1528,7 +1840,7 @@ def test_paper_live_parallel_submits_hyperliquid_and_mt5_without_waiting(monkeyp
     monkeypatch.setattr("app.execution.engine.mt5_session_state", lambda mapping: MT5SessionState(mapping.symbol, "normal_trade", "", True, True, True, True, True))
     monkeypatch.setattr("app.execution.engine.mt5_market_order_check", lambda *args, **kwargs: SimpleNamespace(allowed=True, message="ok"))
     monkeypatch.setattr("app.execution.engine.build_execution_gateway", lambda adapter: FakeGateway(adapter))
-    monkeypatch.setattr("app.execution.engine.quote_synchronizer.synchronized", lambda *args, **kwargs: (SimpleNamespace(hyperliquid=SimpleNamespace(local_recv_ts=datetime.now(timezone.utc).replace(tzinfo=None)), time_diff_ms=0), ""))
+    monkeypatch.setattr("app.execution.engine.quote_synchronizer.synchronized", lambda *args, **kwargs: (SimpleNamespace(leg_a=SimpleNamespace(local_recv_ts=datetime.now(timezone.utc).replace(tzinfo=None), bid=99.0, ask=101.0), leg_b=SimpleNamespace(bid=110.0, ask=111.0), time_diff_ms=0), ""))
     monkeypatch.setattr("app.execution.engine.pre_trade_check", lambda *args, **kwargs: SimpleNamespace(allowed=True, reason=""))
     monkeypatch.setattr("app.execution.engine.get_settings", lambda: SimpleNamespace(hyperliquid_paper_live_order_enabled=True, paper_live_parallel_execution=True, strict_quote_sync_ms=500, quote_stale_ms=1500, default_slippage_bps=0))
 
@@ -1545,15 +1857,15 @@ def test_open_rejects_when_refreshed_quotes_no_longer_meet_entry(monkeypatch) ->
     Session = sessionmaker(bind=engine, future=True)
     db = Session()
     db.add(StrategySetting(execution_mode="paper"))
-    db.add(SymbolMapping(symbol="JP225", hyperliquid_symbol="xyz:JP225", mt5_symbol="JP225z"))
+    db.add(SymbolMapping(symbol="JP225", leg_a_venue_symbol="xyz:JP225", mt5_symbol="JP225z"))
     opportunity = ArbitrageOpportunity(
         symbol="JP225",
-        direction="long_hyperliquid_short_mt5",
+        direction="long_leg_a_short_leg_b",
         status="executable",
         notional=450,
         quantity=1.0,
-        hyperliquid_quantity=1.0,
-        mt5_quantity=1.0,
+        leg_a_quantity=1.0,
+        leg_b_quantity=1.0,
         gross_spread=20,
         unit_cost=1,
         unit_net_profit=19,
@@ -1566,8 +1878,8 @@ def test_open_rejects_when_refreshed_quotes_no_longer_meet_entry(monkeypatch) ->
     db.add(opportunity)
     db.commit()
     synced = SimpleNamespace(
-        hyperliquid=SimpleNamespace(ask=100.0, bid=99.0, local_recv_ts=datetime.now(timezone.utc).replace(tzinfo=None)),
-        mt5=SimpleNamespace(ask=106.0, bid=105.0),
+        leg_a=SimpleNamespace(ask=100.0, bid=99.0, local_recv_ts=datetime.now(timezone.utc).replace(tzinfo=None)),
+        leg_b=SimpleNamespace(ask=106.0, bid=105.0),
         time_diff_ms=10,
     )
     sync_results = [(None, "行情未对齐，时间差 900ms"), (synced, "")]
@@ -1749,16 +2061,16 @@ def test_reconcile_hyper_maker_fill_submits_mt5_taker(monkeypatch) -> None:
     Base.metadata.create_all(engine)
     Session = sessionmaker(bind=engine, future=True)
     db = Session()
-    db.add(SymbolMapping(symbol="EUR", hyperliquid_symbol="xyz:EUR", mt5_symbol="EURUSD", execution_style="hyper_maker_mt5_taker"))
+    db.add(SymbolMapping(symbol="EUR", leg_a_venue_symbol="xyz:EUR", mt5_symbol="EURUSD", execution_style="hyper_maker_mt5_taker"))
     group = HedgeGroup(
         symbol="EUR",
-        direction="long_mt5_short_hyperliquid",
+        direction="long_leg_b_short_leg_a",
         status="opening",
         execution_mode="paper",
         notional=1145.0,
         quantity=0.01,
-        hyperliquid_quantity=1000.0,
-        mt5_quantity=0.01,
+        leg_a_quantity=1000.0,
+        leg_b_quantity=0.01,
         open_cost=0.2,
     )
     db.add(group)
@@ -1808,16 +2120,16 @@ def test_reconcile_taker_open_hyper_fill_submits_mt5_leg(monkeypatch) -> None:
     Base.metadata.create_all(engine)
     Session = sessionmaker(bind=engine, future=True)
     db = Session()
-    db.add(SymbolMapping(symbol="JP225", hyperliquid_symbol="xyz:JP225", mt5_symbol="JP225z"))
+    db.add(SymbolMapping(symbol="JP225", leg_a_venue_symbol="xyz:JP225", mt5_symbol="JP225z"))
     group = HedgeGroup(
         symbol="JP225",
-        direction="long_hyperliquid_short_mt5",
+        direction="long_leg_a_short_leg_b",
         status="opening",
         execution_mode="paper",
         notional=450.0,
         quantity=1.0,
-        hyperliquid_quantity=0.00625,
-        mt5_quantity=1.0,
+        leg_a_quantity=0.00625,
+        leg_b_quantity=1.0,
         open_cost=0.2,
     )
     db.add(group)
@@ -1869,16 +2181,16 @@ def test_reconcile_taker_close_hyper_fill_submits_mt5_reduce_only_leg(monkeypatc
     Base.metadata.create_all(engine)
     Session = sessionmaker(bind=engine, future=True)
     db = Session()
-    db.add(SymbolMapping(symbol="OIL", hyperliquid_symbol="OIL", mt5_symbol="USOIL"))
+    db.add(SymbolMapping(symbol="OIL", leg_a_venue_symbol="OIL", mt5_symbol="USOIL"))
     group = HedgeGroup(
         symbol="OIL",
-        direction="long_hyperliquid_short_mt5",
+        direction="long_leg_a_short_leg_b",
         status="closing",
         execution_mode="paper",
         notional=1000.0,
         quantity=1.0,
-        hyperliquid_quantity=1.0,
-        mt5_quantity=0.1,
+        leg_a_quantity=1.0,
+        leg_b_quantity=0.1,
         open_cost=0.2,
         unrealized_pnl=2.0,
         opened_at=datetime.now(timezone.utc).replace(tzinfo=None),
@@ -1956,7 +2268,7 @@ def test_reconcile_opening_single_fill_cancels_pending_leg(monkeypatch) -> None:
 
 def test_reconcile_opening_single_fill_auto_reverses_filled_leg(monkeypatch) -> None:
     db, group = _pending_reconcile_test_db("opening")
-    db.add(SymbolMapping(symbol="OIL", hyperliquid_symbol="OIL", mt5_symbol="USOIL", single_leg_action="auto_close"))
+    db.add(SymbolMapping(symbol="OIL", leg_a_venue_symbol="OIL", mt5_symbol="USOIL", single_leg_action="auto_close"))
     db.commit()
 
     class FakeGateway:
@@ -2019,7 +2331,7 @@ def test_reconcile_closing_single_fill_cancels_pending_leg(monkeypatch) -> None:
 
 def test_reconcile_closing_single_fill_auto_reverses_and_restores_open(monkeypatch) -> None:
     db, group = _pending_reconcile_test_db("closing")
-    db.add(SymbolMapping(symbol="OIL", hyperliquid_symbol="OIL", mt5_symbol="USOIL", single_leg_action="auto_close"))
+    db.add(SymbolMapping(symbol="OIL", leg_a_venue_symbol="OIL", mt5_symbol="USOIL", single_leg_action="auto_close"))
     db.commit()
 
     class FakeGateway:
@@ -2090,7 +2402,7 @@ def test_sync_live_positions_replaces_current_rows(monkeypatch) -> None:
     Session = sessionmaker(bind=engine, future=True)
     db = Session()
     db.add(Position(platform="mt5", symbol="OLD", side="long", quantity=1, entry_price=1, mark_price=1))
-    db.add(SymbolMapping(symbol="JP225", hyperliquid_symbol="xyz:JP225", mt5_symbol="JP225"))
+    db.add(SymbolMapping(symbol="JP225", leg_a_venue_symbol="xyz:JP225", mt5_symbol="JP225"))
     db.commit()
     captured = {}
 
@@ -2132,16 +2444,16 @@ def test_reconcile_residual_positions_marks_closed_group_manual() -> None:
     Base.metadata.create_all(engine)
     Session = sessionmaker(bind=engine, future=True)
     db = Session()
-    db.add(SymbolMapping(symbol="OIL", hyperliquid_symbol="OIL", mt5_symbol="USOIL"))
+    db.add(SymbolMapping(symbol="OIL", leg_a_venue_symbol="OIL", mt5_symbol="USOIL"))
     group = HedgeGroup(
         symbol="OIL",
-        direction="long_hyperliquid_short_mt5",
+        direction="long_leg_a_short_leg_b",
         status="closed",
         execution_mode="live",
         notional=1000,
         quantity=1.0,
-        hyperliquid_quantity=1.0,
-        mt5_quantity=0.1,
+        leg_a_quantity=1.0,
+        leg_b_quantity=0.1,
         open_cost=1.0,
         fees=0.2,
         unrealized_pnl=0.0,
@@ -2193,10 +2505,10 @@ def test_hyperliquid_live_position_sync_triggers_residual_reconcile(monkeypatch)
     Base.metadata.create_all(engine)
     Session = sessionmaker(bind=engine, future=True)
     db = Session()
-    db.add(SymbolMapping(symbol="OIL", hyperliquid_symbol="OIL", mt5_symbol="USOIL"))
+    db.add(SymbolMapping(symbol="OIL", leg_a_venue_symbol="OIL", mt5_symbol="USOIL"))
     group = HedgeGroup(
         symbol="OIL",
-        direction="long_hyperliquid_short_mt5",
+        direction="long_leg_a_short_leg_b",
         status="closed",
         execution_mode="live",
         notional=1000,
@@ -2240,17 +2552,17 @@ def test_reconcile_orphan_positions_ignores_position_with_live_group() -> None:
     Base.metadata.create_all(engine)
     Session = sessionmaker(bind=engine, future=True)
     db = Session()
-    db.add(SymbolMapping(symbol="OIL", hyperliquid_symbol="OIL", mt5_symbol="USOIL"))
+    db.add(SymbolMapping(symbol="OIL", leg_a_venue_symbol="OIL", mt5_symbol="USOIL"))
     db.add(
         HedgeGroup(
             symbol="OIL",
-            direction="long_hyperliquid_short_mt5",
+            direction="long_leg_a_short_leg_b",
             status="open",
             execution_mode="live",
             notional=1000,
             quantity=1.0,
-            hyperliquid_quantity=1.0,
-            mt5_quantity=0.1,
+            leg_a_quantity=1.0,
+            leg_b_quantity=0.1,
             opened_at=datetime.now(timezone.utc).replace(tzinfo=None),
         )
     )
@@ -2269,17 +2581,17 @@ def test_reconcile_orphan_positions_requires_matching_side_and_quantity() -> Non
     Base.metadata.create_all(engine)
     Session = sessionmaker(bind=engine, future=True)
     db = Session()
-    db.add(SymbolMapping(symbol="OIL", hyperliquid_symbol="OIL", mt5_symbol="USOIL", mt5_volume_step=0.01, mt5_contract_size=100, enabled=True))
+    db.add(SymbolMapping(symbol="OIL", leg_a_venue_symbol="OIL", mt5_symbol="USOIL", mt5_volume_step=0.01, mt5_contract_size=100, enabled=True))
     db.add(
         HedgeGroup(
             symbol="OIL",
-            direction="long_hyperliquid_short_mt5",
+            direction="long_leg_a_short_leg_b",
             status="open",
             execution_mode="live",
             notional=1000,
             quantity=1,
-            hyperliquid_quantity=1.0,
-            mt5_quantity=0.1,
+            leg_a_quantity=1.0,
+            leg_b_quantity=0.1,
         )
     )
     db.add(Position(platform="mt5", symbol="USOIL", side="short", quantity=0.2, entry_price=70, mark_price=71))
@@ -2301,7 +2613,7 @@ def test_adopt_position_creates_live_manual_group() -> None:
     db = Session()
     user = User(username="admin", password_hash="x", role="admin")
     db.add(user)
-    db.add(SymbolMapping(symbol="OIL", hyperliquid_symbol="OIL", mt5_symbol="USOIL"))
+    db.add(SymbolMapping(symbol="OIL", leg_a_venue_symbol="OIL", mt5_symbol="USOIL"))
     position = Position(platform="mt5", symbol="USOIL", side="short", quantity=0.2, entry_price=76, mark_price=77, unrealized_pnl=-2.5)
     db.add(position)
     db.commit()
@@ -2313,9 +2625,9 @@ def test_adopt_position_creates_live_manual_group() -> None:
     assert group["status"] == "manual_intervention"
     assert group["execution_mode"] == "live"
     assert group["symbol"] == "OIL"
-    assert group["direction"] == "long_hyperliquid_short_mt5"
-    assert group["hyperliquid_quantity"] == 0.0
-    assert group["mt5_quantity"] == 0.2
+    assert group["direction"] == "long_leg_a_short_leg_b"
+    assert group["leg_a_quantity"] == 0.0
+    assert group["leg_b_quantity"] == 0.2
     assert db.query(HedgeGroupEvent).filter(HedgeGroupEvent.event_type == "adopted_external_position").count() == 1
     assert db.query(AuditLog).filter(AuditLog.action == "adopt_position").count() == 1
 
@@ -2327,16 +2639,16 @@ def test_close_adopted_single_leg_group_only_closes_existing_leg(monkeypatch) ->
     db = Session()
     db.add(StrategySetting(execution_mode="live"))
     db.add(SystemSetting(key="live_trading_enabled", value="true"))
-    db.add(SymbolMapping(symbol="OIL", hyperliquid_symbol="OIL", mt5_symbol="USOIL", allow_hold_through_mt5_close=True))
+    db.add(SymbolMapping(symbol="OIL", leg_a_venue_symbol="OIL", mt5_symbol="USOIL", allow_hold_through_mt5_close=True))
     group = HedgeGroup(
         symbol="OIL",
-        direction="long_hyperliquid_short_mt5",
+        direction="long_leg_a_short_leg_b",
         status="manual_intervention",
         execution_mode="live",
         notional=1000,
         quantity=0.2,
-        hyperliquid_quantity=0.0,
-        mt5_quantity=0.2,
+        leg_a_quantity=0.0,
+        leg_b_quantity=0.2,
         opened_at=datetime.now(timezone.utc).replace(tzinfo=None),
     )
     db.add(group)
@@ -2372,16 +2684,16 @@ def test_paper_close_realized_pnl_uses_actual_close_fills(monkeypatch) -> None:
     Session = sessionmaker(bind=engine, future=True)
     db = Session()
     db.add(StrategySetting(execution_mode="paper"))
-    db.add(SymbolMapping(symbol="OIL", hyperliquid_symbol="OIL", mt5_symbol="USOIL"))
+    db.add(SymbolMapping(symbol="OIL", leg_a_venue_symbol="OIL", mt5_symbol="USOIL"))
     group = HedgeGroup(
         symbol="OIL",
-        direction="long_hyperliquid_short_mt5",
+        direction="long_leg_a_short_leg_b",
         status="open",
         execution_mode="paper",
         notional=1000,
         quantity=1.0,
-        hyperliquid_quantity=1.0,
-        mt5_quantity=0.1,
+        leg_a_quantity=1.0,
+        leg_b_quantity=0.1,
         entry_spread=5.0,
         open_cost=999.0,
         fees=0.2,
@@ -2421,13 +2733,13 @@ def _pending_reconcile_test_db(status: str):
     db = Session()
     group = HedgeGroup(
         symbol="OIL",
-        direction="long_hyperliquid_short_mt5",
+        direction="long_leg_a_short_leg_b",
         status=status,
         execution_mode="live",
         notional=1000,
         quantity=1.0,
-        hyperliquid_quantity=1.0,
-        mt5_quantity=0.1,
+        leg_a_quantity=1.0,
+        leg_b_quantity=0.1,
         open_cost=1.0,
         fees=0.2,
         unrealized_pnl=5.0,
@@ -2464,7 +2776,7 @@ def _live_close_test_db(auto_close_live_enabled: bool = False, live_trading_enab
     db.add(
         SymbolMapping(
             symbol="OIL",
-            hyperliquid_symbol="OIL",
+            leg_a_venue_symbol="OIL",
             mt5_symbol="USOIL",
             allow_hold_through_mt5_close=True,
             hl_close_order_type="market",
@@ -2473,13 +2785,13 @@ def _live_close_test_db(auto_close_live_enabled: bool = False, live_trading_enab
     )
     group = HedgeGroup(
         symbol="OIL",
-        direction="long_hyperliquid_short_mt5",
+        direction="long_leg_a_short_leg_b",
         status="open",
         execution_mode="live",
         notional=1000,
         quantity=1.0,
-        hyperliquid_quantity=1.0,
-        mt5_quantity=0.1,
+        leg_a_quantity=1.0,
+        leg_b_quantity=0.1,
         open_cost=1.0,
         entry_spread=10.0,
         exit_target=2.0,
@@ -2525,7 +2837,7 @@ def test_hedge_groups_api_returns_realtime_spreads() -> None:
     db.add(
         HedgeGroup(
             symbol="OIL",
-            direction="long_hyperliquid_short_mt5",
+            direction="long_leg_a_short_leg_b",
             status="open",
             execution_mode="paper",
             notional=1000,
@@ -2557,13 +2869,13 @@ def test_hedge_groups_api_returns_runtime_unrealized_pnl() -> None:
     db.add(user)
     group = HedgeGroup(
         symbol="GROUP-PNL",
-        direction="long_hyperliquid_short_mt5",
+        direction="long_leg_a_short_leg_b",
         status="open",
         execution_mode="paper",
         notional=1000,
         quantity=1,
-        hyperliquid_quantity=2,
-        mt5_quantity=2,
+        leg_a_quantity=2,
+        leg_b_quantity=2,
         entry_spread=20,
         unrealized_pnl=0,
     )
@@ -2587,8 +2899,8 @@ def test_hedge_groups_stream_channel_returns_only_current_page() -> None:
     db = Session()
     db.add_all(
         [
-            HedgeGroup(symbol="HG1", direction="long_hyperliquid_short_mt5", status="open", execution_mode="paper", notional=100, quantity=1),
-            HedgeGroup(symbol="HG2", direction="long_hyperliquid_short_mt5", status="open", execution_mode="paper", notional=100, quantity=1),
+            HedgeGroup(symbol="HG1", direction="long_leg_a_short_leg_b", status="open", execution_mode="paper", notional=100, quantity=1),
+            HedgeGroup(symbol="HG2", direction="long_leg_a_short_leg_b", status="open", execution_mode="paper", notional=100, quantity=1),
         ]
     )
     db.commit()
@@ -2665,17 +2977,17 @@ def test_dashboard_summary_uses_runtime_unrealized_pnl() -> None:
     db.add(AccountSnapshot(platform="hyperliquid", equity=100, available_balance=90, margin_used=10, margin_ratio=10))
     group = HedgeGroup(
         symbol="DASH-PNL",
-        direction="long_hyperliquid_short_mt5",
+        direction="long_leg_a_short_leg_b",
         status="open",
         execution_mode="paper",
         notional=1000,
         quantity=1,
-        hyperliquid_quantity=2,
-        mt5_quantity=2,
+        leg_a_quantity=2,
+        leg_b_quantity=2,
         entry_spread=20,
         unrealized_pnl=0,
     )
-    closed = HedgeGroup(symbol="DASH-CLOSED", direction="long_hyperliquid_short_mt5", status="closed", execution_mode="paper", notional=100, quantity=1, realized_pnl=3)
+    closed = HedgeGroup(symbol="DASH-CLOSED", direction="long_leg_a_short_leg_b", status="closed", execution_mode="paper", notional=100, quantity=1, realized_pnl=3)
     db.add_all([group, closed])
     db.commit()
     hedge_pool.load_from_db(db)
@@ -2780,11 +3092,11 @@ def test_lead_lag_stream_channel_returns_only_report() -> None:
 def test_pipeline_pool_payload_uses_stable_stage_symbol_id_order() -> None:
     now = datetime.now(timezone.utc).replace(tzinfo=None)
     groups = [
-        HedgeGroup(id=5, symbol="ZINC", direction="long_mt5_short_hyperliquid", status="manual_intervention", execution_mode="paper", notional=1, quantity=1),
-        HedgeGroup(id=3, symbol="OIL", direction="long_mt5_short_hyperliquid", status="open", execution_mode="paper", notional=1, quantity=1),
-        HedgeGroup(id=2, symbol="EUR", direction="long_mt5_short_hyperliquid", status="opening", execution_mode="paper", notional=1, quantity=1),
-        HedgeGroup(id=1, symbol="BTC", direction="long_mt5_short_hyperliquid", status="pending_open", execution_mode="paper", notional=1, quantity=1),
-        HedgeGroup(id=4, symbol="BTC", direction="long_mt5_short_hyperliquid", status="closing", execution_mode="paper", notional=1, quantity=1),
+        HedgeGroup(id=5, symbol="ZINC", direction="long_leg_b_short_leg_a", status="manual_intervention", execution_mode="paper", notional=1, quantity=1),
+        HedgeGroup(id=3, symbol="OIL", direction="long_leg_b_short_leg_a", status="open", execution_mode="paper", notional=1, quantity=1),
+        HedgeGroup(id=2, symbol="EUR", direction="long_leg_b_short_leg_a", status="opening", execution_mode="paper", notional=1, quantity=1),
+        HedgeGroup(id=1, symbol="BTC", direction="long_leg_b_short_leg_a", status="pending_open", execution_mode="paper", notional=1, quantity=1),
+        HedgeGroup(id=4, symbol="BTC", direction="long_leg_b_short_leg_a", status="closing", execution_mode="paper", notional=1, quantity=1),
     ]
 
     items = _pool_payload(groups, now)["items"]
@@ -2803,13 +3115,13 @@ def test_pipeline_pool_payload_calculates_runtime_unrealized_pnl() -> None:
     group = HedgeGroup(
         id=9,
         symbol="POOL-PNL",
-        direction="long_hyperliquid_short_mt5",
+        direction="long_leg_a_short_leg_b",
         status="open",
         execution_mode="paper",
         notional=1000,
         quantity=1,
-        hyperliquid_quantity=2,
-        mt5_quantity=2,
+        leg_a_quantity=2,
+        leg_b_quantity=2,
         entry_spread=20,
         unrealized_pnl=0,
     )
@@ -2827,13 +3139,13 @@ def test_pipeline_pool_payload_accepts_hedge_group_snapshot() -> None:
     snapshot = HedgeGroupSnapshot(
         id=10,
         symbol="POOL-SNAPSHOT",
-        direction="long_hyperliquid_short_mt5",
+        direction="long_leg_a_short_leg_b",
         status="open",
         execution_mode="paper",
         notional=1000,
         quantity=1,
-        mt5_quantity=1,
-        hyperliquid_quantity=1,
+        leg_b_quantity=1,
+        leg_a_quantity=1,
         open_cost=0,
         fees=0,
         funding=0,
@@ -2887,23 +3199,23 @@ def test_spread_and_opportunity_apis_prefer_memory_scan_state() -> None:
     Base.metadata.create_all(engine)
     Session = sessionmaker(bind=engine, future=True)
     db = Session()
-    db.add(SymbolMapping(symbol="BTC", hyperliquid_symbol="BTC", mt5_symbol="BTCUSD", enabled=True))
-    db.add(SymbolMapping(symbol="ETH", hyperliquid_symbol="ETH", mt5_symbol="ETHUSD", enabled=True))
+    db.add(SymbolMapping(symbol="BTC", leg_a_venue_symbol="BTC", mt5_symbol="BTCUSD", enabled=True))
+    db.add(SymbolMapping(symbol="ETH", leg_a_venue_symbol="ETH", mt5_symbol="ETHUSD", enabled=True))
     db.commit()
     scan_state_store.update(
         [
             {
                 "id": 10,
                 "symbol": "BTC",
-                "direction": "long_mt5_short_hyperliquid",
-                "hyperliquid_bid": 100.0,
+                "direction": "long_leg_b_short_leg_a",
+                "leg_a_bid": 100.0,
             }
         ],
         [
             {
                 "id": 20,
                 "symbol": "ETH",
-                "direction": "long_hyperliquid_short_mt5",
+                "direction": "long_leg_a_short_leg_b",
                 "status": "candidate",
                 "created_at": datetime.now(timezone.utc).replace(tzinfo=None),
             }
@@ -2942,11 +3254,11 @@ def test_delete_symbol_mapping_clears_current_scan_state() -> None:
     Base.metadata.create_all(engine)
     Session = sessionmaker(bind=engine, future=True)
     db = Session()
-    mapping = SymbolMapping(symbol="BTC", hyperliquid_symbol="BTC", mt5_symbol="BTCUSD", enabled=True)
+    mapping = SymbolMapping(symbol="BTC", leg_a_venue_symbol="BTC", mt5_symbol="BTCUSD", enabled=True)
     db.add(mapping)
     db.flush()
-    db.add(SpreadCurrent(symbol="BTC", direction="none", hyperliquid_bid=1, hyperliquid_ask=1, mt5_bid=1, mt5_ask=1, quantity=1, gross_spread=0, unit_cost=0, unit_net_profit=0, total_cost=0, net_profit=0, annualized_return=0, status="rejected"))
-    db.add(ArbitrageOpportunity(symbol="BTC", direction="long_mt5_short_hyperliquid", notional=1, quantity=1, gross_spread=1, total_cost=0, net_profit=1, annualized_return=1, status="candidate"))
+    db.add(SpreadCurrent(symbol="BTC", direction="none", leg_a_bid=1, leg_a_ask=1, leg_b_bid=1, leg_b_ask=1, quantity=1, gross_spread=0, unit_cost=0, unit_net_profit=0, total_cost=0, net_profit=0, annualized_return=0, status="rejected"))
+    db.add(ArbitrageOpportunity(symbol="BTC", direction="long_leg_b_short_leg_a", notional=1, quantity=1, gross_spread=1, total_cost=0, net_profit=1, annualized_return=1, status="candidate"))
     db.commit()
     scan_state_store.update([{"symbol": "BTC"}], [{"symbol": "BTC", "status": "candidate"}])
 
@@ -2994,7 +3306,7 @@ def test_spread_analytics_uses_raw_snapshots_through_4h() -> None:
         db.add(
             SpreadBucket(
                 symbol="BTC",
-                direction="long_mt5_short_hyperliquid",
+                direction="long_leg_b_short_leg_a",
                 bucket_start=now - timedelta(minutes=10),
                 bucket_seconds=5,
                 open_spread=100,
@@ -3010,11 +3322,11 @@ def test_spread_analytics_uses_raw_snapshots_through_4h() -> None:
         db.add(
             SpreadSnapshot(
                 symbol="BTC",
-                direction="long_mt5_short_hyperliquid",
-                hyperliquid_bid=1,
-                hyperliquid_ask=1,
-                mt5_bid=1,
-                mt5_ask=1,
+                direction="long_leg_b_short_leg_a",
+                leg_a_bid=1,
+                leg_a_ask=1,
+                leg_b_bid=1,
+                leg_b_ask=1,
                 gross_spread=200,
                 unit_cost=20,
                 unit_net_profit=180,
@@ -3027,7 +3339,7 @@ def test_spread_analytics_uses_raw_snapshots_through_4h() -> None:
         )
         db.commit()
 
-        points = load_spread_points(db, "BTC", "long_mt5_short_hyperliquid", "4h")
+        points = load_spread_points(db, "BTC", "long_leg_b_short_leg_a", "4h")
 
     assert [point.spread for point in points] == [200]
 
@@ -3043,7 +3355,7 @@ def test_spread_analytics_uses_buckets_for_24h_and_7d() -> None:
         db.add(
             SpreadBucket(
                 symbol="BTC",
-                direction="long_mt5_short_hyperliquid",
+                direction="long_leg_b_short_leg_a",
                 bucket_start=now - timedelta(hours=6),
                 bucket_seconds=5,
                 open_spread=100,
@@ -3059,11 +3371,11 @@ def test_spread_analytics_uses_buckets_for_24h_and_7d() -> None:
         db.add(
             SpreadSnapshot(
                 symbol="BTC",
-                direction="long_mt5_short_hyperliquid",
-                hyperliquid_bid=1,
-                hyperliquid_ask=1,
-                mt5_bid=1,
-                mt5_ask=1,
+                direction="long_leg_b_short_leg_a",
+                leg_a_bid=1,
+                leg_a_ask=1,
+                leg_b_bid=1,
+                leg_b_ask=1,
                 gross_spread=200,
                 unit_cost=20,
                 unit_net_profit=180,
@@ -3076,14 +3388,14 @@ def test_spread_analytics_uses_buckets_for_24h_and_7d() -> None:
         )
         db.commit()
 
-        points = load_spread_points(db, "BTC", "long_mt5_short_hyperliquid", "7d")
+        points = load_spread_points(db, "BTC", "long_leg_b_short_leg_a", "7d")
 
     assert [point.spread for point in points] == [100]
 
 
 def test_direction_spreads_separate_entry_close_and_mid() -> None:
-    long_hl = spreads_for_direction("long_hyperliquid_short_mt5", hl_bid=99, hl_ask=101, mt5_bid=110, mt5_ask=111)
-    long_mt5 = spreads_for_direction("long_mt5_short_hyperliquid", hl_bid=99, hl_ask=101, mt5_bid=110, mt5_ask=111)
+    long_hl = spreads_for_direction("long_leg_a_short_leg_b", leg_a_bid=99, leg_a_ask=101, leg_b_bid=110, leg_b_ask=111)
+    long_mt5 = spreads_for_direction("long_leg_b_short_leg_a", leg_a_bid=99, leg_a_ask=101, leg_b_bid=110, leg_b_ask=111)
 
     assert long_hl.entry_spread == 9
     assert long_hl.close_spread == 12
@@ -3105,11 +3417,11 @@ def test_load_spread_points_supports_close_and_mid_basis() -> None:
         db.add(
             SpreadSnapshot(
                 symbol="BTC",
-                direction="long_mt5_short_hyperliquid",
-                hyperliquid_bid=99,
-                hyperliquid_ask=101,
-                mt5_bid=110,
-                mt5_ask=111,
+                direction="long_leg_b_short_leg_a",
+                leg_a_bid=99,
+                leg_a_ask=101,
+                leg_b_bid=110,
+                leg_b_ask=111,
                 gross_spread=9,
                 entry_spread=9,
                 close_spread=12,
@@ -3124,9 +3436,9 @@ def test_load_spread_points_supports_close_and_mid_basis() -> None:
         )
         db.commit()
 
-        entry = load_spread_points(db, "BTC", "long_mt5_short_hyperliquid", "1h", basis="entry")
-        close = load_spread_points(db, "BTC", "long_mt5_short_hyperliquid", "1h", basis="close")
-        mid = load_spread_points(db, "BTC", "long_mt5_short_hyperliquid", "1h", basis="mid")
+        entry = load_spread_points(db, "BTC", "long_leg_b_short_leg_a", "1h", basis="entry")
+        close = load_spread_points(db, "BTC", "long_leg_b_short_leg_a", "1h", basis="close")
+        mid = load_spread_points(db, "BTC", "long_leg_b_short_leg_a", "1h", basis="mid")
 
     assert [point.spread for point in entry] == [9]
     assert [point.spread for point in close] == [12]
@@ -3155,7 +3467,7 @@ def test_statistical_exit_target_uses_close_spread_distribution() -> None:
             db.add(
                 SpreadBucket(
                     symbol="JP225",
-                    direction="long_hyperliquid_short_mt5",
+                    direction="long_leg_a_short_leg_b",
                     bucket_start=now - timedelta(seconds=30 - index),
                     bucket_seconds=1,
                     open_spread=100 + index,
@@ -3172,14 +3484,14 @@ def test_statistical_exit_target_uses_close_spread_distribution() -> None:
             )
         db.commit()
 
-        signal = evaluate_entry_signal(db, strategy, "JP225", "long_hyperliquid_short_mt5", 126, 0, 126, 1, 1)
+        signal = evaluate_entry_signal(db, strategy, "JP225", "long_leg_a_short_leg_b", 126, 0, 126, 1, 1)
 
     assert signal.reachable_entry > 100
     assert signal.exit_target < 30
 
 
 def test_symbol_spread_limits_tighten_statistical_thresholds() -> None:
-    mapping = SymbolMapping(symbol="JP225", hyperliquid_symbol="xyz:JP225", mt5_symbol="JP225", min_entry_spread=150, max_close_spread=12)
+    mapping = SymbolMapping(symbol="JP225", leg_a_venue_symbol="xyz:JP225", mt5_symbol="JP225", min_entry_spread=150, max_close_spread=12)
 
     assert scanner_module._effective_entry_threshold(mapping, 120) == 150
     assert scanner_module._effective_entry_threshold(mapping, 180) == 180
@@ -3188,7 +3500,7 @@ def test_symbol_spread_limits_tighten_statistical_thresholds() -> None:
 
 
 def test_symbol_negative_close_spread_limit_tightens_exit_target() -> None:
-    mapping = SymbolMapping(symbol="SPCX", hyperliquid_symbol="xyz:SPCX", mt5_symbol="SPCX", max_close_spread=-0.11)
+    mapping = SymbolMapping(symbol="SPCX", leg_a_venue_symbol="xyz:SPCX", mt5_symbol="SPCX", max_close_spread=-0.11)
 
     assert scanner_module._effective_exit_target(mapping, 0.047) == pytest.approx(-0.11)
     assert scanner_module._effective_exit_target(mapping, 0) == pytest.approx(-0.11)
@@ -3211,13 +3523,13 @@ def test_auto_close_fallback_uses_symbol_max_close_spread_without_samples(monkey
     now = datetime.now(timezone.utc).replace(tzinfo=None)
     with Session() as db:
         strategy = StrategySetting(statistical_min_samples=20, auto_close_min_profit=0)
-        mapping = SymbolMapping(symbol="JP225", hyperliquid_symbol="xyz:JP225", mt5_symbol="JP225", max_close_spread=10)
+        mapping = SymbolMapping(symbol="JP225", leg_a_venue_symbol="xyz:JP225", mt5_symbol="JP225", max_close_spread=10)
         group = HedgeGroup(
             symbol="JP225",
-            direction="long_hyperliquid_short_mt5",
+            direction="long_leg_a_short_leg_b",
             notional=1000,
             quantity=1,
-            hyperliquid_quantity=1,
+            leg_a_quantity=1,
             entry_spread=100,
             entry_threshold=100,
             exit_target=0,
@@ -3229,8 +3541,8 @@ def test_auto_close_fallback_uses_symbol_max_close_spread_without_samples(monkey
         db.add_all([strategy, mapping, group])
         db.commit()
         synced = SimpleNamespace(
-            hyperliquid=SimpleNamespace(bid=110, ask=111),
-            mt5=SimpleNamespace(bid=100, ask=101),
+            leg_a=SimpleNamespace(bid=110, ask=111),
+            leg_b=SimpleNamespace(bid=100, ask=101),
         )
         monkeypatch.setattr("app.execution.auto_closer.quote_synchronizer.synchronized", lambda *args, **kwargs: (synced, ""))
 
@@ -3246,16 +3558,16 @@ def test_auto_close_final_check_uses_current_symbol_max_close_spread(monkeypatch
     Session = sessionmaker(bind=engine, future=True)
     with Session() as db:
         strategy = StrategySetting(auto_close_min_profit=0)
-        mapping = SymbolMapping(symbol="SPCX", hyperliquid_symbol="xyz:SPCX", mt5_symbol="SPCX", max_close_spread=-0.11)
+        mapping = SymbolMapping(symbol="SPCX", leg_a_venue_symbol="xyz:SPCX", mt5_symbol="SPCX", max_close_spread=-0.11)
         group = HedgeGroup(
             symbol="SPCX",
-            direction="long_mt5_short_hyperliquid",
+            direction="long_leg_b_short_leg_a",
             status="open",
             execution_mode="paper",
             notional=2000,
             quantity=0.13,
-            mt5_quantity=0.13,
-            hyperliquid_quantity=13,
+            leg_b_quantity=0.13,
+            leg_a_quantity=13,
             entry_spread=0.14,
             exit_target=0.047,
             fees=0.18,
@@ -3264,8 +3576,8 @@ def test_auto_close_final_check_uses_current_symbol_max_close_spread(monkeypatch
         db.add_all([strategy, mapping, group])
         db.commit()
         synced = SimpleNamespace(
-            hyperliquid=SimpleNamespace(bid=157.58, ask=157.59, local_recv_ts=datetime.now(timezone.utc).replace(tzinfo=None)),
-            mt5=SimpleNamespace(bid=157.59, ask=157.65, local_recv_ts=datetime.now(timezone.utc).replace(tzinfo=None)),
+            leg_a=SimpleNamespace(bid=157.58, ask=157.59, local_recv_ts=datetime.now(timezone.utc).replace(tzinfo=None)),
+            leg_b=SimpleNamespace(bid=157.59, ask=157.65, local_recv_ts=datetime.now(timezone.utc).replace(tzinfo=None)),
             time_diff_ms=0,
         )
         monkeypatch.setattr("app.execution.engine.quote_synchronizer.synchronized", lambda *args, **kwargs: (synced, ""))
@@ -3283,18 +3595,18 @@ def test_scanner_records_two_direction_current_rows(monkeypatch) -> None:
     Session = sessionmaker(bind=engine, future=True)
     db = Session()
     db.add(StrategySetting(signal_mode="fixed_profit", min_net_profit=-999, min_annualized_return=-999, default_notional=1000))
-    db.add(SymbolMapping(symbol="DUAL", hyperliquid_symbol="DUAL", mt5_symbol="DUAL", mt5_min_lot=1, mt5_volume_step=1, mt5_contract_size=1, enabled=True))
+    db.add(SymbolMapping(symbol="DUAL", leg_a_venue_symbol="DUAL", mt5_symbol="DUAL", mt5_min_lot=1, mt5_volume_step=1, mt5_contract_size=1, enabled=True))
     db.commit()
     quote_cache.put("hyperliquid", "DUAL", bid=99, ask=101, depth_notional=100000, source="test")
     quote_cache.put("mt5", "DUAL", bid=110, ask=111, depth_notional=100000, source="test")
     synced = SimpleNamespace(
-        hyperliquid=SimpleNamespace(bid=99, ask=101, mid=100, depth_notional=100000, local_recv_ts=datetime.now(timezone.utc).replace(tzinfo=None)),
-        mt5=SimpleNamespace(bid=110, ask=111, mid=110.5, depth_notional=100000, local_recv_ts=datetime.now(timezone.utc).replace(tzinfo=None)),
+        leg_a=SimpleNamespace(bid=99, ask=101, mid=100, depth_notional=100000, local_recv_ts=datetime.now(timezone.utc).replace(tzinfo=None)),
+        leg_b=SimpleNamespace(bid=110, ask=111, mid=110.5, depth_notional=100000, local_recv_ts=datetime.now(timezone.utc).replace(tzinfo=None)),
         time_diff_ms=0,
     )
     monkeypatch.setattr(scanner_module.quote_synchronizer, "synchronized", lambda *args, **kwargs: (synced, ""))
     monkeypatch.setattr(scanner_module, "mt5_session_state", lambda mapping: MT5SessionState(mapping.symbol, "normal_trade", "", True, True, True, True, True))
-    monkeypatch.setattr(scanner_module, "hyperliquid_cost_inputs", lambda symbol: SimpleNamespace(source="test", maker_fee_rate=0, taker_fee_rate=0, funding_rate=0))
+    monkeypatch.setattr(scanner_module, "leg_a_cost_inputs", lambda symbol: SimpleNamespace(source="test", maker_fee_rate=0, taker_fee_rate=0, funding_rate=0))
     monkeypatch.setattr(scanner_module, "mt5_cost_inputs", lambda *args, **kwargs: SimpleNamespace(source="test", commission_rate=0, swap_cost=0))
     monkeypatch.setattr(scanner_module.mt5_tradability_cache, "is_fresh_allowed", lambda *args, **kwargs: (True, "ok"))
 
@@ -3303,20 +3615,20 @@ def test_scanner_records_two_direction_current_rows(monkeypatch) -> None:
     scanner_module.run_scan(db)
     state = scan_state_store.snapshot()
     assert state["ready"] is True
-    assert {row["direction"] for row in state["direction_spreads"] if row["symbol"] == "DUAL"} == {"long_hyperliquid_short_mt5", "long_mt5_short_hyperliquid"}
+    assert {row["direction"] for row in state["direction_spreads"] if row["symbol"] == "DUAL"} == {"long_leg_a_short_leg_b", "long_leg_b_short_leg_a"}
     scanner_module.persist_scan_state(db)
     rows = db.query(SpreadDirectionCurrent).filter(SpreadDirectionCurrent.symbol == "DUAL").all()
     current = db.query(SpreadCurrent).filter(SpreadCurrent.symbol == "DUAL").one()
     opportunity = db.query(ArbitrageOpportunity).filter(ArbitrageOpportunity.symbol == "DUAL", ArbitrageOpportunity.status == "executable").first()
 
-    assert {row.direction for row in rows} == {"long_hyperliquid_short_mt5", "long_mt5_short_hyperliquid"}
+    assert {row.direction for row in rows} == {"long_leg_a_short_leg_b", "long_leg_b_short_leg_a"}
     assert current.entry_spread == current.gross_spread
     assert current.close_spread != current.entry_spread
     assert opportunity is not None
-    assert opportunity.trigger_hyperliquid_bid == 99
-    assert opportunity.trigger_hyperliquid_ask == 101
-    assert opportunity.trigger_mt5_bid == 110
-    assert opportunity.trigger_mt5_ask == 111
+    assert opportunity.trigger_leg_a_bid == 99
+    assert opportunity.trigger_leg_a_ask == 101
+    assert opportunity.trigger_leg_b_bid == 110
+    assert opportunity.trigger_leg_b_ask == 111
 
 
 def test_funding_day_bucket_and_positive_bias() -> None:
@@ -3332,6 +3644,77 @@ def test_funding_day_bucket_and_positive_bias() -> None:
     assert summary["negative_count"] == 2
     assert buckets[0]["sum_funding_rate"] == pytest.approx(0.00005)
     assert buckets[0]["count"] == 8
+
+
+def test_funding_history_uses_hyperliquid_leg_when_not_leg_a(monkeypatch) -> None:
+    engine = create_engine("sqlite:///:memory:", future=True)
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine, future=True)
+    captured = {}
+
+    def fake_fetch(coin, start_ms, end_ms):
+        captured["coin"] = coin
+        return [FundingPoint(time=datetime(2026, 1, 1), funding_rate=0.0001)]
+
+    monkeypatch.setattr("app.analytics.funding.fetch_funding_history", fake_fetch)
+    with Session() as db:
+        db.add(SymbolMapping(symbol="REV", leg_a_venue_symbol="XAUUSD", mt5_symbol="XAUUSD", leg_a_venue="mt5", leg_a_symbol="XAUUSD", leg_b_venue="hyperliquid", leg_b_symbol="xyz:XAU"))
+        db.commit()
+
+        data = funding_history(db, "REV", "24h", "raw")
+
+    assert captured["coin"] == "xyz:XAU"
+    assert data["funding_venue"] == "hyperliquid"
+    assert data["funding_leg"] == "b"
+    assert data["supported"] is True
+    assert data["summary"]["latest_funding_rate"] == pytest.approx(0.0001)
+
+
+def test_funding_history_marks_non_hyperliquid_pair_unsupported(monkeypatch) -> None:
+    engine = create_engine("sqlite:///:memory:", future=True)
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine, future=True)
+
+    def fail_fetch(*args, **kwargs):
+        raise AssertionError("should not fetch Hyperliquid funding for non-Hyperliquid mapping")
+
+    monkeypatch.setattr("app.analytics.funding.fetch_funding_history", fail_fetch)
+    with Session() as db:
+        db.add(SymbolMapping(symbol="OKBY", leg_a_venue_symbol="BTC-USDT-SWAP", mt5_symbol="BTCUSDT", leg_a_venue="okx", leg_a_symbol="BTC-USDT-SWAP", leg_b_venue="bybit", leg_b_symbol="BTCUSDT"))
+        db.commit()
+
+        data = funding_history(db, "OKBY", "24h", "raw")
+
+    assert data["supported"] is False
+    assert data["funding_venue"] == ""
+    assert data["items"] == []
+    assert "没有已支持 funding" in data["source_error"]
+
+
+def test_funding_history_uses_binance_funding_via_nautilus(monkeypatch) -> None:
+    engine = create_engine("sqlite:///:memory:", future=True)
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine, future=True)
+    captured = {}
+
+    def fake_fetch(credential, symbol, start_ms, end_ms):
+        captured["venue"] = credential.venue
+        captured["symbol"] = symbol
+        return [FundingPoint(time=datetime(2026, 1, 1), funding_rate=-0.0002)]
+
+    monkeypatch.setattr("app.analytics.funding.fetch_binance_funding_history", fake_fetch)
+    with Session() as db:
+        db.add(ExchangeCredential(venue="binance", display_name="Binance", environment="test", enabled=True, read_only=True))
+        db.add(SymbolMapping(symbol="GOLD", leg_a_venue_symbol="XAUUSDT", mt5_symbol="XAUUSD", leg_a_venue="binance", leg_a_symbol="XAUUSDT", leg_b_venue="mt5", leg_b_symbol="XAUUSD"))
+        db.commit()
+
+        data = funding_history(db, "GOLD", "24h", "raw")
+
+    assert captured == {"venue": "binance", "symbol": "XAUUSDT"}
+    assert data["funding_venue"] == "binance"
+    assert data["funding_leg"] == "a"
+    assert data["supported"] is True
+    assert data["summary"]["latest_funding_rate"] == pytest.approx(-0.0002)
 
 
 def test_statistical_signal_uses_reachable_entry() -> None:
@@ -3357,7 +3740,7 @@ def test_statistical_signal_uses_reachable_entry() -> None:
             db.add(
                 SpreadBucket(
                     symbol="JP225",
-                    direction="long_hyperliquid_short_mt5",
+                    direction="long_leg_a_short_leg_b",
                     bucket_start=now + timedelta(seconds=index),
                     bucket_seconds=5,
                     open_spread=spread,
@@ -3371,7 +3754,7 @@ def test_statistical_signal_uses_reachable_entry() -> None:
                 )
             )
         db.commit()
-        signal = evaluate_entry_signal(db, strategy, "JP225", "long_hyperliquid_short_mt5", 126, 20, 106, 1, 1)
+        signal = evaluate_entry_signal(db, strategy, "JP225", "long_leg_a_short_leg_b", 126, 20, 106, 1, 1)
         assert signal.result.status == "executable"
         assert signal.reachable_entry > 0
 
@@ -3392,7 +3775,7 @@ def test_overheat_marks_risk_without_blocking_executable_entry() -> None:
             min_total_profit=0.5,
         )
         db.add(strategy)
-        db.add(SymbolMapping(symbol="JP225", hyperliquid_symbol="xyz:JP225", mt5_symbol="JP225", min_entry_spread=200))
+        db.add(SymbolMapping(symbol="JP225", leg_a_venue_symbol="xyz:JP225", mt5_symbol="JP225", min_entry_spread=200))
         from app.db.models import SpreadBucket
 
         for index in range(30):
@@ -3400,7 +3783,7 @@ def test_overheat_marks_risk_without_blocking_executable_entry() -> None:
             db.add(
                 SpreadBucket(
                     symbol="JP225",
-                    direction="long_hyperliquid_short_mt5",
+                    direction="long_leg_a_short_leg_b",
                     bucket_start=now + timedelta(seconds=index),
                     bucket_seconds=5,
                     open_spread=spread,
@@ -3415,7 +3798,7 @@ def test_overheat_marks_risk_without_blocking_executable_entry() -> None:
             )
         db.commit()
 
-        signal = evaluate_entry_signal(db, strategy, "JP225", "long_hyperliquid_short_mt5", 263.1, 20, 243.1, 9.14, 1)
+        signal = evaluate_entry_signal(db, strategy, "JP225", "long_leg_a_short_leg_b", 263.1, 20, 243.1, 9.14, 1)
 
     mapping = SimpleNamespace(min_entry_spread=200)
     assert scanner_module._effective_entry_threshold(mapping, signal.reachable_entry) == 200
@@ -3452,7 +3835,7 @@ def test_statistical_signal_blocks_entry_when_samples_are_insufficient() -> None
             db.add(
                 SpreadBucket(
                     symbol="OIL",
-                    direction="long_hyperliquid_short_mt5",
+                    direction="long_leg_a_short_leg_b",
                     bucket_start=now + timedelta(seconds=index),
                     bucket_seconds=5,
                     open_spread=0.8,
@@ -3467,7 +3850,7 @@ def test_statistical_signal_blocks_entry_when_samples_are_insufficient() -> None
             )
         db.commit()
 
-        signal = evaluate_entry_signal(db, strategy, "OIL", "long_hyperliquid_short_mt5", 0.8, 0.02, 0.78, 50, 1)
+        signal = evaluate_entry_signal(db, strategy, "OIL", "long_leg_a_short_leg_b", 0.8, 0.02, 0.78, 50, 1)
 
         assert signal.result.status == "candidate"
         assert "统计样本不足" in signal.result.reason
@@ -3497,8 +3880,8 @@ def test_statistical_signal_reuses_stats_cache(monkeypatch) -> None:
     statistical_signal_module.clear_signal_stats_cache()
     monkeypatch.setattr(statistical_signal_module, "load_spread_points", fake_load_points)
     try:
-        first = evaluate_entry_signal(db, strategy, "JP225", "long_hyperliquid_short_mt5", 126, 20, 106, 1, 1)
-        second = evaluate_entry_signal(db, strategy, "JP225", "long_hyperliquid_short_mt5", 127, 20, 107, 1, 1)
+        first = evaluate_entry_signal(db, strategy, "JP225", "long_leg_a_short_leg_b", 126, 20, 106, 1, 1)
+        second = evaluate_entry_signal(db, strategy, "JP225", "long_leg_a_short_leg_b", 127, 20, 107, 1, 1)
     finally:
         statistical_signal_module.clear_signal_stats_cache()
 
@@ -3520,7 +3903,7 @@ def test_statistical_signal_reads_background_refreshed_stats(monkeypatch) -> Non
         min_total_profit=0,
     )
     db.add(strategy)
-    db.add(SymbolMapping(symbol="JP225", hyperliquid_symbol="xyz:JP225", mt5_symbol="JP225", enabled=True))
+    db.add(SymbolMapping(symbol="JP225", leg_a_venue_symbol="xyz:JP225", mt5_symbol="JP225", enabled=True))
     db.commit()
     points = [SpreadPoint(datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(seconds=index), 100 + index, 20, 80 + index) for index in range(30)]
     calls = {"count": 0}
@@ -3538,7 +3921,7 @@ def test_statistical_signal_reads_background_refreshed_stats(monkeypatch) -> Non
             "load_spread_points",
             lambda *args, **kwargs: pytest.fail("扫描热路径不应重新读取历史样本"),
         )
-        signal = evaluate_entry_signal(db, strategy, "JP225", "long_hyperliquid_short_mt5", 126, 20, 106, 1, 1)
+        signal = evaluate_entry_signal(db, strategy, "JP225", "long_leg_a_short_leg_b", 126, 20, 106, 1, 1)
     finally:
         statistical_signal_module.clear_signal_stats_cache()
 
@@ -3569,7 +3952,7 @@ def test_statistical_exit_target_uses_low_percentile_and_profit_buffer() -> None
             db.add(
                 SpreadBucket(
                     symbol="JP225",
-                    direction="long_hyperliquid_short_mt5",
+                    direction="long_leg_a_short_leg_b",
                     bucket_start=now + timedelta(seconds=index),
                     bucket_seconds=5,
                     open_spread=spread,
@@ -3583,7 +3966,7 @@ def test_statistical_exit_target_uses_low_percentile_and_profit_buffer() -> None
                 )
             )
         db.commit()
-        signal = evaluate_entry_signal(db, strategy, "JP225", "long_hyperliquid_short_mt5", 360, 70, 290, 10, 1)
+        signal = evaluate_entry_signal(db, strategy, "JP225", "long_leg_a_short_leg_b", 360, 70, 290, 10, 1)
         assert signal.exit_target == pytest.approx(152.5)
         assert signal.exit_target <= 360 - signal.cost_guard - strategy.auto_close_unit_profit_buffer
 
@@ -3611,7 +3994,7 @@ def test_statistical_exit_target_rejects_oversized_unit_buffer() -> None:
             db.add(
                 SpreadBucket(
                     symbol="OIL",
-                    direction="long_mt5_short_hyperliquid",
+                    direction="long_leg_b_short_leg_a",
                     bucket_start=now + timedelta(seconds=index),
                     bucket_seconds=5,
                     open_spread=spread,
@@ -3625,7 +4008,7 @@ def test_statistical_exit_target_rejects_oversized_unit_buffer() -> None:
                 )
             )
         db.commit()
-        signal = evaluate_entry_signal(db, strategy, "OIL", "long_mt5_short_hyperliquid", 0.115, 0.03, 0.085, 0.85, 1)
+        signal = evaluate_entry_signal(db, strategy, "OIL", "long_leg_b_short_leg_a", 0.115, 0.03, 0.085, 0.85, 1)
         assert signal.exit_target == 0.0
 
 
@@ -3636,16 +4019,16 @@ def test_auto_close_uses_saved_exit_target() -> None:
     with Session() as db:
         strategy = StrategySetting(auto_close_enabled=True, auto_close_min_profit=0.0)
         db.add(strategy)
-        db.add(SymbolMapping(symbol="JP225", hyperliquid_symbol="xyz:JP225", mt5_symbol="JP225"))
+        db.add(SymbolMapping(symbol="JP225", leg_a_venue_symbol="xyz:JP225", mt5_symbol="JP225"))
         group = HedgeGroup(
             symbol="JP225",
-            direction="long_hyperliquid_short_mt5",
+            direction="long_leg_a_short_leg_b",
             status="open",
             execution_mode="paper",
             notional=500,
             quantity=1,
-            mt5_quantity=1,
-            hyperliquid_quantity=1,
+            leg_b_quantity=1,
+            leg_a_quantity=1,
             open_cost=10,
             entry_spread=250,
             exit_target=170,
@@ -3670,13 +4053,13 @@ def test_auto_close_allows_zero_axis_close_without_exit_target() -> None:
         db.add(strategy)
         group = HedgeGroup(
             symbol="OIL-ZERO",
-            direction="long_hyperliquid_short_mt5",
+            direction="long_leg_a_short_leg_b",
             status="open",
             execution_mode="paper",
             notional=5000,
             quantity=0.07,
-            mt5_quantity=0.07,
-            hyperliquid_quantity=70,
+            leg_b_quantity=0.07,
+            leg_a_quantity=70,
             entry_spread=0.847,
             exit_target=0.0,
             fees=0.45,
@@ -3703,13 +4086,13 @@ def test_auto_close_zero_axis_still_requires_min_profit() -> None:
         db.add(strategy)
         group = HedgeGroup(
             symbol="OIL-ZERO-MIN",
-            direction="long_hyperliquid_short_mt5",
+            direction="long_leg_a_short_leg_b",
             status="open",
             execution_mode="paper",
             notional=5000,
             quantity=0.07,
-            mt5_quantity=0.07,
-            hyperliquid_quantity=70,
+            leg_b_quantity=0.07,
+            leg_a_quantity=70,
             entry_spread=0.847,
             exit_target=0.0,
             fees=0.45,
@@ -3729,16 +4112,16 @@ def test_auto_close_zero_axis_still_requires_min_profit() -> None:
 def test_paper_hyperliquid_funding_cost_uses_actual_rates(monkeypatch) -> None:
     group = HedgeGroup(
         symbol="JP225",
-        direction="long_hyperliquid_short_mt5",
+        direction="long_leg_a_short_leg_b",
         status="open",
         execution_mode="paper",
         notional=1000,
         quantity=1,
-        mt5_quantity=1,
-        hyperliquid_quantity=1,
+        leg_b_quantity=1,
+        leg_a_quantity=1,
         opened_at=datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(hours=2),
     )
-    mapping = SymbolMapping(symbol="JP225", hyperliquid_symbol="xyz:JP225", mt5_symbol="JP225")
+    mapping = SymbolMapping(symbol="JP225", leg_a_venue_symbol="xyz:JP225", mt5_symbol="JP225")
 
     monkeypatch.setattr(
         "app.execution.carry_costs._post_hyperliquid_info",
@@ -3746,7 +4129,7 @@ def test_paper_hyperliquid_funding_cost_uses_actual_rates(monkeypatch) -> None:
     )
 
     assert round(_paper_hyperliquid_funding_cost(group, mapping), 8) == 0.05
-    group.direction = "long_mt5_short_hyperliquid"
+    group.direction = "long_leg_b_short_leg_a"
     assert round(_paper_hyperliquid_funding_cost(group, mapping), 8) == -0.05
 
 
@@ -3757,18 +4140,18 @@ def test_mt5_swap_cost_uses_position_swap_sign(monkeypatch) -> None:
     db = Session()
     group = HedgeGroup(
         symbol="OIL",
-        direction="long_hyperliquid_short_mt5",
+        direction="long_leg_a_short_leg_b",
         status="open",
         execution_mode="paper",
         notional=1000,
         quantity=1,
-        mt5_quantity=0.5,
-        hyperliquid_quantity=1,
+        leg_b_quantity=0.5,
+        leg_a_quantity=1,
         opened_at=datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=1),
     )
     db.add(group)
     db.commit()
-    mapping = SymbolMapping(symbol="OIL", hyperliquid_symbol="OIL", mt5_symbol="USOIL")
+    mapping = SymbolMapping(symbol="OIL", leg_a_venue_symbol="OIL", mt5_symbol="USOIL")
 
     class FakeMT5:
         POSITION_TYPE_SELL = 1
@@ -3793,7 +4176,7 @@ def test_lead_lag_detects_following_move() -> None:
     time.sleep(0.001)
     quote_cache.put("mt5", symbol, 102, 103, 10000, "test")
     report = lead_lag_report(symbol, window_seconds=60, threshold_bps=50, follow_ratio=0.5, max_lag_ms=2000)
-    summary = report["summary"]["hyperliquid_to_mt5"]
+    summary = report["summary"]["leg_a_to_leg_b"]
     assert summary["event_count"] >= 1
     assert summary["follow_count"] >= 1
 
@@ -3809,21 +4192,43 @@ def test_mt5_pre_close_blocks_open_but_allows_close() -> None:
         can_close_long=True,
         can_close_short=True,
     )
-    can_open, open_reason = mt5_action_allowed(state, "long_mt5_short_hyperliquid", "open")
-    can_close, close_reason = mt5_action_allowed(state, "long_mt5_short_hyperliquid", "close")
+    can_open, open_reason = mt5_action_allowed(state, "long_leg_b_short_leg_a", "open")
+    can_close, close_reason = mt5_action_allowed(state, "long_leg_b_short_leg_a", "close")
     assert not can_open
     assert "不允许" in open_reason
     assert can_close
     assert close_reason == ""
 
 
+def test_mt5_action_allowed_uses_mt5_leg_direction() -> None:
+    state = MT5SessionState(
+        symbol="BTC",
+        status="open",
+        reason="",
+        can_quote=True,
+        can_open_long=True,
+        can_open_short=False,
+        can_close_long=True,
+        can_close_short=False,
+        mt5_leg="a",
+    )
+
+    can_open_a_long, reason_a_long = mt5_action_allowed(state, "long_leg_a_short_leg_b", "open")
+    can_open_a_short, reason_a_short = mt5_action_allowed(state, "long_leg_b_short_leg_a", "open")
+
+    assert can_open_a_long
+    assert reason_a_long == ""
+    assert not can_open_a_short
+    assert "不允许" in reason_a_short
+
+
 def test_local_mt5_stock_close_only_blocks_open_but_allows_close() -> None:
-    mapping = SymbolMapping(symbol="SPCX", hyperliquid_symbol="xyz:SPCX", mt5_symbol="SPCXz")
+    mapping = SymbolMapping(symbol="SPCX", leg_a_venue_symbol="xyz:SPCX", mt5_symbol="SPCXz")
     apply_mt5_session_template(mapping, "stock_us_close_only")
     state = mt5_session_state(mapping, datetime(2026, 6, 23, 10, 30, tzinfo=timezone.utc))
 
-    can_open, open_reason = mt5_action_allowed(state, "long_hyperliquid_short_mt5", "open")
-    can_close, close_reason = mt5_action_allowed(state, "long_hyperliquid_short_mt5", "close")
+    can_open, open_reason = mt5_action_allowed(state, "long_leg_a_short_leg_b", "open")
+    can_close, close_reason = mt5_action_allowed(state, "long_leg_a_short_leg_b", "close")
 
     assert state.status == "reduce_only"
     assert state.session_source == "exness_template"
@@ -3835,7 +4240,7 @@ def test_local_mt5_stock_close_only_blocks_open_but_allows_close() -> None:
 
 
 def test_local_mt5_quote_only_blocks_close_for_indices() -> None:
-    mapping = SymbolMapping(symbol="JP225", hyperliquid_symbol="JP225", mt5_symbol="JP225")
+    mapping = SymbolMapping(symbol="JP225", leg_a_venue_symbol="JP225", mt5_symbol="JP225")
     apply_mt5_session_template(mapping, "index_us_jp")
     state = local_schedule_state(mapping, datetime(2026, 6, 23, 21, 30, tzinfo=timezone.utc))
 
@@ -3846,7 +4251,7 @@ def test_local_mt5_quote_only_blocks_close_for_indices() -> None:
 
 
 def test_mt5_session_template_infers_spcx_as_stock() -> None:
-    mapping = SymbolMapping(symbol="SPCX", hyperliquid_symbol="xyz:SPCX", mt5_symbol="SPCXz")
+    mapping = SymbolMapping(symbol="SPCX", leg_a_venue_symbol="xyz:SPCX", mt5_symbol="SPCXz")
     assert infer_template(mapping) == "stock_us_close_only"
 
 
@@ -3855,7 +4260,7 @@ def test_live_execution_readiness_blocks_missing_live_prerequisites(monkeypatch)
     Base.metadata.create_all(engine)
     Session = sessionmaker(bind=engine, future=True)
     db = Session()
-    db.add(SymbolMapping(symbol="OIL", hyperliquid_symbol="OIL", mt5_symbol="USOIL", enabled=True))
+    db.add(SymbolMapping(symbol="OIL", leg_a_venue_symbol="OIL", mt5_symbol="USOIL", enabled=True))
     db.commit()
 
     def fake_import(name):
@@ -3881,7 +4286,7 @@ def test_paper_execution_readiness_allows_demo_account(monkeypatch) -> None:
     Base.metadata.create_all(engine)
     Session = sessionmaker(bind=engine, future=True)
     db = Session()
-    db.add(SymbolMapping(symbol="OIL", hyperliquid_symbol="OIL", mt5_symbol="USOIL", mt5_volume_step=0.01, mt5_contract_size=100, enabled=True))
+    db.add(SymbolMapping(symbol="OIL", leg_a_venue_symbol="OIL", mt5_symbol="USOIL", mt5_volume_step=0.01, mt5_contract_size=100, enabled=True))
     db.commit()
 
     settings = SimpleNamespace(
@@ -3924,7 +4329,7 @@ def test_paper_execution_readiness_blocks_real_mt5_account(monkeypatch) -> None:
     Base.metadata.create_all(engine)
     Session = sessionmaker(bind=engine, future=True)
     db = Session()
-    db.add(SymbolMapping(symbol="OIL", hyperliquid_symbol="OIL", mt5_symbol="USOIL", mt5_volume_step=0.01, mt5_contract_size=100, enabled=True))
+    db.add(SymbolMapping(symbol="OIL", leg_a_venue_symbol="OIL", mt5_symbol="USOIL", mt5_volume_step=0.01, mt5_contract_size=100, enabled=True))
     db.commit()
 
     settings = SimpleNamespace(
@@ -3972,7 +4377,7 @@ def test_live_execution_readiness_blocks_hyperliquid_live_submit_after_sdk_remov
     db.add(
         SymbolMapping(
             symbol="OIL",
-            hyperliquid_symbol="OIL",
+            leg_a_venue_symbol="OIL",
             mt5_symbol="USOIL",
             mt5_volume_step=0.01,
             mt5_contract_size=100,
@@ -4034,7 +4439,7 @@ def test_live_execution_readiness_blocks_failed_read_probes(monkeypatch) -> None
     Session = sessionmaker(bind=engine, future=True)
     db = Session()
     db.add(SystemSetting(key="live_trading_enabled", value="true"))
-    db.add(SymbolMapping(symbol="OIL", hyperliquid_symbol="OIL", mt5_symbol="USOIL", mt5_volume_step=0.01, mt5_contract_size=100, enabled=True))
+    db.add(SymbolMapping(symbol="OIL", leg_a_venue_symbol="OIL", mt5_symbol="USOIL", mt5_volume_step=0.01, mt5_contract_size=100, enabled=True))
     db.commit()
 
     class FakeMT5:
@@ -4080,7 +4485,7 @@ def test_live_execution_readiness_blocks_unmanaged_live_positions(monkeypatch) -
     Session = sessionmaker(bind=engine, future=True)
     db = Session()
     db.add(SystemSetting(key="live_trading_enabled", value="true"))
-    db.add(SymbolMapping(symbol="OIL", hyperliquid_symbol="OIL", mt5_symbol="USOIL", mt5_volume_step=0.01, mt5_contract_size=100, enabled=True))
+    db.add(SymbolMapping(symbol="OIL", leg_a_venue_symbol="OIL", mt5_symbol="USOIL", mt5_volume_step=0.01, mt5_contract_size=100, enabled=True))
     db.add(Position(platform="hyperliquid", symbol="OIL", side="long", quantity=1, entry_price=70, mark_price=71))
     db.commit()
 
@@ -4131,17 +4536,17 @@ def test_live_execution_readiness_requires_managed_position_side_and_quantity(mo
     Session = sessionmaker(bind=engine, future=True)
     db = Session()
     db.add(SystemSetting(key="live_trading_enabled", value="true"))
-    db.add(SymbolMapping(symbol="OIL", hyperliquid_symbol="OIL", mt5_symbol="USOIL", mt5_volume_step=0.01, mt5_contract_size=100, enabled=True))
+    db.add(SymbolMapping(symbol="OIL", leg_a_venue_symbol="OIL", mt5_symbol="USOIL", mt5_volume_step=0.01, mt5_contract_size=100, enabled=True))
     db.add(
         HedgeGroup(
             symbol="OIL",
-            direction="long_hyperliquid_short_mt5",
+            direction="long_leg_a_short_leg_b",
             status="open",
             execution_mode="live",
             notional=1000,
             quantity=1,
-            hyperliquid_quantity=1.0,
-            mt5_quantity=0.1,
+            leg_a_quantity=1.0,
+            leg_b_quantity=0.1,
         )
     )
     db.add(Position(platform="mt5", symbol="USOIL", side="short", quantity=0.2, entry_price=70, mark_price=71))
@@ -4196,11 +4601,11 @@ def test_live_execution_readiness_blocks_residual_closed_group_position(monkeypa
     Session = sessionmaker(bind=engine, future=True)
     db = Session()
     db.add(SystemSetting(key="live_trading_enabled", value="true"))
-    db.add(SymbolMapping(symbol="OIL", hyperliquid_symbol="OIL", mt5_symbol="USOIL", mt5_volume_step=0.01, mt5_contract_size=100, enabled=True))
+    db.add(SymbolMapping(symbol="OIL", leg_a_venue_symbol="OIL", mt5_symbol="USOIL", mt5_volume_step=0.01, mt5_contract_size=100, enabled=True))
     db.add(
         HedgeGroup(
             symbol="OIL",
-            direction="long_hyperliquid_short_mt5",
+            direction="long_leg_a_short_leg_b",
             status="closed",
             execution_mode="live",
             notional=1000,
@@ -4274,12 +4679,12 @@ def test_symbol_mapping_file_seeds_missing_without_overwriting_existing(tmp_path
         """
 symbols:
   - symbol: BTC
-    hyperliquid_symbol: BTC
+    leg_a_venue_symbol: BTC
     mt5_symbol: BTCUSD
     min_order_size: 1.23
     enabled: true
   - symbol: ETH
-    hyperliquid_symbol: ETH
+    leg_a_venue_symbol: ETH
     mt5_symbol: ETHUSD
     min_order_size: 2.34
     enabled: true
@@ -4291,13 +4696,13 @@ symbols:
     Base.metadata.create_all(engine)
     Session = sessionmaker(bind=engine, future=True)
     with Session() as db:
-        db.add(SymbolMapping(symbol="BTC", hyperliquid_symbol="BTC-PERP", mt5_symbol="BTCUSD", min_order_size=0.5))
+        db.add(SymbolMapping(symbol="BTC", leg_a_venue_symbol="BTC-PERP", mt5_symbol="BTCUSD", min_order_size=0.5))
         db.commit()
         seeded = symbol_module.seed_symbol_mappings_from_file(db)
         btc = db.query(SymbolMapping).filter(SymbolMapping.symbol == "BTC").one()
         eth = db.query(SymbolMapping).filter(SymbolMapping.symbol == "ETH").one()
         assert seeded == 1
-        assert btc.hyperliquid_symbol == "BTC-PERP"
+        assert btc.leg_a_venue_symbol == "BTC-PERP"
         assert btc.min_order_size == 0.5
         assert eth.min_order_size == 2.34
 
@@ -4308,11 +4713,11 @@ def test_enabled_mappings_cache_requires_explicit_clear() -> None:
     Session = sessionmaker(bind=engine, future=True)
     with Session() as db:
         symbol_module.clear_symbol_mapping_cache()
-        db.add(SymbolMapping(symbol="BTC", hyperliquid_symbol="BTC", mt5_symbol="BTCUSD", enabled=True))
+        db.add(SymbolMapping(symbol="BTC", leg_a_venue_symbol="BTC", mt5_symbol="BTCUSD", enabled=True))
         db.commit()
 
         first = symbol_module.enabled_mappings(db)
-        db.add(SymbolMapping(symbol="ETH", hyperliquid_symbol="ETH", mt5_symbol="ETHUSD", enabled=True))
+        db.add(SymbolMapping(symbol="ETH", leg_a_venue_symbol="ETH", mt5_symbol="ETHUSD", enabled=True))
         db.commit()
         cached = symbol_module.enabled_mappings(db)
         symbol_module.clear_symbol_mapping_cache()
@@ -4352,13 +4757,13 @@ def test_hedge_pool_loads_and_cas_groups() -> None:
     with Session() as db:
         group = HedgeGroup(
             symbol="POOL",
-            direction="long_hyperliquid_short_mt5",
+            direction="long_leg_a_short_leg_b",
             status="open",
             execution_mode="paper",
             notional=1000,
             quantity=1,
-            mt5_quantity=1,
-            hyperliquid_quantity=1,
+            leg_b_quantity=1,
+            leg_a_quantity=1,
             entry_spread=20,
             exit_target=2,
             opened_at=datetime.now(timezone.utc).replace(tzinfo=None),
@@ -4385,13 +4790,13 @@ def test_hedge_pool_load_preserves_runtime_unrealized_pnl() -> None:
     with Session() as db:
         group = HedgeGroup(
             symbol="POOL-PRESERVE",
-            direction="long_hyperliquid_short_mt5",
+            direction="long_leg_a_short_leg_b",
             status="open",
             execution_mode="paper",
             notional=1000,
             quantity=1,
-            mt5_quantity=1,
-            hyperliquid_quantity=1,
+            leg_b_quantity=1,
+            leg_a_quantity=1,
             entry_spread=20,
             unrealized_pnl=0,
         )
@@ -4414,13 +4819,13 @@ def test_run_auto_close_uses_pool_without_hedge_group_query(monkeypatch) -> None
     group = HedgeGroupSnapshot(
         id=999,
         symbol="POOL-AUTO",
-        direction="long_hyperliquid_short_mt5",
+        direction="long_leg_a_short_leg_b",
         status="open",
         execution_mode="paper",
         notional=1000,
         quantity=1,
-        mt5_quantity=1,
-        hyperliquid_quantity=1,
+        leg_b_quantity=1,
+        leg_a_quantity=1,
         open_cost=0,
         fees=0,
         funding=0,
@@ -4445,14 +4850,16 @@ def test_run_auto_close_uses_pool_without_hedge_group_query(monkeypatch) -> None
         auto_close_live_enabled=False,
         auto_close_min_profit=0,
         max_holding_minutes=240,
-        paper_hyperliquid_latency_ms_min=0,
-        paper_hyperliquid_latency_ms_max=0,
-        paper_mt5_latency_ms_min=0,
-        paper_mt5_latency_ms_max=0,
+        paper_leg_a_latency_ms_min=0,
+        paper_leg_a_latency_ms_max=0,
+        paper_leg_b_latency_ms_min=0,
+        paper_leg_b_latency_ms_max=0,
     )
     mapping = SimpleNamespace(
         symbol="POOL-AUTO",
-        hyperliquid_symbol="POOL-AUTO",
+        leg_a_venue="hyperliquid",
+        leg_b_venue="mt5",
+        leg_a_venue_symbol="POOL-AUTO",
         mt5_symbol="POOL-AUTO",
         max_close_spread=2,
         allow_hold_through_mt5_close=True,
@@ -4488,6 +4895,12 @@ def test_run_auto_close_uses_pool_without_hedge_group_query(monkeypatch) -> None
     monkeypatch.setattr("app.execution.auto_closer.mt5_session_state", lambda mapping: MT5SessionState(mapping.symbol, "normal_trade", "", True, True, True, True, True))
     monkeypatch.setattr("app.execution.auto_closer.build_execution_gateway", lambda adapter: FakeGateway())
     monkeypatch.setattr("app.execution.auto_closer.prune_table_by_id", lambda *args, **kwargs: None)
+    synced = SimpleNamespace(
+        leg_a=SimpleNamespace(bid=100, ask=101, local_recv_ts=datetime.now(timezone.utc).replace(tzinfo=None)),
+        leg_b=SimpleNamespace(bid=100, ask=101, local_recv_ts=datetime.now(timezone.utc).replace(tzinfo=None)),
+        time_diff_ms=0,
+    )
+    monkeypatch.setattr("app.execution.auto_closer.quote_synchronizer.synchronized", lambda *args, **kwargs: (synced, ""))
 
     closed = run_auto_close(FakeDb())
 

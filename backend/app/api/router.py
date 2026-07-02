@@ -14,6 +14,7 @@ from app.analytics.spreads import downsample_spreads, load_spread_points, summar
 from app.accounts.sync import latest_account_snapshots, sync_account_snapshots
 from app.adapters.base import AdapterOrder
 from app.adapters.hyperliquid import HyperliquidAdapter, _load_hyperliquid_exchange
+from app.adapters.venue import NATIVE_VENUES, build_market_adapter, mapping_leg
 from app.auth.dependencies import get_current_user, require_admin
 from app.auth.security import create_access_token, decode_access_token, verify_password
 from app.db.models import (
@@ -21,6 +22,7 @@ from app.db.models import (
     Alert,
     ArbitrageOpportunity,
     AuditLog,
+    ExchangeCredential,
     Fill,
     HedgeGroup,
     HedgeGroupEvent,
@@ -50,6 +52,7 @@ from app.execution.pnl import pnl_from_close_spread
 from app.execution.persistence import persist_hedge_pool_events
 from app.execution.readiness import live_execution_readiness, paper_execution_readiness
 from app.execution.reconciler import run_execution_reconcile
+from app.exchanges.credentials import mark_test_result, public_exchange_credential, upsert_exchange_credential, validate_exchange_credential
 from app.market.scanner import clear_strategy_setting_cache, run_scan
 from app.market.scan_state import scan_state_store
 from app.market.quotes import quote_cache
@@ -58,7 +61,8 @@ from app.market.mt5_sessions import as_session_dict, mt5_session_state
 from app.market.mt5_schedule import apply_mt5_session_template, mt5_session_templates
 from app.market.symbols import clear_symbol_mapping_cache
 from app.config.settings import get_settings
-from app.schemas import AdoptPositionIn, CloseHedgeGroupIn, HyperliquidProbeTestIn, LiveTradingIn, LoginRequest, RiskModeIn, RiskSettingsIn, StrategySettingsIn, SymbolMappingIn, TokenResponse
+from app.schemas import AdoptPositionIn, CloseHedgeGroupIn, ExchangeCredentialIn, ExecutionSettingsIn, VenueProbeTestIn, LiveTradingIn, LoginRequest, RiskModeIn, RiskSettingsIn, StrategySettingsIn, SymbolMappingIn, TokenResponse
+from app.execution.runtime_settings import execution_settings_payload, set_execution_settings
 from app.strategy.statistical_signal import clear_signal_stats_cache
 
 
@@ -70,6 +74,93 @@ def as_dict(row: Any) -> dict[str, Any]:
         return dict(row.__dict__)
     data = {column.name: getattr(row, column.name) for column in row.__table__.columns}
     return data
+
+
+def _leg_metadata(mapping: SymbolMapping | None) -> dict[str, str]:
+    if not mapping:
+        return {
+            "leg_a_venue": "hyperliquid",
+            "leg_a_symbol": "",
+            "leg_b_venue": "mt5",
+            "leg_b_symbol": "",
+        }
+    leg_a_venue, leg_a_symbol = mapping_leg(mapping, "a")
+    leg_b_venue, leg_b_symbol = mapping_leg(mapping, "b")
+    return {
+        "leg_a_venue": leg_a_venue or "hyperliquid",
+        "leg_a_symbol": leg_a_symbol or mapping.symbol,
+        "leg_b_venue": leg_b_venue or "mt5",
+        "leg_b_symbol": leg_b_symbol or mapping.symbol,
+    }
+
+
+def _leg_metadata_for_symbol(db: Session, symbol: str) -> dict[str, str]:
+    mapping = db.query(SymbolMapping).filter(SymbolMapping.symbol == str(symbol or "").upper()).first()
+    return _leg_metadata(mapping)
+
+
+def _row_with_leg_metadata(db: Session, row: Any) -> dict[str, Any]:
+    data = as_dict(row) if not isinstance(row, dict) else dict(row)
+    data.update(_leg_metadata_for_symbol(db, str(data.get("symbol") or "")))
+    return data
+
+
+def _create_current_symbol_opportunity(db: Session, symbol: str, source: str, *, direction: str = "", force: bool = False) -> ArbitrageOpportunity:
+    normalized = symbol.strip().upper()
+    if not normalized:
+        raise HTTPException(status_code=400, detail="symbol 不能为空")
+    mapping = db.query(SymbolMapping).filter(SymbolMapping.symbol == normalized, SymbolMapping.enabled.is_(True)).first()
+    if not mapping:
+        raise HTTPException(status_code=404, detail="品种映射不存在或未启用")
+    query = db.query(SpreadDirectionCurrent).filter(SpreadDirectionCurrent.symbol == normalized)
+    if direction.strip():
+        query = query.filter(SpreadDirectionCurrent.direction == direction.strip())
+    rows = query.order_by(desc(SpreadDirectionCurrent.net_profit), desc(SpreadDirectionCurrent.updated_at)).all()
+    executable = [row for row in rows if row.status == "executable"]
+    if not executable and not force:
+        reason = rows[0].reason if rows else "当前品种没有方向快照"
+        status = rows[0].status if rows else "missing"
+        raise HTTPException(status_code=400, detail=f"当前品种没有 executable 方向，最新状态 {status}: {reason}")
+    if not executable and not rows:
+        raise HTTPException(status_code=400, detail="当前品种没有方向快照")
+    row = executable[0] if executable else rows[0]
+    strategy = db.query(StrategySetting).first() or StrategySetting()
+    opportunity = ArbitrageOpportunity(
+        symbol=normalized,
+        direction=row.direction,
+        notional=_current_row_notional(row, strategy),
+        quantity=row.quantity,
+        leg_b_quantity=row.leg_b_quantity or row.quantity,
+        leg_a_quantity=row.leg_a_quantity or row.quantity,
+        notional_currency=row.notional_currency,
+        fx_rate_to_usd=row.fx_rate_to_usd,
+        gross_spread=row.gross_spread,
+        trigger_leg_a_bid=row.leg_a_bid,
+        trigger_leg_a_ask=row.leg_a_ask,
+        trigger_leg_b_bid=row.leg_b_bid,
+        trigger_leg_b_ask=row.leg_b_ask,
+        unit_cost=row.unit_cost,
+        unit_net_profit=row.unit_net_profit,
+        total_cost=row.total_cost,
+        net_profit=row.net_profit,
+        annualized_return=row.annualized_return,
+        entry_threshold=row.entry_spread,
+        exit_target=row.close_spread,
+        overheat_threshold=0.0,
+        signal_sample_count=0,
+        status="executable",
+        reject_reason=f"{'manual_force_execute_from_spread' if force else 'manual_execute_from_spread'}:{source}; source_status={row.status}; source_reason={row.reason}",
+    )
+    db.add(opportunity)
+    db.flush()
+    return opportunity
+
+
+def _current_row_notional(row: SpreadDirectionCurrent, strategy: StrategySetting) -> float:
+    configured = float(strategy.default_notional or 0.0)
+    leg_a_mid = (float(row.leg_a_bid or 0.0) + float(row.leg_a_ask or 0.0)) / 2
+    estimated = leg_a_mid * float(row.leg_a_quantity or row.quantity or 0.0)
+    return max(configured, estimated, 0.0)
 
 
 def _paginate_rows(rows: list[dict[str, Any]], page: int, page_size: int) -> dict[str, Any]:
@@ -223,20 +314,24 @@ def scan(_: User = Depends(require_admin), db: Session = Depends(get_db)) -> dic
 
 @router.get("/markets/symbols")
 def market_symbols(_: User = Depends(get_current_user), db: Session = Depends(get_db)) -> list[dict[str, Any]]:
-    return [as_dict(row) for row in db.query(SymbolMapping).order_by(SymbolMapping.symbol).all()]
+    return [_row_with_leg_metadata(db, row) for row in db.query(SymbolMapping).order_by(SymbolMapping.symbol).all()]
 
 
 @router.get("/markets/quotes")
 def market_quotes(_: User = Depends(get_current_user), db: Session = Depends(get_db)) -> list[dict[str, Any]]:
     rows = []
     for mapping in db.query(SymbolMapping).order_by(SymbolMapping.symbol).all():
-        for platform in ("hyperliquid", "mt5"):
+        for leg in ("a", "b"):
+            platform, venue_symbol = mapping_leg(mapping, leg)
             quote = quote_cache.latest(platform, mapping.symbol)
             if quote:
                 rows.append(
                     {
                         "platform": platform,
                         "symbol": mapping.symbol,
+                        "venue_symbol": venue_symbol,
+                        **_leg_metadata(mapping),
+                        "leg": leg,
                         "bid": quote.bid,
                         "ask": quote.ask,
                         "depth_notional": quote.depth_notional,
@@ -270,14 +365,24 @@ def spreads(_: User = Depends(get_current_user), db: Session = Depends(get_db), 
             needle = symbol.upper()
             rows = [row for row in rows if needle in str(row.get("symbol", "")).upper()]
         rows = sorted(rows, key=lambda row: str(row.get("symbol", "")))
-        return _paginate_rows(rows, page, page_size)
+        return _paginate_rows([_row_with_leg_metadata(db, row) for row in rows], page, page_size)
     query = db.query(SpreadCurrent)
     query = query.filter(SpreadCurrent.symbol.in_(enabled_symbols)) if enabled_symbols else query.filter(False)
     if symbol:
         query = query.filter(SpreadCurrent.symbol.contains(symbol.upper()))
     total = query.count()
     rows = query.order_by(SpreadCurrent.symbol).offset((page - 1) * page_size).limit(page_size).all()
-    return {"total": total, "items": [as_dict(row) for row in rows]}
+    return {"total": total, "items": [_row_with_leg_metadata(db, row) for row in rows]}
+
+
+@router.post("/markets/spreads/{symbol}/execute")
+def execute_current_symbol(symbol: str, direction: str = "", force: bool = False, user: User = Depends(require_admin), db: Session = Depends(get_db)) -> dict[str, Any]:
+    opportunity = _create_current_symbol_opportunity(db, symbol, user.username, direction=direction, force=force)
+    try:
+        group = open_hedge_group(db, opportunity.id, source=user.username, force_strategy_checks=force)
+        return as_dict(group)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.get("/stream")
@@ -367,15 +472,15 @@ def _stream_snapshot(
     if channel == "risk":
         return {"risk_status": _risk_status_payload(db), "risk_events": _risk_events_payload(db, page=page, page_size=page_size)}
     if channel == "lead-lag":
-        return {"lead_lag": _lead_lag_payload(symbol, window_seconds, threshold_bps, min_move, follow_ratio, max_lag_ms)}
+        return {"lead_lag": _lead_lag_payload(db, symbol, window_seconds, threshold_bps, min_move, follow_ratio, max_lag_ms)}
 
     state = scan_state_store.snapshot()
     enabled_symbols = _enabled_symbol_names(db)
     if state["ready"]:
         spread_rows = [row for row in state["spreads"] if str(row.get("symbol", "")).upper() in enabled_symbols]
         opportunity_rows = [row for row in state["opportunities"] if str(row.get("symbol", "")).upper() in enabled_symbols]
-        spreads_payload = {"total": len(spread_rows), "items": spread_rows}
-        opportunities_payload = {"total": len(opportunity_rows), "items": opportunity_rows}
+        spreads_payload = {"total": len(spread_rows), "items": [_row_with_leg_metadata(db, row) for row in spread_rows]}
+        opportunities_payload = {"total": len(opportunity_rows), "items": [_row_with_leg_metadata(db, row) for row in opportunity_rows]}
     else:
         spread_rows = db.query(SpreadCurrent).filter(SpreadCurrent.symbol.in_(enabled_symbols)).order_by(SpreadCurrent.symbol).all() if enabled_symbols else []
         opportunity_rows = (
@@ -387,8 +492,8 @@ def _stream_snapshot(
             if enabled_symbols
             else []
         )
-        spreads_payload = {"total": len(spread_rows), "items": [as_dict(row) for row in spread_rows]}
-        opportunities_payload = {"total": len(opportunity_rows), "items": [as_dict(row) for row in opportunity_rows]}
+        spreads_payload = {"total": len(spread_rows), "items": [_row_with_leg_metadata(db, row) for row in spread_rows]}
+        opportunities_payload = {"total": len(opportunity_rows), "items": [_row_with_leg_metadata(db, row) for row in opportunity_rows]}
     account_rows = latest_account_snapshots(db)
     latest_bucket = db.query(SpreadBucket).order_by(desc(SpreadBucket.id)).first()
     return {
@@ -405,13 +510,13 @@ def spread_summary(
     _: User = Depends(get_current_user),
     db: Session = Depends(get_db),
     symbol: str = "BTC",
-    direction: str = "long_mt5_short_hyperliquid",
+    direction: str = "long_leg_b_short_leg_a",
     range: str = "1h",
     basis: str = "entry",
 ) -> dict[str, Any]:
     safe_basis = basis if basis in {"entry", "close", "mid"} else "entry"
     points = load_spread_points(db, symbol, direction, range, basis=safe_basis)
-    return {"symbol": symbol.upper(), "direction": direction, "basis": safe_basis, **summarize_spreads(points, range)}
+    return {"symbol": symbol.upper(), "direction": direction, "basis": safe_basis, **_leg_metadata_for_symbol(db, symbol), **summarize_spreads(points, range)}
 
 
 @router.get("/analytics/spread-series")
@@ -419,7 +524,7 @@ def spread_series(
     _: User = Depends(get_current_user),
     db: Session = Depends(get_db),
     symbol: str = "BTC",
-    direction: str = "long_mt5_short_hyperliquid",
+    direction: str = "long_leg_b_short_leg_a",
     range: str = "1h",
     basis: str = "entry",
 ) -> dict[str, Any]:
@@ -430,6 +535,7 @@ def spread_series(
         "symbol": symbol.upper(),
         "direction": direction,
         "basis": safe_basis,
+        **_leg_metadata_for_symbol(db, symbol),
         "range": summary["range"],
         "summary": summary,
         "items": downsample_spreads(points, range),
@@ -444,7 +550,10 @@ def venue_spreads(
     range: str = "1h",
 ) -> dict[str, Any]:
     from app.analytics.venue_spreads import venue_spread_report
-    return venue_spread_report(db, symbol.upper(), range)
+    leg_meta = _leg_metadata_for_symbol(db, symbol)
+    data = venue_spread_report(db, symbol.upper(), range, leg_a_venue=leg_meta["leg_a_venue"], leg_b_venue=leg_meta["leg_b_venue"])
+    data.update(leg_meta)
+    return data
 
 
 @router.get("/analytics/funding-series")
@@ -461,6 +570,7 @@ def funding_series(
 @router.get("/analytics/lead-lag")
 def lead_lag(
     _: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
     symbol: str = "JP225",
     window_seconds: int = 300,
     threshold_bps: float = 3.0,
@@ -468,11 +578,24 @@ def lead_lag(
     follow_ratio: float = 0.5,
     max_lag_ms: int = 2000,
 ) -> dict[str, Any]:
-    return _lead_lag_payload(symbol, window_seconds, threshold_bps, min_move, follow_ratio, max_lag_ms)
+    return _lead_lag_payload(db, symbol, window_seconds, threshold_bps, min_move, follow_ratio, max_lag_ms)
 
 
-def _lead_lag_payload(symbol: str, window_seconds: int, threshold_bps: float, min_move: float, follow_ratio: float, max_lag_ms: int) -> dict[str, Any]:
-    return lead_lag_report(symbol, window_seconds, threshold_bps, min_move, follow_ratio, max_lag_ms)
+def _lead_lag_payload(db: Session, symbol: str, window_seconds: int, threshold_bps: float, min_move: float, follow_ratio: float, max_lag_ms: int) -> dict[str, Any]:
+    mapping = db.query(SymbolMapping).filter(SymbolMapping.symbol == symbol.upper()).first()
+    leg_meta = _leg_metadata(mapping)
+    data = lead_lag_report(
+        symbol,
+        window_seconds,
+        threshold_bps,
+        min_move,
+        follow_ratio,
+        max_lag_ms,
+        leg_a_venue=leg_meta["leg_a_venue"],
+        leg_b_venue=leg_meta["leg_b_venue"],
+    )
+    data.update(leg_meta)
+    return data
 
 
 @router.get("/opportunities")
@@ -482,11 +605,11 @@ def opportunities(_: User = Depends(get_current_user), db: Session = Depends(get
     if state["ready"]:
         rows = [row for row in state["opportunities"] if str(row.get("symbol", "")).upper() in enabled_symbols]
         rows = sorted(rows, key=lambda row: row.get("created_at") or datetime.min, reverse=True)
-        return _paginate_rows(rows, page, page_size)
+        return _paginate_rows([_row_with_leg_metadata(db, row) for row in rows], page, page_size)
     query = db.query(ArbitrageOpportunity).filter(ArbitrageOpportunity.symbol.in_(enabled_symbols), ArbitrageOpportunity.status.in_(["candidate", "executable", "executing"])) if enabled_symbols else db.query(ArbitrageOpportunity).filter(False)
     total = query.count()
     rows = query.order_by(desc(ArbitrageOpportunity.created_at)).offset((page - 1) * page_size).limit(page_size).all()
-    return {"total": total, "items": [as_dict(row) for row in rows]}
+    return {"total": total, "items": [_row_with_leg_metadata(db, row) for row in rows]}
 
 
 @router.get("/opportunities/{opportunity_id}")
@@ -494,7 +617,7 @@ def opportunity_detail(opportunity_id: int, _: User = Depends(get_current_user),
     row = db.get(ArbitrageOpportunity, opportunity_id)
     if not row:
         raise HTTPException(status_code=404, detail="机会不存在")
-    return as_dict(row)
+    return _row_with_leg_metadata(db, row)
 
 
 @router.post("/opportunities/{opportunity_id}/execute")
@@ -519,7 +642,7 @@ def _hedge_groups_payload(db: Session, page: int = 1, page_size: int = 20) -> di
     items = []
     for row in rows:
         snapshot = active_by_id.get(row.id)
-        items.append(_hedge_group_payload(snapshot if snapshot and snapshot.symbol == row.symbol else row))
+        items.append(_hedge_group_payload(db, snapshot if snapshot and snapshot.symbol == row.symbol else row))
     return {"total": total, "page": page, "page_size": page_size, "items": items}
 
 
@@ -528,14 +651,15 @@ def hedge_group_detail(group_id: int, _: User = Depends(get_current_user), db: S
     group = db.get(HedgeGroup, group_id)
     if not group:
         raise HTTPException(status_code=404, detail="对冲组不存在")
-    data = _hedge_group_payload(group)
+    data = _hedge_group_payload(db, group)
     data["events"] = [as_dict(row) for row in group.events]
     data["orders"] = [as_dict(row) for row in db.query(Order).filter(Order.hedge_group_id == group_id).all()]
     return data
 
 
-def _hedge_group_payload(group: HedgeGroup | HedgeGroupSnapshot) -> dict[str, Any]:
+def _hedge_group_payload(db: Session, group: HedgeGroup | HedgeGroupSnapshot) -> dict[str, Any]:
     data = as_dict(group)
+    data.update(_leg_metadata_for_symbol(db, str(data.get("symbol") or "")))
     spreads = hedge_group_spreads(group)
     data.update(spreads)
     current_close_spread = spreads.get("current_close_spread")
@@ -550,8 +674,8 @@ def _hedge_group_payload(group: HedgeGroup | HedgeGroupSnapshot) -> dict[str, An
 @router.post("/hedge-groups/{group_id}/close")
 def close_group(group_id: int, payload: CloseHedgeGroupIn, user: User = Depends(require_admin), db: Session = Depends(get_db)) -> dict[str, Any]:
     try:
-        group = close_hedge_group_from_pool(db, group_id, payload.reason)
-        audit(db, user.id, "close_hedge_group", "hedge_group", str(group_id))
+        group = close_hedge_group_from_pool(db, group_id, payload.reason, force_strategy_checks=payload.force)
+        audit(db, user.id, "close_hedge_group", "hedge_group", f"{group_id}; force={payload.force}")
         db.commit()
         persist_hedge_pool_events(db)
         return as_dict(group)
@@ -595,7 +719,7 @@ def positions(_: User = Depends(get_current_user), db: Session = Depends(get_db)
 
 
 def _positions_payload(db: Session) -> list[dict[str, Any]]:
-    return [as_dict(row) for row in db.query(Position).order_by(desc(Position.created_at)).all()]
+    return [_row_with_leg_metadata(db, row) for row in db.query(Position).order_by(desc(Position.created_at)).all()]
 
 
 @router.post("/positions/{position_id}/adopt")
@@ -603,8 +727,8 @@ def adopt_position(position_id: int, payload: AdoptPositionIn, user: User = Depe
     position = db.get(Position, position_id)
     if not position:
         raise HTTPException(status_code=404, detail="仓位不存在")
-    if position.platform not in {"hyperliquid", "mt5"}:
-        raise HTTPException(status_code=400, detail="只支持接管 Hyperliquid/MT5 live 仓位")
+    if position.platform not in NATIVE_VENUES:
+        raise HTTPException(status_code=400, detail=f"只支持接管 {NATIVE_VENUES} live 仓位")
     if abs(position.quantity) <= 0:
         raise HTTPException(status_code=400, detail="仓位数量为 0，不能接管")
     mapping = _mapping_for_position(db, position, payload.symbol)
@@ -613,9 +737,10 @@ def adopt_position(position_id: int, payload: AdoptPositionIn, user: User = Depe
     if _position_has_live_group(db, position, mapping):
         raise HTTPException(status_code=400, detail="该仓位已匹配 live 对冲组，不能重复接管")
 
-    direction = _direction_for_position(position)
-    hyperliquid_quantity = position.quantity if position.platform == "hyperliquid" else 0.0
-    mt5_quantity = position.quantity if position.platform == "mt5" else 0.0
+    direction = _direction_for_position(position, mapping)
+    leg_a_venue, _ = mapping_leg(mapping, "a")
+    leg_a_quantity = position.quantity if position.platform == leg_a_venue else 0.0
+    leg_b_quantity = position.quantity if position.platform != leg_a_venue else 0.0
     notional = abs(position.quantity * (position.mark_price or position.entry_price or 0.0))
     group = HedgeGroup(
         symbol=mapping.symbol,
@@ -624,8 +749,8 @@ def adopt_position(position_id: int, payload: AdoptPositionIn, user: User = Depe
         execution_mode="live",
         notional=notional,
         quantity=abs(position.quantity),
-        hyperliquid_quantity=hyperliquid_quantity,
-        mt5_quantity=mt5_quantity,
+        leg_a_quantity=leg_a_quantity,
+        leg_b_quantity=leg_b_quantity,
         unrealized_pnl=position.unrealized_pnl,
         close_reason=f"外部仓位接管: {payload.reason}",
         source=user.username,
@@ -638,40 +763,43 @@ def adopt_position(position_id: int, payload: AdoptPositionIn, user: User = Depe
     audit(db, user.id, "adopt_position", "position", f"{position_id}->{group.id}: {detail}")
     db.commit()
     db.refresh(group)
-    return as_dict(group)
+    return _hedge_group_payload(db, group)
 
 
 def _mapping_for_position(db: Session, position: Position, requested_symbol: str = "") -> SymbolMapping | None:
     symbol = requested_symbol.strip().upper()
     if symbol:
         return db.query(SymbolMapping).filter(SymbolMapping.symbol == symbol).first()
-    if position.platform == "hyperliquid":
-        return (
-            db.query(SymbolMapping)
-            .filter((SymbolMapping.hyperliquid_symbol == position.symbol) | (SymbolMapping.symbol == position.symbol))
-            .first()
-        )
-    return (
-        db.query(SymbolMapping)
-        .filter((SymbolMapping.mt5_symbol == position.symbol) | (SymbolMapping.symbol == position.symbol))
-        .first()
-    )
+    for mapping in db.query(SymbolMapping).all():
+        leg_a_venue, leg_a_symbol = mapping_leg(mapping, "a")
+        leg_b_venue, leg_b_symbol = mapping_leg(mapping, "b")
+        if position.platform == leg_a_venue and position.symbol in {mapping.symbol, leg_a_symbol}:
+            return mapping
+        if position.platform == leg_b_venue and position.symbol in {mapping.symbol, leg_b_symbol}:
+            return mapping
+        if position.symbol == mapping.symbol:
+            return mapping
+    return None
 
 
-def _direction_for_position(position: Position) -> str:
+def _direction_for_position(position: Position, mapping: SymbolMapping) -> str:
     side = position.side.lower()
-    if position.platform == "hyperliquid":
-        return "long_hyperliquid_short_mt5" if side == "long" else "long_mt5_short_hyperliquid"
-    return "long_mt5_short_hyperliquid" if side == "long" else "long_hyperliquid_short_mt5"
+    leg_a_venue, _ = mapping_leg(mapping, "a")
+    is_leg_a = position.platform == leg_a_venue
+    if is_leg_a:
+        return "long_leg_a_short_leg_b" if side == "long" else "long_leg_b_short_leg_a"
+    return "long_leg_b_short_leg_a" if side == "long" else "long_leg_a_short_leg_b"
 
 
 def _position_has_live_group(db: Session, position: Position, mapping: SymbolMapping) -> bool:
     groups = db.query(HedgeGroup).filter(HedgeGroup.execution_mode == "live").all()
-    symbols = {
-        "hyperliquid": {mapping.symbol, mapping.hyperliquid_symbol},
-        "mt5": {mapping.symbol, mapping.mt5_symbol},
+    leg_a_venue, leg_a_sym = mapping_leg(mapping, "a")
+    leg_b_venue, leg_b_sym = mapping_leg(mapping, "b")
+    platform_symbols = {
+        leg_a_venue: {mapping.symbol, leg_a_sym},
+        leg_b_venue: {mapping.symbol, leg_b_sym},
     }
-    if position.symbol not in symbols.get(position.platform, set()):
+    if position.symbol not in platform_symbols.get(position.platform, set()):
         return False
     return any(group.symbol == mapping.symbol and group.status != "closed" for group in groups)
 
@@ -685,23 +813,39 @@ def execution_reconcile(user: User = Depends(require_admin), db: Session = Depen
     return {"status": "ok", "changed": changed, "cost_changed": cost_changed}
 
 
-@router.post("/execution/hyperliquid-probe-test")
-def hyperliquid_probe_test(payload: HyperliquidProbeTestIn, user: User = Depends(require_admin), db: Session = Depends(get_db)) -> dict[str, Any]:
+@router.post("/execution/venue-probe-test")
+def venue_probe_test(payload: VenueProbeTestIn, user: User = Depends(require_admin), db: Session = Depends(get_db)) -> dict[str, Any]:
     side = payload.side.lower()
     if side not in {"buy", "sell"}:
         raise HTTPException(status_code=400, detail="side 必须是 buy 或 sell")
+    venue = payload.venue or "hyperliquid"
     mapping = db.query(SymbolMapping).filter(SymbolMapping.symbol == payload.symbol).first()
-    venue_symbol = mapping.hyperliquid_symbol if mapping else payload.symbol
+    if mapping:
+        leg_a_venue, leg_a_symbol = mapping_leg(mapping, "a")
+        leg_b_venue, leg_b_symbol = mapping_leg(mapping, "b")
+        if venue == leg_a_venue:
+            venue_symbol = leg_a_symbol
+        elif venue == leg_b_venue:
+            venue_symbol = leg_b_symbol
+        else:
+            venue_symbol = payload.symbol
+    else:
+        venue_symbol = payload.symbol
     settings = get_settings()
-    adapter = HyperliquidAdapter(live=True)
+    adapter = build_market_adapter(venue, live=True)
     adapter.paper_price_probe = True
     slippage = float(payload.slippage if payload.slippage is not None else settings.hyperliquid_paper_live_slippage)
     try:
         probe_quantity = float(payload.quantity) if payload.quantity is not None else adapter._probe_quantity(venue_symbol)
-        exchange = _load_hyperliquid_exchange(settings)
-        slippage_price = exchange._slippage_price(venue_symbol, side == "buy", slippage, None)
+        if venue == "hyperliquid":
+            exchange = _load_hyperliquid_exchange(settings)
+            slippage_price = exchange._slippage_price(venue_symbol, side == "buy", slippage, None)
+        else:
+            exchange = None
+            slippage_price = 0.0
         response: dict[str, Any] = {
             "symbol": payload.symbol,
+            "venue": venue,
             "venue_symbol": venue_symbol,
             "side": side,
             "reduce_only": payload.reduce_only,
@@ -709,18 +853,19 @@ def hyperliquid_probe_test(payload: HyperliquidProbeTestIn, user: User = Depends
             "probe_quantity": probe_quantity,
             "slippage": slippage,
             "slippage_price": slippage_price,
-            "asset": exchange.info.coin_to_asset.get(venue_symbol),
+            "asset": exchange.info.coin_to_asset.get(venue_symbol) if exchange else None,
             "status": "dry_run_ok",
         }
         if not payload.submit:
-            audit(db, user.id, "hyperliquid_probe_dry_run", "execution", f"{venue_symbol} {side} {probe_quantity}")
+            audit(db, user.id, "venue_probe_dry_run", "execution", f"{venue}:{venue_symbol} {side} {probe_quantity}")
             db.commit()
             return response
-        if payload.confirmation != "SUBMIT HYPERLIQUID PROBE":
-            raise HTTPException(status_code=400, detail="真实提交必须传 confirmation='SUBMIT HYPERLIQUID PROBE'")
+        confirmation_phrase = f"SUBMIT {venue.upper()} PROBE"
+        if payload.confirmation != confirmation_phrase:
+            raise HTTPException(status_code=400, detail=f"真实提交必须传 confirmation='{confirmation_phrase}'")
         order_result = adapter.place_order(
             AdapterOrder(
-                platform="hyperliquid",
+                platform=venue,
                 symbol=payload.symbol,
                 venue_symbol=venue_symbol,
                 side=side,
@@ -740,7 +885,7 @@ def hyperliquid_probe_test(payload: HyperliquidProbeTestIn, user: User = Depends
                 "message": order_result.error_message,
             }
         )
-        audit(db, user.id, "hyperliquid_probe_submit", "execution", f"{venue_symbol} {side} {probe_quantity} {order_result.status}")
+        audit(db, user.id, "venue_probe_submit", "execution", f"{venue}:{venue_symbol} {side} {probe_quantity} {order_result.status}")
         db.commit()
         return response
     except HTTPException:
@@ -748,6 +893,7 @@ def hyperliquid_probe_test(payload: HyperliquidProbeTestIn, user: User = Depends
     except Exception as exc:
         return {
             "symbol": payload.symbol,
+            "venue": venue,
             "venue_symbol": venue_symbol,
             "side": side,
             "reduce_only": payload.reduce_only,
@@ -767,7 +913,7 @@ def _orders_payload(db: Session, page: int = 1, page_size: int = 20) -> dict[str
     query = db.query(Order)
     total = query.count()
     rows = query.order_by(desc(Order.created_at)).offset((page - 1) * page_size).limit(page_size).all()
-    return {"total": total, "page": page, "page_size": page_size, "items": [as_dict(row) for row in rows]}
+    return {"total": total, "page": page, "page_size": page_size, "items": [_row_with_leg_metadata(db, row) for row in rows]}
 
 
 @router.get("/fills")
@@ -779,7 +925,7 @@ def _fills_payload(db: Session, page: int = 1, page_size: int = 20) -> dict[str,
     query = db.query(Fill)
     total = query.count()
     rows = query.order_by(desc(Fill.created_at)).offset((page - 1) * page_size).limit(page_size).all()
-    return {"total": total, "page": page, "page_size": page_size, "items": [as_dict(row) for row in rows]}
+    return {"total": total, "page": page, "page_size": page_size, "items": [_row_with_leg_metadata(db, row) for row in rows]}
 
 
 @router.get("/risk/status")
@@ -864,12 +1010,71 @@ def put_risk(payload: RiskSettingsIn, user: User = Depends(require_admin), db: S
 
 @router.get("/settings/symbol-mappings")
 def get_symbol_mappings(_: User = Depends(get_current_user), db: Session = Depends(get_db)) -> list[dict[str, Any]]:
-    return [as_dict(row) for row in db.query(SymbolMapping).order_by(SymbolMapping.symbol).all()]
+    return [_row_with_leg_metadata(db, row) for row in db.query(SymbolMapping).order_by(SymbolMapping.symbol).all()]
 
 
 @router.get("/settings/mt5-session-templates")
 def get_mt5_session_templates(_: User = Depends(get_current_user)) -> list[dict[str, Any]]:
     return mt5_session_templates()
+
+
+@router.get("/settings/exchanges")
+def get_exchange_credentials(_: User = Depends(get_current_user), db: Session = Depends(get_db)) -> list[dict[str, Any]]:
+    rows = db.query(ExchangeCredential).order_by(ExchangeCredential.venue).all()
+    return [public_exchange_credential(row) for row in rows]
+
+
+@router.post("/settings/exchanges")
+def create_exchange_credential(payload: ExchangeCredentialIn, user: User = Depends(require_admin), db: Session = Depends(get_db)) -> dict[str, Any]:
+    try:
+        row = upsert_exchange_credential(db, payload.model_dump())
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    audit(db, user.id, "upsert_exchange_credential", "settings", row.venue)
+    db.commit()
+    db.refresh(row)
+    return public_exchange_credential(row)
+
+
+@router.put("/settings/exchanges/{venue}")
+def update_exchange_credential(venue: str, payload: ExchangeCredentialIn, user: User = Depends(require_admin), db: Session = Depends(get_db)) -> dict[str, Any]:
+    if venue.strip().lower() != payload.venue.strip().lower():
+        raise HTTPException(status_code=400, detail="路径 venue 与请求体 venue 不一致")
+    try:
+        row = upsert_exchange_credential(db, payload.model_dump())
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    audit(db, user.id, "update_exchange_credential", "settings", row.venue)
+    db.commit()
+    db.refresh(row)
+    return public_exchange_credential(row)
+
+
+@router.delete("/settings/exchanges/{venue}")
+def delete_exchange_credential(venue: str, user: User = Depends(require_admin), db: Session = Depends(get_db)) -> dict[str, str]:
+    row = db.query(ExchangeCredential).filter(ExchangeCredential.venue == venue.strip().lower()).first()
+    if not row:
+        raise HTTPException(status_code=404, detail="交易所配置不存在")
+    db.delete(row)
+    audit(db, user.id, "delete_exchange_credential", "settings", venue)
+    db.commit()
+    return {"status": "ok"}
+
+
+@router.post("/settings/exchanges/{venue}/test")
+def test_exchange_credential(venue: str, user: User = Depends(require_admin), db: Session = Depends(get_db)) -> dict[str, Any]:
+    row = db.query(ExchangeCredential).filter(ExchangeCredential.venue == venue.strip().lower()).first()
+    if not row:
+        raise HTTPException(status_code=404, detail="交易所配置不存在")
+    try:
+        status, message = validate_exchange_credential(row)
+    except ValueError as exc:
+        status, message = "failed", str(exc)
+    mark_test_result(row, status, message)
+    audit(db, user.id, "test_exchange_credential", "settings", row.venue)
+    db.commit()
+    db.refresh(row)
+    return public_exchange_credential(row)
 
 
 @router.put("/settings/symbol-mappings")
@@ -878,7 +1083,7 @@ def put_symbol_mappings(payload: list[SymbolMappingIn], user: User = Depends(req
     for item in payload:
         row = db.query(SymbolMapping).filter(SymbolMapping.symbol == item.symbol).first()
         if not row:
-            row = SymbolMapping(symbol=item.symbol, hyperliquid_symbol=item.hyperliquid_symbol, mt5_symbol=item.mt5_symbol)
+            row = SymbolMapping(symbol=item.symbol, leg_a_venue_symbol=item.leg_a_venue_symbol, mt5_symbol=item.mt5_symbol)
         old_symbol = row.symbol
         for key, value in item.model_dump().items():
             setattr(row, key, value)
@@ -892,7 +1097,7 @@ def put_symbol_mappings(payload: list[SymbolMappingIn], user: User = Depends(req
     db.commit()
     clear_symbol_mapping_cache()
     clear_signal_stats_cache()
-    return [as_dict(row) for row in db.query(SymbolMapping).order_by(SymbolMapping.symbol).all()]
+    return [_row_with_leg_metadata(db, row) for row in db.query(SymbolMapping).order_by(SymbolMapping.symbol).all()]
 
 
 @router.post("/settings/symbol-mappings")
@@ -906,7 +1111,7 @@ def create_symbol_mapping(payload: SymbolMappingIn, user: User = Depends(require
     clear_symbol_mapping_cache()
     clear_signal_stats_cache()
     db.refresh(row)
-    return as_dict(row)
+    return _row_with_leg_metadata(db, row)
 
 
 @router.put("/settings/symbol-mappings/{mapping_id}")
@@ -929,7 +1134,7 @@ def update_symbol_mapping(mapping_id: int, payload: SymbolMappingIn, user: User 
     clear_symbol_mapping_cache()
     clear_signal_stats_cache()
     db.refresh(row)
-    return as_dict(row)
+    return _row_with_leg_metadata(db, row)
 
 
 @router.delete("/settings/symbol-mappings/{mapping_id}")
@@ -999,7 +1204,7 @@ def sync_symbol_mapping_from_broker(mapping_id: int, user: User = Depends(requir
     row.quote_asset = currency_profit or row.quote_asset
     row.mt5_min_base_size = mt5_min_base_size
     row.contract_multiplier = contract_size
-    row.hyperliquid_min_notional = row.hyperliquid_min_notional or get_settings().hyperliquid_default_min_notional
+    row.leg_a_min_notional = row.leg_a_min_notional or get_settings().hyperliquid_default_min_notional
     row.min_order_size = _effective_min_order_size(row)
     row.quantity_precision = max(_decimal_places(mt5_base_step), 0)
     row.price_precision = digits
@@ -1044,10 +1249,11 @@ def sync_symbol_mapping_sessions(mapping_id: int, user: User = Depends(require_a
 
 
 def _effective_min_order_size(row: SymbolMapping) -> float:
-    hyper_quote = quote_cache.latest("hyperliquid", row.symbol)
-    hyper_mid = hyper_quote.mid if hyper_quote else 0.0
-    hyper_notional_base = (row.hyperliquid_min_notional / hyper_mid) if hyper_mid > 0 and row.hyperliquid_min_notional > 0 else 0.0
-    return max(row.mt5_min_base_size or 0.0, row.hyperliquid_min_base_size or 0.0, hyper_notional_base)
+    leg_a_venue, _ = mapping_leg(row, "a")
+    leg_a_quote = quote_cache.latest(leg_a_venue, row.symbol)
+    leg_a_mid = leg_a_quote.mid if leg_a_quote else 0.0
+    leg_a_notional_base = (row.leg_a_min_notional / leg_a_mid) if leg_a_mid > 0 and row.leg_a_min_notional > 0 else 0.0
+    return max(row.mt5_min_base_size or 0.0, row.leg_a_min_base_size or 0.0, leg_a_notional_base)
 
 
 def _decimal_places(value: float) -> int:
@@ -1069,6 +1275,26 @@ def get_live_readiness(_: User = Depends(get_current_user), db: Session = Depend
 @router.get("/settings/paper-readiness")
 def get_paper_readiness(_: User = Depends(get_current_user), db: Session = Depends(get_db)) -> dict[str, Any]:
     return paper_execution_readiness(db)
+
+
+@router.get("/settings/execution")
+def get_execution_settings(_: User = Depends(get_current_user), db: Session = Depends(get_db)) -> dict[str, Any]:
+    return execution_settings_payload(db, get_settings())
+
+
+@router.put("/settings/execution")
+def put_execution_settings(payload: ExecutionSettingsIn, user: User = Depends(require_admin), db: Session = Depends(get_db)) -> dict[str, Any]:
+    current = execution_settings_payload(db, get_settings())
+    if payload.paper_live_probe_enabled and not current["paper_live_probe_enabled"] and payload.confirmation != "ENABLE PAPER LIVE PROBE":
+        raise HTTPException(status_code=400, detail="开启 Paper 真实探针需要输入确认短语")
+    set_execution_settings(
+        db,
+        paper_live_probe_enabled=payload.paper_live_probe_enabled,
+        paper_live_parallel_execution=payload.paper_live_parallel_execution,
+    )
+    audit(db, user.id, "update_execution_settings", "settings", json.dumps(payload.model_dump(exclude={"confirmation"}), ensure_ascii=False))
+    db.commit()
+    return execution_settings_payload(db, get_settings())
 
 
 @router.put("/settings/live-trading")
@@ -1120,3 +1346,6 @@ def ack_alert(alert_id: int, user: User = Depends(require_admin), db: Session = 
     audit(db, user.id, "ack_alert", "alert", str(alert_id))
     db.commit()
     return as_dict(row)
+
+
+

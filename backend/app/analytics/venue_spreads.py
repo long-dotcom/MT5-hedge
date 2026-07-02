@@ -13,7 +13,7 @@ from app.market.quotes import quote_cache
 
 
 def load_venue_spread_series(
-    db: Session, symbol: str, range_value: str, range_key: str | None = None
+    db: Session, symbol: str, range_value: str, range_key: str | None = None, leg_a_venue: str = "hyperliquid", leg_b_venue: str = "mt5"
 ) -> list[dict[str, Any]]:
     """Load per-venue bid-ask spread time-series for *symbol*.
 
@@ -26,7 +26,7 @@ def load_venue_spread_series(
 
     # For short ranges try live quote_cache first
     if effective_key in ("15m", "1h"):
-        series = _series_from_quote_cache(symbol, start_at)
+        series = _series_from_quote_cache(symbol, start_at, leg_a_venue=leg_a_venue, leg_b_venue=leg_b_venue)
         if len(series) >= 30:
             return series
 
@@ -35,10 +35,10 @@ def load_venue_spread_series(
 
 
 def _series_from_quote_cache(
-    symbol: str, start_at: datetime
+    symbol: str, start_at: datetime, leg_a_venue: str = "hyperliquid", leg_b_venue: str = "mt5"
 ) -> list[dict[str, Any]]:
-    hl_quotes = quote_cache.history("hyperliquid", symbol)
-    mt5_quotes = quote_cache.history("mt5", symbol)
+    hl_quotes = quote_cache.history(leg_a_venue, symbol)
+    mt5_quotes = quote_cache.history(leg_b_venue, symbol)
 
     hl_quotes = [q for q in hl_quotes if q.local_recv_ts >= start_at]
     mt5_quotes = [q for q in mt5_quotes if q.local_recv_ts >= start_at]
@@ -68,8 +68,8 @@ def _series_from_quote_cache(
         series.append(
             {
                 "time": hl_q.local_recv_ts.isoformat(),
-                "hl_spread": hl_q.ask - hl_q.bid,
-                "mt5_spread": mt5_q.ask - mt5_q.bid,
+                "leg_a_spread": hl_q.ask - hl_q.bid,
+                "leg_b_spread": mt5_q.ask - mt5_q.bid,
             }
         )
     return series
@@ -90,8 +90,8 @@ def _series_from_db(
     return [
         {
             "time": row.created_at.isoformat(),
-            "hl_spread": float(row.hyperliquid_ask) - float(row.hyperliquid_bid),
-            "mt5_spread": float(row.mt5_ask) - float(row.mt5_bid),
+            "leg_a_spread": float(row.leg_a_ask) - float(row.leg_a_bid),
+            "leg_b_spread": float(row.leg_b_ask) - float(row.leg_b_bid),
         }
         for row in rows
     ]
@@ -165,21 +165,21 @@ def downsample_venue_spreads(
     result: list[dict[str, Any]] = []
     for idx in sorted(buckets):
         bucket = buckets[idx]
-        hl_vals = [p["hl_spread"] for p in bucket]
-        mt5_vals = [p["mt5_spread"] for p in bucket]
+        hl_vals = [p["leg_a_spread"] for p in bucket]
+        mt5_vals = [p["leg_b_spread"] for p in bucket]
         result.append(
             {
                 "time": bucket[-1]["time"],
-                "hl_open": hl_vals[0],
-                "hl_close": hl_vals[-1],
-                "hl_high": max(hl_vals),
-                "hl_low": min(hl_vals),
-                "hl_avg": round(mean(hl_vals), 6),
-                "mt5_open": mt5_vals[0],
-                "mt5_close": mt5_vals[-1],
-                "mt5_high": max(mt5_vals),
-                "mt5_low": min(mt5_vals),
-                "mt5_avg": round(mean(mt5_vals), 6),
+                "leg_a_open": hl_vals[0],
+                "leg_a_close": hl_vals[-1],
+                "leg_a_high": max(hl_vals),
+                "leg_a_low": min(hl_vals),
+                "leg_a_avg": round(mean(hl_vals), 6),
+                "leg_b_open": mt5_vals[0],
+                "leg_b_close": mt5_vals[-1],
+                "leg_b_high": max(mt5_vals),
+                "leg_b_low": min(mt5_vals),
+                "leg_b_avg": round(mean(mt5_vals), 6),
                 "count": len(bucket),
             }
         )
@@ -187,7 +187,7 @@ def downsample_venue_spreads(
 
 
 def venue_spread_report(
-    db: Session, symbol: str, range_value: str, range_key: str | None = None
+    db: Session, symbol: str, range_value: str, range_key: str | None = None, leg_a_venue: str = "hyperliquid", leg_b_venue: str = "mt5"
 ) -> dict[str, Any]:
     """Main entry: build the full venue-spreads report.
 
@@ -195,17 +195,17 @@ def venue_spread_report(
     callers who have already normalised the range string can avoid
     re-parsing.
     """
-    series = load_venue_spread_series(db, symbol, range_value, range_key=range_key)
+    series = load_venue_spread_series(db, symbol, range_value, range_key=range_key, leg_a_venue=leg_a_venue, leg_b_venue=leg_b_venue)
 
-    hl_values = [p["hl_spread"] for p in series]
-    mt5_values = [p["mt5_spread"] for p in series]
+    hl_values = [p["leg_a_spread"] for p in series]
+    mt5_values = [p["leg_b_spread"] for p in series]
 
     return {
         "symbol": symbol,
         "range": range_value,
         "summary": {
-            "hl": summarize_venue_spreads(hl_values),
-            "mt5": summarize_venue_spreads(mt5_values),
+            "leg_a": summarize_venue_spreads(hl_values),
+            "leg_b": summarize_venue_spreads(mt5_values),
         },
         "series": downsample_venue_spreads(series, range_value),
     }

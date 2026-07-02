@@ -1,7 +1,9 @@
 symbols:
   - symbol: BTC
-    hyperliquid_symbol: BTC
+    leg_a_venue: hyperliquid
+    leg_a_venue_symbol: BTC
     mt5_symbol: BTCUSD
+    leg_b_venue: mt5
     base_asset: BTC
     quote_asset: USD
     contract_multiplier: 1
@@ -15,8 +17,10 @@ symbols:
     allow_hold_through_mt5_close: false
     enabled: true
   - symbol: ETH
-    hyperliquid_symbol: ETH
+    leg_a_venue: hyperliquid
+    leg_a_venue_symbol: ETH
     mt5_symbol: ETHUSD
+    leg_b_venue: mt5
     base_asset: ETH
     quote_asset: USD
     contract_multiplier: 1

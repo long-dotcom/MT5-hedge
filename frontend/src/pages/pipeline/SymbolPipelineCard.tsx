@@ -1,6 +1,7 @@
 import { memo } from 'react';
 import { Card, Space, Tag, Tooltip, Typography } from 'antd';
 import { fmtAdaptive, fmtPct } from '../../utils/format';
+import { legTitle, venueLabel } from '../../utils/venues';
 import { PipelineStatusTag, statusClass } from './PipelineStatusTag';
 import type { PipelineEdge, PipelineNode, SymbolPipeline } from './types';
 
@@ -22,7 +23,7 @@ const MAIN_FLOW = ['sync', 'scan', 'signal', 'candidate', 'stream'];
 
 function isAfterBlockedStage(key: string, blockedStage?: string) {
   if (!blockedStage) return false;
-  if (blockedStage === 'hl_quote' || blockedStage === 'mt5_quote') {
+  if (['hl_quote', 'mt5_quote', 'leg_a_quote', 'leg_b_quote'].includes(blockedStage)) {
     return MAIN_FLOW.includes(key);
   }
   const blockedIndex = MAIN_FLOW.indexOf(blockedStage);
@@ -84,16 +85,16 @@ function Valve({ active, className }: { active: boolean; className: string }) {
 function PipelinePath({ symbol }: { symbol: SymbolPipeline }) {
   const nodes = symbol.nodes;
   const edges = symbol.edges;
-  const hl = nodeByKey(nodes, 'hl_quote');
-  const mt5 = nodeByKey(nodes, 'mt5_quote');
+  const legA = nodeByKey(nodes, 'leg_a_quote') || nodeByKey(nodes, 'hl_quote');
+  const legB = nodeByKey(nodes, 'leg_b_quote') || nodeByKey(nodes, 'mt5_quote');
   const sync = nodeByKey(nodes, 'sync');
   const scan = nodeByKey(nodes, 'scan');
   const signal = nodeByKey(nodes, 'signal');
   const candidate = nodeByKey(nodes, 'candidate');
   const stream = nodeByKey(nodes, 'stream');
   const blockedStage = symbol.blocked_stage;
-  const hlEdge = edgeBetween(edges, 'hl_quote', 'sync');
-  const mt5Edge = edgeBetween(edges, 'mt5_quote', 'sync');
+  const legAEdge = edgeBetween(edges, 'leg_a_quote', 'sync') || edgeBetween(edges, 'hl_quote', 'sync');
+  const legBEdge = edgeBetween(edges, 'leg_b_quote', 'sync') || edgeBetween(edges, 'mt5_quote', 'sync');
   const syncScan = edgeBetween(edges, 'sync', 'scan');
   const scanSignal = edgeBetween(edges, 'scan', 'signal');
   const signalCandidate = edgeBetween(edges, 'signal', 'candidate');
@@ -103,31 +104,31 @@ function PipelinePath({ symbol }: { symbol: SymbolPipeline }) {
   return (
     <div className="pipeline-board">
       <svg className="pipeline-svg" viewBox="0 0 1000 150" preserveAspectRatio="none" aria-hidden>
-        <PipeSvgSegment path="M150 43 H220 C250 43 250 73 285 73" status={hlEdge?.status || hl?.status} />
-        <PipeSvgSegment path="M150 111 H220 C250 111 250 77 285 77" status={mt5Edge?.status || mt5?.status} />
+        <PipeSvgSegment path="M150 43 H220 C250 43 250 73 285 73" status={legAEdge?.status || legA?.status} />
+        <PipeSvgSegment path="M150 111 H220 C250 111 250 77 285 77" status={legBEdge?.status || legB?.status} />
         <PipeSvgSegment path="M305 75 H455" status={displayStatus(syncScan?.status, 'scan', blockedStage)} />
         <PipeSvgSegment path="M465 75 H615" status={displayStatus(scanSignal?.status, 'signal', blockedStage)} />
         <PipeSvgSegment path="M625 75 H775" status={displayStatus(signalCandidate?.status, 'candidate', blockedStage)} />
         <PipeSvgSegment path="M785 75 H925" status={displayStatus(candidateStream?.status, 'stream', blockedStage)} />
       </svg>
-      <div className="pipe-svg-label label-hl-sync">{msText(hlEdge?.latency_ms)}</div>
-      <div className="pipe-svg-label label-mt5-sync">{msText(mt5Edge?.latency_ms)}</div>
+      <div className="pipe-svg-label label-hl-sync">{msText(legAEdge?.latency_ms)}</div>
+      <div className="pipe-svg-label label-mt5-sync">{msText(legBEdge?.latency_ms)}</div>
       <div className="pipe-svg-label label-sync-scan">{msText(syncScan?.latency_ms)}</div>
       <div className="pipe-svg-label label-scan-signal">{msText(scanSignal?.latency_ms)}</div>
       <div className="pipe-svg-label label-signal-candidate">{signalCandidate?.label || '-'}</div>
       <div className="pipe-svg-label label-candidate-stream">{candidateStream?.label || '-'}</div>
       <div className={`pipeline-merge-joint pipe-board-joint ${statusClass(displayStatus(sync?.status, 'sync', blockedStage))}`} />
-      <Valve active={isBlocked('hl_quote')} className="valve-hl" />
-      <Valve active={isBlocked('mt5_quote')} className="valve-mt5" />
+      <Valve active={isBlocked('leg_a_quote') || isBlocked('hl_quote')} className="valve-hl" />
+      <Valve active={isBlocked('leg_b_quote') || isBlocked('mt5_quote')} className="valve-mt5" />
       <Valve active={isBlocked('sync')} className="valve-sync" />
       <Valve active={isBlocked('scan')} className="valve-scan" />
       <Valve active={isBlocked('signal')} className="valve-signal" />
       <Valve active={isBlocked('candidate')} className="valve-candidate" />
       <div className="pipeline-board-source source-hl">
-        <SourceQuotePill node={hl} label="HL" />
+        <SourceQuotePill node={legA} label={venueLabel(symbol.leg_a_venue)} />
       </div>
       <div className="pipeline-board-source source-mt5">
-        <SourceQuotePill node={mt5} label="MT5" />
+        <SourceQuotePill node={legB} label={venueLabel(symbol.leg_b_venue)} />
       </div>
       <div className="stage-label stage-sync">同步</div>
       <div className="stage-label stage-scan">扫描</div>
@@ -161,8 +162,8 @@ export const SymbolPipelineCard = memo(function SymbolPipelineCard({ symbol }: {
       <div className="pipeline-card-header">
         <Space size={8} wrap>
           <Typography.Text strong className="pipeline-symbol">{symbol.symbol}</Typography.Text>
-          <Typography.Text type="secondary">{symbol.hyperliquid_symbol}</Typography.Text>
-          <Typography.Text type="secondary">/ MT5: {symbol.mt5_symbol}</Typography.Text>
+          <Typography.Text type="secondary">{legTitle(symbol, 'a')}</Typography.Text>
+          <Typography.Text type="secondary">/ {legTitle(symbol, 'b')}</Typography.Text>
           <PipelineStatusTag status={symbol.status} />
         </Space>
         <div className="pipeline-reason-group">
@@ -182,8 +183,8 @@ export const SymbolPipelineCard = memo(function SymbolPipelineCard({ symbol }: {
       </div>
       <PipelinePath symbol={symbol} />
       <div className="pipeline-card-footer">
-        <span>HL age {msText(symbol.metrics.hl_age_ms)}</span>
-        <span>MT5 age {msText(symbol.metrics.mt5_age_ms)}</span>
+        <span>{venueLabel(symbol.leg_a_venue)} age {msText(symbol.metrics.leg_a_age_ms ?? symbol.metrics.hl_age_ms)}</span>
+        <span>{venueLabel(symbol.leg_b_venue)} age {msText(symbol.metrics.leg_b_age_ms ?? symbol.metrics.mt5_age_ms)}</span>
         <span>同步差 {msText(symbol.metrics.sync_diff_ms)}</span>
         <span>扫描 age {msText(symbol.metrics.scan_age_ms)}</span>
         <span>净利/份 {fmtAdaptive(netProfit ?? undefined)}</span>

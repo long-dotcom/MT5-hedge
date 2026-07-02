@@ -50,6 +50,7 @@ class Settings:
     access_token_minutes: int = 720
     admin_username: str = "admin"
     admin_password: str = INSECURE_DEFAULT_ADMIN_PASSWORD
+    exchange_config_secret: str = ""
     default_execution_mode: str = "paper"
     symbol_mapping_path: str = str(ROOT_DIR / "config" / "symbol_mappings.yaml")
     live_trading_enabled: bool = False
@@ -79,6 +80,8 @@ class Settings:
     hyperliquid_fee_round_trips: float = 2.0
     hyperliquid_secret_key: str = ""
     hyperliquid_paper_live_order_enabled: bool = False
+    paper_live_probe_enabled: bool = False
+    paper_live_probe_venues: str = "*"
     paper_live_parallel_execution: bool = True
     hyperliquid_paper_live_slippage: float = 0.01
     mt5_default_commission_rate: float = 0.0
@@ -95,6 +98,12 @@ class Settings:
     fx_fallback_rates: str = '{"JPY":0.00625}'
     cost_cache_ttl_seconds: int = 60
     carry_cost_sync_interval_seconds: int = 300
+    nautilus_enabled: bool = False
+    nautilus_read_only_sync_enabled: bool = True
+    nautilus_quote_poll_interval_ms: int = 1000
+    nautilus_allowed_venues: str = "binance,okx,bybit"
+    nautilus_environment: str = "sandbox"
+    nautilus_credentials_json: str = "{}"
 
     hyperliquid_account_address: str = ""
     execution_reconcile_pending_stale_seconds: int = 300
@@ -129,6 +138,7 @@ def runtime_requires_strong_secrets(settings: Settings) -> bool:
         settings.live_trading_enabled
         or settings.mt5_live_order_enabled
         or settings.hyperliquid_paper_live_order_enabled
+        or settings.paper_live_probe_enabled
         or settings.default_execution_mode == "live"
     )
     return environment not in LOCAL_ENVIRONMENTS or live_switch_enabled

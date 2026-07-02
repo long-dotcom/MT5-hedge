@@ -10,3 +10,4 @@ httpx>=0.28.1,<0.29
 python-multipart>=0.0.20,<0.1
 MetaTrader5>=5.0.5735,<5.1
 hyperliquid-python-sdk>=0.24.0,<0.25
+cryptography>=42,<45

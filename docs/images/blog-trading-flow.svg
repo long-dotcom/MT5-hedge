@@ -1,0 +1,97 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 520" font-family="'Segoe UI', system-ui, sans-serif">
+  <defs>
+    <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#64748b"/>
+    </marker>
+    <marker id="ag" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#16a34a"/>
+    </marker>
+    <marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#dc2626"/>
+    </marker>
+  </defs>
+
+  <rect width="800" height="520" rx="8" fill="#f8fafc"/>
+
+  <!-- Open phase -->
+  <text x="200" y="30" text-anchor="middle" font-size="14" font-weight="600" fill="#1e40af">开仓阶段</text>
+
+  <!-- Signal -->
+  <rect x="120" y="45" width="160" height="36" rx="18" fill="#dbeafe" stroke="#93c5fd" stroke-width="1.5"/>
+  <text x="200" y="68" text-anchor="middle" font-size="12" fill="#1e40af">executable 信号</text>
+
+  <line x1="200" y1="81" x2="200" y2="100" stroke="#64748b" stroke-width="1.2" marker-end="url(#a)"/>
+
+  <!-- 10-step chain -->
+  <rect x="80" y="105" width="240" height="120" rx="6" fill="#eff6ff" stroke="#93c5fd" stroke-width="1.2" stroke-dasharray="4,3"/>
+  <text x="200" y="122" text-anchor="middle" font-size="11" font-weight="600" fill="#1e40af">10 步保护链</text>
+  <text x="110" y="140" font-size="9" fill="#475569">1. 信号验证</text>
+  <text x="110" y="153" font-size="9" fill="#475569">2. 执行模式检查</text>
+  <text x="110" y="166" font-size="9" fill="#475569">3. 品种映射 + MT5 会话权限</text>
+  <text x="110" y="179" font-size="9" fill="#475569">4. MT5 订单预检</text>
+  <text x="110" y="192" font-size="9" fill="#475569">5. 严格报价同步 (500ms)</text>
+  <text x="110" y="205" font-size="9" fill="#475569">6. 价差再验证 + 风控预检 (6项)</text>
+  <text x="110" y="218" font-size="9" fill="#475569">7. 创建对冲组 → 双边下单</text>
+
+  <line x1="200" y1="225" x2="200" y2="248" stroke="#64748b" stroke-width="1.2" marker-end="url(#a)"/>
+
+  <!-- Dual order -->
+  <rect x="100" y="253" width="90" height="36" rx="6" fill="#dcfce7" stroke="#86efac" stroke-width="1.2"/>
+  <text x="145" y="276" text-anchor="middle" font-size="11" fill="#166534">HL 下单</text>
+  <rect x="210" y="253" width="90" height="36" rx="6" fill="#dcfce7" stroke="#86efac" stroke-width="1.2"/>
+  <text x="255" y="276" text-anchor="middle" font-size="11" fill="#166534">MT5 下单</text>
+
+  <line x1="200" y1="289" x2="200" y2="310" stroke="#16a34a" stroke-width="1.2" marker-end="url(#ag)"/>
+
+  <!-- Open state -->
+  <rect x="130" y="315" width="140" height="36" rx="18" fill="#dcfce7" stroke="#16a34a" stroke-width="2"/>
+  <text x="200" y="338" text-anchor="middle" font-size="13" font-weight="700" fill="#166534">持仓中 (open)</text>
+
+  <!-- Hold phase label -->
+  <text x="600" y="30" text-anchor="middle" font-size="14" font-weight="600" fill="#92400e">持仓监控</text>
+
+  <!-- Auto close triggers -->
+  <rect x="480" y="45" width="240" height="100" rx="6" fill="#fffbeb" stroke="#fcd34d" stroke-width="1.2" stroke-dasharray="4,3"/>
+  <text x="600" y="62" text-anchor="middle" font-size="11" font-weight="600" fill="#92400e">自动平仓触发条件</text>
+  <text x="500" y="82" font-size="10" fill="#78350f">1. 退出线触发：close_spread ≤ exit_target</text>
+  <text x="500" y="100" font-size="10" fill="#78350f">2. 超时触发：持仓 > max_holding_minutes</text>
+  <text x="500" y="118" font-size="10" fill="#78350f">3. 利润检查：估算利润 ≥ min_profit</text>
+
+  <!-- Close flow -->
+  <line x1="600" y1="145" x2="600" y2="175" stroke="#64748b" stroke-width="1.2" marker-end="url(#a)"/>
+
+  <rect x="490" y="180" width="220" height="55" rx="6" fill="#fef3c7" stroke="#fbbf24" stroke-width="1.2"/>
+  <text x="600" y="198" text-anchor="middle" font-size="11" font-weight="600" fill="#92400e">平仓执行</text>
+  <text x="510" y="215" font-size="9" fill="#78350f">严格同步 → 最终复核 → 双边平仓</text>
+  <text x="510" y="228" font-size="9" fill="#78350f">断路器检查 → 真实 fill 回写 PnL</text>
+
+  <line x1="600" y1="235" x2="600" y2="260" stroke="#16a34a" stroke-width="1.2" marker-end="url(#ag)"/>
+
+  <rect x="530" y="265" width="140" height="36" rx="18" fill="#dcfce7" stroke="#16a34a" stroke-width="2"/>
+  <text x="600" y="288" text-anchor="middle" font-size="13" font-weight="700" fill="#166534">closed</text>
+
+  <!-- Hedge group status flow at bottom -->
+  <text x="400" y="385" text-anchor="middle" font-size="14" font-weight="600" fill="#334155">对冲组状态流转</text>
+
+  <rect x="40" y="405" width="100" height="32" rx="16" fill="#dbeafe" stroke="#93c5fd" stroke-width="1.2"/>
+  <text x="90" y="426" text-anchor="middle" font-size="11" fill="#1e40af">opening</text>
+  <line x1="140" y1="421" x2="170" y2="421" stroke="#64748b" stroke-width="1.2" marker-end="url(#a)"/>
+
+  <rect x="175" y="405" width="100" height="32" rx="16" fill="#dcfce7" stroke="#86efac" stroke-width="1.2"/>
+  <text x="225" y="426" text-anchor="middle" font-size="11" fill="#166534">open</text>
+  <line x1="275" y1="421" x2="305" y2="421" stroke="#64748b" stroke-width="1.2" marker-end="url(#a)"/>
+
+  <rect x="310" y="405" width="100" height="32" rx="16" fill="#fef3c7" stroke="#fcd34d" stroke-width="1.2"/>
+  <text x="360" y="426" text-anchor="middle" font-size="11" fill="#92400e">closing</text>
+  <line x1="410" y1="421" x2="440" y2="421" stroke="#64748b" stroke-width="1.2" marker-end="url(#a)"/>
+
+  <rect x="445" y="405" width="100" height="32" rx="16" fill="#dcfce7" stroke="#16a34a" stroke-width="1.5"/>
+  <text x="495" y="426" text-anchor="middle" font-size="11" fill="#166534">closed</text>
+
+  <!-- manual_intervention branch -->
+  <line x1="225" y1="437" x2="225" y2="462" stroke="#dc2626" stroke-width="1.2" marker-end="url(#ar)"/>
+  <rect x="145" y="467" width="160" height="32" rx="16" fill="#fef2f2" stroke="#fca5a5" stroke-width="1.2"/>
+  <text x="225" y="488" text-anchor="middle" font-size="10" fill="#dc2626">manual_intervention</text>
+
+  <text x="400" y="510" text-anchor="middle" font-size="10" fill="#94a3b8">单边成交异常时进入人工干预状态</text>
+</svg>

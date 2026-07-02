@@ -4,6 +4,7 @@ import ReactECharts from 'echarts-for-react';
 import { useMemo, useState } from 'react';
 import { api } from '../api/client';
 import { fmtAdaptive, fmtChartTime, fmtNum } from '../utils/format';
+import { legMeta, venueLabel } from '../utils/venues';
 
 const ranges = [
   { value: '15m', label: '15分钟' },
@@ -35,45 +36,49 @@ export function VenueSpreadsPage() {
 
   const summary = query.data?.summary;
   const series = query.data?.series || [];
+  const activeMapping = query.data || (symbols.data || []).find((row: any) => row.symbol === activeSymbol);
+  const meta = legMeta(activeMapping);
+  const legALabel = venueLabel(meta.leg_a_venue);
+  const legBLabel = venueLabel(meta.leg_b_venue);
 
   const option = useMemo(() => {
     const times = series.map((row: any) => fmtChartTime(row.time));
-    const hlData = series.map((row: any) => row.hl_avg);
-    const mt5Data = series.map((row: any) => row.mt5_avg);
+    const legAData = series.map((row: any) => row.leg_a_avg);
+    const legBData = series.map((row: any) => row.leg_b_avg);
 
-    const hlMean = summary?.hl?.mean ?? 0;
-    const mt5Mean = summary?.mt5?.mean ?? 0;
-    const hlMeanArr = series.map(() => hlMean);
-    const mt5MeanArr = series.map(() => mt5Mean);
+    const legAMean = summary?.leg_a?.mean ?? 0;
+    const legBMean = summary?.leg_b?.mean ?? 0;
+    const legAMeanArr = series.map(() => legAMean);
+    const legBMeanArr = series.map(() => legBMean);
 
-    const hlStd = summary?.hl?.std ?? 0;
-    const mt5Std = summary?.mt5?.std ?? 0;
-    const hlUpper3 = hlMean + hlStd * 3;
-    const mt5Upper3 = mt5Mean + mt5Std * 3;
-    const hlUpper3Arr = series.map(() => hlUpper3);
-    const mt5Upper3Arr = series.map(() => mt5Upper3);
+    const legAStd = summary?.leg_a?.std ?? 0;
+    const legBStd = summary?.leg_b?.std ?? 0;
+    const legAUpper3 = legAMean + legAStd * 3;
+    const legBUpper3 = legBMean + legBStd * 3;
+    const legAUpper3Arr = series.map(() => legAUpper3);
+    const legBUpper3Arr = series.map(() => legBUpper3);
 
     // Build markArea data for anomaly regions (value > mean + 3σ)
-    const hlAnomalyAreas: any[] = [];
-    const mt5AnomalyAreas: any[] = [];
-    let hlStart: any = null;
-    let mt5Start: any = null;
+    const legAAnomalyAreas: any[] = [];
+    const legBAnomalyAreas: any[] = [];
+    let legAStart: any = null;
+    let legBStart: any = null;
     for (let i = 0; i < series.length; i++) {
-      const hlExceed = series[i].hl_avg > hlUpper3;
-      const mt5Exceed = series[i].mt5_avg > mt5Upper3;
-      if (hlExceed && hlStart === null) hlStart = i;
-      if (!hlExceed && hlStart !== null) {
-        hlAnomalyAreas.push([{ xAxis: hlStart }, { xAxis: i - 1 }]);
-        hlStart = null;
+      const legAExceed = series[i].leg_a_avg > legAUpper3;
+      const legBExceed = series[i].leg_b_avg > legBUpper3;
+      if (legAExceed && legAStart === null) legAStart = i;
+      if (!legAExceed && legAStart !== null) {
+        legAAnomalyAreas.push([{ xAxis: legAStart }, { xAxis: i - 1 }]);
+        legAStart = null;
       }
-      if (mt5Exceed && mt5Start === null) mt5Start = i;
-      if (!mt5Exceed && mt5Start !== null) {
-        mt5AnomalyAreas.push([{ xAxis: mt5Start }, { xAxis: i - 1 }]);
-        mt5Start = null;
+      if (legBExceed && legBStart === null) legBStart = i;
+      if (!legBExceed && legBStart !== null) {
+        legBAnomalyAreas.push([{ xAxis: legBStart }, { xAxis: i - 1 }]);
+        legBStart = null;
       }
     }
-    if (hlStart !== null) hlAnomalyAreas.push([{ xAxis: hlStart }, { xAxis: series.length - 1 }]);
-    if (mt5Start !== null) mt5AnomalyAreas.push([{ xAxis: mt5Start }, { xAxis: series.length - 1 }]);
+    if (legAStart !== null) legAAnomalyAreas.push([{ xAxis: legAStart }, { xAxis: series.length - 1 }]);
+    if (legBStart !== null) legBAnomalyAreas.push([{ xAxis: legBStart }, { xAxis: series.length - 1 }]);
 
     return {
       animation: false,
@@ -81,31 +86,31 @@ export function VenueSpreadsPage() {
         trigger: 'axis',
         valueFormatter: (value: unknown) => fmtChartValue(value)
       },
-      legend: { top: 0, data: ['HL 点差', 'MT5 点差', 'HL 均值', 'MT5 均值', '+3σ'] },
+      legend: { top: 0, data: [`${legALabel} 点差`, `${legBLabel} 点差`, `${legALabel} 均值`, `${legBLabel} 均值`, '+3σ'] },
       grid: { left: 48, right: 28, top: 48, bottom: 42 },
       xAxis: { type: 'category', data: times, boundaryGap: false },
       yAxis: { type: 'value', scale: true, axisLabel: { formatter: (value: number) => fmtChartValue(value) } },
       dataZoom: [{ type: 'inside' }, { type: 'slider', height: 18, bottom: 8 }],
       series: [
         {
-          name: 'HL 点差', type: 'line', data: hlData, showSymbol: false,
+          name: `${legALabel} 点差`, type: 'line', data: legAData, showSymbol: false,
           lineStyle: { width: 2, color: '#1677ff' },
           itemStyle: { color: '#1677ff' },
-          markArea: hlAnomalyAreas.length ? { silent: true, data: hlAnomalyAreas.map((pair) => pair.map((p: any) => ({ ...p, itemStyle: { color: 'rgba(255,77,79,0.08)' } }))) } : undefined,
+          markArea: legAAnomalyAreas.length ? { silent: true, data: legAAnomalyAreas.map((pair) => pair.map((p: any) => ({ ...p, itemStyle: { color: 'rgba(255,77,79,0.08)' } }))) } : undefined,
         },
         {
-          name: 'MT5 点差', type: 'line', data: mt5Data, showSymbol: false,
+          name: `${legBLabel} 点差`, type: 'line', data: legBData, showSymbol: false,
           lineStyle: { width: 2, color: '#52c41a' },
           itemStyle: { color: '#52c41a' },
-          markArea: mt5AnomalyAreas.length ? { silent: true, data: mt5AnomalyAreas.map((pair) => pair.map((p: any) => ({ ...p, itemStyle: { color: 'rgba(255,77,79,0.08)' } }))) } : undefined,
+          markArea: legBAnomalyAreas.length ? { silent: true, data: legBAnomalyAreas.map((pair) => pair.map((p: any) => ({ ...p, itemStyle: { color: 'rgba(255,77,79,0.08)' } }))) } : undefined,
         },
-        { name: 'HL 均值', type: 'line', data: hlMeanArr, showSymbol: false, lineStyle: { width: 1.5, type: 'dashed', color: '#1677ff' } },
-        { name: 'MT5 均值', type: 'line', data: mt5MeanArr, showSymbol: false, lineStyle: { width: 1.5, type: 'dashed', color: '#52c41a' } },
-        { name: '+3σ', type: 'line', data: hlUpper3Arr, showSymbol: false, lineStyle: { width: 1, type: 'dotted', color: '#ff4d4f' } },
-        { name: '+3σ(mt5)', type: 'line', data: mt5Upper3Arr, showSymbol: false, lineStyle: { width: 1, type: 'dotted', color: '#ff4d4f' }, tooltip: { show: false } },
+        { name: `${legALabel} 均值`, type: 'line', data: legAMeanArr, showSymbol: false, lineStyle: { width: 1.5, type: 'dashed', color: '#1677ff' } },
+        { name: `${legBLabel} 均值`, type: 'line', data: legBMeanArr, showSymbol: false, lineStyle: { width: 1.5, type: 'dashed', color: '#52c41a' } },
+        { name: '+3σ', type: 'line', data: legAUpper3Arr, showSymbol: false, lineStyle: { width: 1, type: 'dotted', color: '#ff4d4f' } },
+        { name: `+3σ(${legBLabel})`, type: 'line', data: legBUpper3Arr, showSymbol: false, lineStyle: { width: 1, type: 'dotted', color: '#ff4d4f' }, tooltip: { show: false } },
       ]
     };
-  }, [series, summary]);
+  }, [series, summary, legALabel, legBLabel]);
 
   const symbolOptions = (symbols.data || []).map((row: any) => ({ value: row.symbol, label: row.symbol }));
 
@@ -134,24 +139,24 @@ export function VenueSpreadsPage() {
       <Row gutter={[16, 16]}>
         <Col xs={24} sm={12} lg={6}>
           <Card className="metric-card">
-            <Statistic title="HL 当前点差" value={summary?.hl?.current || 0} formatter={(value) => fmtChartValue(value)} />
-            <div style={{ marginTop: 4, color: '#888', fontSize: 12 }}>均值: {fmtChartValue(summary?.hl?.mean)}</div>
+            <Statistic title={`${legALabel} 当前点差`} value={summary?.leg_a?.current || 0} formatter={(value) => fmtChartValue(value)} />
+            <div style={{ marginTop: 4, color: '#888', fontSize: 12 }}>均值: {fmtChartValue(summary?.leg_a?.mean)}</div>
           </Card>
         </Col>
         <Col xs={24} sm={12} lg={6}>
           <Card className="metric-card">
-            <Statistic title="MT5 当前点差" value={summary?.mt5?.current || 0} formatter={(value) => fmtChartValue(value)} />
-            <div style={{ marginTop: 4, color: '#888', fontSize: 12 }}>均值: {fmtChartValue(summary?.mt5?.mean)}</div>
+            <Statistic title={`${legBLabel} 当前点差`} value={summary?.leg_b?.current || 0} formatter={(value) => fmtChartValue(value)} />
+            <div style={{ marginTop: 4, color: '#888', fontSize: 12 }}>均值: {fmtChartValue(summary?.leg_b?.mean)}</div>
           </Card>
         </Col>
         <Col xs={24} sm={12} lg={6}>
           <Card className="metric-card">
-            <Statistic title="HL 变异系数 (CV)" value={summary?.hl?.cv || 0} formatter={(value) => fmtNum(value as number, 4)} />
+            <Statistic title={`${legALabel} 变异系数 (CV)`} value={summary?.leg_a?.cv || 0} formatter={(value) => fmtNum(value as number, 4)} />
           </Card>
         </Col>
         <Col xs={24} sm={12} lg={6}>
           <Card className="metric-card">
-            <Statistic title="MT5 变异系数 (CV)" value={summary?.mt5?.cv || 0} formatter={(value) => fmtNum(value as number, 4)} />
+            <Statistic title={`${legBLabel} 变异系数 (CV)`} value={summary?.leg_b?.cv || 0} formatter={(value) => fmtNum(value as number, 4)} />
           </Card>
         </Col>
       </Row>
@@ -164,9 +169,9 @@ export function VenueSpreadsPage() {
         </Col>
         <Col xs={24} lg={8}>
           <Card className="analytics-side-card">
-            {renderStats(summary?.hl, 'HL 统计')}
+            {renderStats(summary?.leg_a, `${legALabel} 统计`)}
             <Divider style={{ margin: '12px 0' }} />
-            {renderStats(summary?.mt5, 'MT5 统计')}
+            {renderStats(summary?.leg_b, `${legBLabel} 统计`)}
           </Card>
         </Col>
       </Row>

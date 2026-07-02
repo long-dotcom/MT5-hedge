@@ -29,11 +29,20 @@ class Quote:
 @dataclass(frozen=True)
 class SynchronizedQuote:
     symbol: str
-    hyperliquid: Quote
-    mt5: Quote
+    leg_a: Quote
+    leg_b: Quote
     time_diff_ms: float
     max_age_ms: float
     mode: SyncMode
+
+    # Backward-compatible aliases
+    @property
+    def hyperliquid(self) -> Quote:
+        return self.leg_a
+
+    @property
+    def mt5(self) -> Quote:
+        return self.leg_b
 
 
 class QuoteCache:
@@ -100,9 +109,12 @@ class QuoteSynchronizer:
         mode: SyncMode,
         max_time_diff_ms: int,
         max_age_ms: int,
+        *,
+        leg_a_venue: str = "hyperliquid",
+        leg_b_venue: str = "mt5",
     ) -> tuple[SynchronizedQuote | None, str]:
-        hl = self.cache.latest("hyperliquid", symbol)
-        mt5 = self.cache.latest("mt5", symbol)
+        hl = self.cache.latest(leg_a_venue, symbol)
+        mt5 = self.cache.latest(leg_b_venue, symbol)
         if not hl or not mt5:
             return None, "缺少实时行情"
         now = datetime.now(timezone.utc).replace(tzinfo=None)
@@ -118,7 +130,7 @@ class QuoteSynchronizer:
             return None, "报价异常"
         if hl.bid > hl.ask or mt5.bid > mt5.ask:
             return None, "bid/ask 反转"
-        return SynchronizedQuote(symbol=symbol, hyperliquid=hl, mt5=mt5, time_diff_ms=time_diff, max_age_ms=max_age, mode=mode), ""
+        return SynchronizedQuote(symbol=symbol, leg_a=hl, leg_b=mt5, time_diff_ms=time_diff, max_age_ms=max_age, mode=mode), ""
 
 
 quote_synchronizer = QuoteSynchronizer(quote_cache)

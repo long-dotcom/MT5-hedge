@@ -22,17 +22,18 @@
 
 - `POST /api/markets/scan`：手动触发一次价差扫描。
 - `GET /api/stream?channel=pipeline`：页面级 SSE 推送，必须通过 `Authorization: Bearer <token>` 请求头鉴权，不再允许把 access token 放在 URL query 中。`channel=pipeline` 只推送链路监控所需的诊断快照，前端仅在打开链路监控页时订阅；`channel=dashboard` 只推送仪表盘摘要和权益曲线；`channel=hedge-groups&page=1&page_size=20` 只推送对冲组列表当前页；`channel=positions` 只推送仓位页当前仓位列表；`channel=accounts` 只推送账户快照；`channel=execution&page=1&fill_page=1&page_size=20` 只推送执行记录页当前订单页和成交页；`channel=logs&page=1&alert_page=1&page_size=20` 只推送日志中心当前日志页和告警页；`channel=risk&page=1&page_size=10` 只推送风控页状态和当前风险事件页；`channel=lead-lag&symbol=JP225&window_seconds=300&threshold_bps=3&min_move=0&max_lag_ms=2000` 只推送报价时差分析页当前筛选参数的报告。未指定 `channel` 时保留兼容的全量 snapshot 行为。
-- `GET /api/markets/symbols`：查看手动品种映射。
-- `GET /api/markets/quotes`：查看实时行情缓存中的最新报价、来源和本地接收时间。
+- `GET /api/markets/symbols`：查看手动品种映射；响应会补齐 `leg_a_venue`、`leg_a_symbol`、`leg_b_venue`、`leg_b_symbol`，旧数据默认按 Hyperliquid + MT5 展示。
+- `GET /api/markets/quotes`：查看实时行情缓存中的最新报价、来源和本地接收时间；返回 `leg`、`platform`、`venue_symbol` 以及对应品种的 leg metadata，其中 Hyperliquid/MT5 使用原生实现，其他 venue 在 V1 由 Nautilus 只读 adapter 提供；Binance 行情通过 NautilusTrader Binance adapter 读取 futures book ticker。
 - `GET /api/markets/trading-sessions`：查看每个品种的 MT5 交易时段状态和动作级权限。
-- `GET /api/diagnostics/pipeline`：查看“链路监控”页面使用的结构化诊断状态，包含每个启用品种的 HL/MT5 报价年龄、同步时间差、扫描状态、候选状态、主阻塞环节、`blockers` 多阻塞原因列表，以及当前活跃对冲组池和生命周期泳道计数。对冲池优先读取运行期内存池，持仓组 `unrealized_pnl` 使用当前 close spread 即时估算，避免数据库异步落库导致显示延迟。`metrics` 中的 `quote_sync_duration_ms`、`symbol_scan_duration_ms`、`cost_duration_ms`、`signal_duration_ms`、`candidate_sync_duration_ms`、`persist_duration_ms` 来自扫描器本轮真实计算耗时；`scan_age_ms` 仅表示结果新鲜度。
+- `GET /api/diagnostics/pipeline`：查看“链路监控”页面使用的结构化诊断状态，包含每个启用品种的两腿 venue/symbol、双腿报价年龄、同步时间差、扫描状态、候选状态、主阻塞环节、`blockers` 多阻塞原因列表，以及当前活跃对冲组池和生命周期泳道计数。对冲池优先读取运行期内存池，持仓组 `unrealized_pnl` 使用当前 close spread 即时估算，避免数据库异步落库导致显示延迟。`metrics` 中的 `leg_a_age_ms`、`leg_b_age_ms`、`quote_sync_duration_ms`、`symbol_scan_duration_ms`、`cost_duration_ms`、`signal_duration_ms`、`candidate_sync_duration_ms`、`persist_duration_ms` 来自扫描器本轮真实计算耗时；`scan_age_ms` 仅表示结果新鲜度。
 - `GET /api/markets/spreads?page=1&page_size=20`：查看每个品种最新一条最优方向实时价差快照。返回兼容字段 `gross_spread`，其含义等同 `entry_spread`；同时返回 `entry_spread`、`close_spread`、`mid_spread`、`spread_cost`。
-- `GET /api/analytics/spread-summary?symbol=BTC&direction=long_mt5_short_hyperliquid&range=1h&basis=entry`：查看价差均值、标准差、Z-Score、分位数、半衰期和回归概率；`basis` 支持 `entry/close/mid`，默认 `entry`。
-- `GET /api/analytics/spread-series?symbol=BTC&direction=long_mt5_short_hyperliquid&range=1h&basis=entry`：查看后端降采样后的价差曲线，支持 `15m/1h/4h/24h/7d`；`15m/1h/4h` 优先用原始快照统计，`24h/7d` 优先用聚合桶。
-- `GET /api/analytics/funding-series?symbol=JP225&range=7d&bucket=day`：查看单个品种历史资金费率曲线和统计，后端会按品种映射自动查询 Hyperliquid/HIP-3 合约，支持 `24h/7d/30d/90d` 和 `raw/hour/day` 聚合。
+- `POST /api/markets/spreads/{symbol}/execute?direction=long_leg_b_short_leg_a&force=true`：从当前品种指定方向的当前快照创建一次性机会并提交下单。默认只接受 `executable` 快照；`force=true` 用于人工强制下单，会跳过策略入场线、价差和净利润闸门，但仍经过 paper/live readiness、严格行情同步、MT5 session、MT5 订单预检查、风控和账户类保护。未传 `direction` 时使用该品种净利润最高的 `executable` 方向，强制模式下可使用当前方向快照。
+- `GET /api/analytics/spread-summary?symbol=BTC&direction=long_leg_b_short_leg_a&range=1h&basis=entry`：查看价差均值、标准差、Z-Score、分位数、半衰期和回归概率；响应补齐 leg metadata，前端方向标签按 mapping 渲染为“多某交易所 / 空某交易所”；`basis` 支持 `entry/close/mid`，默认 `entry`。
+- `GET /api/analytics/spread-series?symbol=BTC&direction=long_leg_b_short_leg_a&range=1h&basis=entry`：查看后端降采样后的价差曲线，响应补齐 leg metadata，支持 `15m/1h/4h/24h/7d`；`15m/1h/4h` 优先用原始快照统计，`24h/7d` 优先用聚合桶。
+- `GET /api/analytics/funding-series?symbol=JP225&range=7d&bucket=day`：查看单个品种历史资金费率曲线和统计，后端会按品种映射自动定位支持 funding 的永续腿，响应返回 `funding_venue`、`funding_symbol`、`funding_leg` 和 leg metadata。Hyperliquid/HIP-3 走原生 Hyperliquid info API；Binance USDT futures 走 NautilusTrader Binance HTTP client 的 `/fapi/v1/fundingRate` 只读 endpoint。尚未接 funding 的 venue pair 会返回 `supported=false` 和空数据。支持 `24h/7d/30d/90d` 和 `raw/hour/day` 聚合。
 - 价差研究和资金费研究当前按筛选条件直接请求上述分析接口，不使用页面级 SSE；筛选条件变化会触发重新读取。
-- `GET /api/analytics/lead-lag?symbol=JP225&window_seconds=300&threshold_bps=3&max_lag_ms=2000`：查看最近报价时差分析，用内存报价历史判断 HL 与 MT5 谁先跳动、另一边是否跟随、滞后毫秒和滞后期间最大 mid 差。报价时差分析页打开后会使用 `channel=lead-lag` 页面级 SSE 持续接收当前筛选条件的报告，不再使用前端轮询。
-- `GET /api/opportunities?page=1&page_size=20`：查看当前仍满足条件的候选机会；价差回落后对应机会会从当前池移除；展示口径使用 `gross_spread`、`unit_cost`、`unit_net_profit`，其中 `gross_spread` 为入场价差兼容别名。候选机会还会保存触发时盘口 `trigger_hyperliquid_bid`、`trigger_hyperliquid_ask`、`trigger_mt5_bid`、`trigger_mt5_ask`。
+- `GET /api/analytics/lead-lag?symbol=JP225&window_seconds=300&threshold_bps=3&max_lag_ms=2000`：查看最近报价时差分析，用内存报价历史判断两条腿谁先跳动、另一边是否跟随、滞后毫秒和滞后期间最大 mid 差。报价时差分析页打开后会使用 `channel=lead-lag` 页面级 SSE 持续接收当前筛选条件的报告，不再使用前端轮询。
+- `GET /api/opportunities?page=1&page_size=20`：查看当前仍满足条件的候选机会；价差回落后对应机会会从当前池移除；展示口径使用 `gross_spread`、`unit_cost`、`unit_net_profit`，其中 `gross_spread` 为入场价差兼容别名。候选机会返回 leg metadata，并继续保存触发时兼容盘口 `trigger_hyperliquid_bid`、`trigger_hyperliquid_ask`、`trigger_mt5_bid`、`trigger_mt5_ask`。
 - `GET /api/opportunities/{id}`：查看单个机会。
 - `POST /api/opportunities/{id}/execute`：按当前执行模式创建对冲组。
 
@@ -40,15 +41,15 @@
 
 - `GET /api/hedge-groups?page=1&page_size=20`：分页查看对冲组；活跃对冲组会优先使用运行期内存池快照，并用当前平仓价差即时估算未实现盈亏。
 - `GET /api/hedge-groups/{id}`：查看对冲组详情、事件和订单。
-- `POST /api/hedge-groups/{id}/close`：手动平仓。
+- `POST /api/hedge-groups/{id}/close`：手动平仓。请求体支持 `force=true`，用于人工释放资金时跳过退出线和最小盈利检查；仍保留严格报价同步、MT5 平仓权限、reduce-only 平仓和执行 readiness 等安全限制。
 - `POST /api/hedge-groups/{id}/mark-manual`：标记为需要人工处理。
-- Paper 自动平仓由后台调度器执行，不需要前端点击；对冲组会返回 `trigger_spread`、`trigger_hyperliquid_bid`、`trigger_hyperliquid_ask`、`trigger_mt5_bid`、`trigger_mt5_ask`、`entry_spread`、`entry_threshold`、`exit_target`、`overheat_threshold`、`fees`、`funding`、`swap` 和 `close_reason`。其中 `trigger_spread` 是机会触发时的入场价差，四个 `trigger_*` 价格是该价差对应的 HL/MT5 bid/ask 盘口，`entry_spread` 是双边成交后按 fill 均价回写的真实开仓价差，`entry_threshold` 是统计入场线和品种“最小买入价差”的较高值，`exit_target` 是统计退出线和品种“最大卖出价差”合成后的最终平仓线。`funding` 和 `swap` 按成本口径返回：正数表示付出，负数表示收到，前端对冲组页会分别显示 HL 资金费和 MT5 隔夜费。
+- Paper 自动平仓由后台调度器执行，不需要前端点击；对冲组会返回 leg metadata、`trigger_spread`、`trigger_hyperliquid_bid`、`trigger_hyperliquid_ask`、`trigger_mt5_bid`、`trigger_mt5_ask`、`entry_spread`、`entry_threshold`、`exit_target`、`overheat_threshold`、`fees`、`funding`、`swap` 和 `close_reason`。其中 `trigger_spread` 是机会触发时的入场价差，四个 `trigger_*` 价格是当前原生执行链路的兼容盘口，`entry_spread` 是双边成交后按 fill 均价回写的真实开仓价差，`entry_threshold` 是统计入场线和品种“最小买入价差”的较高值，`exit_target` 是统计退出线和品种“最大卖出价差”合成后的最终平仓线。`funding` 和 `swap` 按成本口径返回：正数表示付出，负数表示收到，前端按实际 venue 名称展示资金费或隔夜费。
 
 ## 账户、仓位、订单
 
-- `GET /api/accounts`：同步并返回 Hyperliquid、MT5 两个平台的最新账户状态；Hyperliquid 会分开展示 Perp 权益、Spot USDC、可提取和可用保证金，读取失败时回退 Paper 账户。仪表盘账户区首屏调用该接口做主动同步；旧 `/accounts` 路由保留用于直接访问。
+- `GET /api/accounts`：同步并返回 Hyperliquid、MT5 以及启用映射中出现的 Nautilus 只读 venue 的最新账户状态；Hyperliquid 会分开展示 Perp 权益、Spot USDC、可提取和可用保证金，读取失败时回退 Paper 账户。Binance 账户读取通过 NautilusTrader Binance adapter 的 futures account API，失败后才尝试 spot account API。仪表盘账户区首屏调用该接口做主动同步；旧 `/accounts` 路由保留用于直接访问。
 - `GET /api/accounts/snapshots`：账户快照分页。
-- `GET /api/positions`：当前仓位；仓位页打开后会使用 `channel=positions` 页面级 SSE 持续接收更新。
+- `GET /api/positions`：当前仓位；HL/MT5 继续走原生同步，Nautilus venue 仅做只读同步，不参与残仓/孤儿仓位阻断。Binance 持仓通过 NautilusTrader Binance adapter 的 futures position risk API 同步。仓位页打开后会使用 `channel=positions` 页面级 SSE 持续接收更新。
 - `POST /api/positions/{id}/adopt`：管理员将已同步的 Hyperliquid/MT5 外部仓位接管为 `live/manual_intervention` 对冲组；用于处理 readiness 发现的孤儿仓位。请求体可传 `reason`，必要时可传内部 `symbol`。
 - `POST /api/execution/reconcile`：管理员手工触发执行状态同步，立即刷新 live positions、回查 pending 订单、检查 closed 残仓和外部孤儿仓位。
 - `GET /api/orders`：订单分页，包含 `post_only`、`reduce_only` 和 `ttl_seconds` 等执行语义字段，便于复核 live 平仓/补偿单是否按 reduce-only 提交。执行记录页打开后会使用 `channel=execution` 页面级 SSE 持续接收当前订单页更新。
@@ -67,16 +68,22 @@
 
 - `GET/PUT /api/settings/strategy`：策略参数，包含统计入场线、Paper 自动执行和自动平仓参数；`auto_close_live_enabled=false` 时自动平仓只处理 paper 对冲组，开启后才允许 live 自动平仓继续进入实盘反向订单路径。自动平仓退出线按 `min(平仓价差低分位, 开仓价差 - 单位成本 - 每份利润缓冲)` 计算，利润保护上限无效时返回 `0`。每份利润缓冲默认 `0`，跨品种利润保护建议使用 USD 口径的 `auto_close_min_profit`。
 - `GET/PUT /api/settings/risk`：风控参数。
-- `GET/PUT /api/settings/symbol-mappings`：品种映射。
+- `GET /api/settings/exchanges`：查看数据库中的交易所配置，只返回是否已配置、指纹、环境、启用状态和最近检查结果，不返回明文密钥。
+- `POST /api/settings/exchanges`、`PUT /api/settings/exchanges/{venue}`：新增或更新交易所配置；`credentials` 会加密保存到数据库，编辑时留空不会覆盖旧凭证。
+- `DELETE /api/settings/exchanges/{venue}`：删除交易所配置。
+- `POST /api/settings/exchanges/{venue}/test`：检查已保存凭证是否可解密，并写入最近检查状态。
+- `GET/PUT /api/settings/symbol-mappings`：品种映射。新增通用双腿字段 `leg_a_venue`、`leg_a_symbol`、`leg_b_venue`、`leg_b_symbol`；旧 `hyperliquid_symbol`、`mt5_symbol` 保留用于当前 HL+MT5 执行链路和兼容显示，旧数据默认补齐为 `hyperliquid` + `mt5`。
 - `POST /api/settings/symbol-mappings`：新增单条品种映射。
 - `PUT /api/settings/symbol-mappings/{id}`：更新单条品种映射。
 - `DELETE /api/settings/symbol-mappings/{id}`：删除单条品种映射。
 - `POST /api/settings/symbol-mappings/{id}/sync-broker`：从 MT5 `symbol_info()` 同步最小手数、步进、合约大小、价格精度和最小跳动。
 - 品种映射包含执行策略字段：`execution_style`、`hl_open_order_type`、`hl_close_order_type`、`hl_post_only`、`hl_maker_offset_bps`、`hl_order_ttl_seconds`、`hl_unfilled_action`、`single_leg_action`。
 - 品种映射包含 MT5 会话保护字段：`mt5_pre_close_no_open_minutes`、`mt5_post_open_cooldown_minutes`、`allow_hold_through_mt5_close`。
+- Nautilus V1 限制：非 `leg_a=hyperliquid` + `leg_b=mt5` 的 venue pair 只产生只读行情/账户/持仓和观察型价差候选，不会进入 `executable`，自动开仓和平仓仍只允许当前原生 Hyperliquid(A)+MT5(B) 组合。
 - `GET/PUT /api/settings/live-trading`：实盘开关。
 - `GET /api/settings/live-readiness`：实盘执行就绪检查，返回总状态、Hyperliquid 只读账户连通性、MT5、全局实盘开关、品种映射、单腿补偿配置等检查项；当前 Hyperliquid `execution_mode=live` 下单项固定为 block。
-- `GET /api/settings/paper-readiness`：Paper 执行就绪检查，返回 Hyperliquid paper 撮合或 paper-live 探针配置、MT5 demo 开关、demo 账户状态、`MT5_LOGIN`/`MT5_SERVER` 账户锁定和品种映射检查项。存在 `block` 时，paper 开仓和平仓不会提交订单。
+- `GET/PUT /api/settings/execution`：运行态执行开关，当前包含 Paper 真实探针总开关和探针/MT5 demo 并发开关；开启 Paper 真实探针需要确认短语 `ENABLE PAPER LIVE PROBE`。这些开关保存到数据库，优先级高于 env 兜底；Hyperliquid paper-live 探针按该总开关放行，旧 `HYPERLIQUID_PAPER_LIVE_ORDER_ENABLED` 仅作为无数据库记录时的兼容兜底。
+- `GET /api/settings/paper-readiness`：Paper 执行就绪检查，返回 Hyperliquid paper 撮合或 paper-live 探针配置、通用探针命中情况、MT5 demo 开关、demo 账户状态、`MT5_LOGIN`/`MT5_SERVER` 账户锁定和品种映射检查项。存在 `block` 时，paper 开仓和平仓不会提交订单；Binance Futures 已接入 Nautilus paper-live 最小真实探针单，要求交易所配置启用、填写凭证并关闭只读模式；其他 Nautilus venue 若尚未实现真实探针 adapter，会明确提示并拒绝下单。
 - `POST /api/execution/hyperliquid-probe-test`：管理员诊断接口。默认 `submit=false`，只解析品种映射、HL SDK asset、最小探针量和滑点价格，不下单；真实提交必须传 `submit=true` 且 `confirmation=SUBMIT HYPERLIQUID PROBE`。
 
 开启实盘时必须传入确认短语 `ENABLE LIVE TRADING`。
@@ -86,3 +93,4 @@
 - `GET /api/logs`：系统日志分页。日志中心打开后会使用 `channel=logs` 页面级 SSE 持续接收当前日志页更新。
 - `GET /api/alerts`：站内告警分页。日志中心打开后会使用 `channel=logs` 页面级 SSE 持续接收当前告警页更新。
 - `POST /api/alerts/{id}/ack`：确认告警。
+

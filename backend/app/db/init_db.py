@@ -31,6 +31,10 @@ def ensure_schema_columns() -> None:
         return
     existing = {column["name"] for column in inspector.get_columns("symbol_mappings")}
     columns = {
+        "leg_a_venue": "VARCHAR(32) DEFAULT 'hyperliquid'",
+        "leg_a_symbol": "VARCHAR(64) DEFAULT ''",
+        "leg_b_venue": "VARCHAR(32) DEFAULT 'mt5'",
+        "leg_b_symbol": "VARCHAR(64) DEFAULT ''",
         "mt5_min_lot": "FLOAT DEFAULT 0.0",
         "min_entry_spread": "FLOAT DEFAULT 0.0",
         "max_close_spread": "FLOAT DEFAULT 0.0",
@@ -41,8 +45,8 @@ def ensure_schema_columns() -> None:
         "mt5_currency_margin": "VARCHAR(16) DEFAULT 'USD'",
         "mt5_calc_mode": "INTEGER DEFAULT 0",
         "mt5_min_base_size": "FLOAT DEFAULT 0.0",
-        "hyperliquid_min_base_size": "FLOAT DEFAULT 0.0",
-        "hyperliquid_min_notional": "FLOAT DEFAULT 10.0",
+        "leg_a_min_base_size": "FLOAT DEFAULT 0.0",
+        "leg_a_min_notional": "FLOAT DEFAULT 10.0",
         "execution_style": "VARCHAR(64) DEFAULT 'taker_taker'",
         "hl_open_order_type": "VARCHAR(16) DEFAULT 'market'",
         "hl_close_order_type": "VARCHAR(16) DEFAULT 'market'",
@@ -70,6 +74,17 @@ def ensure_schema_columns() -> None:
         for name, ddl in columns.items():
             if name not in existing:
                 conn.execute(text(f"ALTER TABLE symbol_mappings ADD COLUMN {name} {_dialect_type(ddl)}"))
+        conn.execute(
+            text(
+                """
+                UPDATE symbol_mappings
+                SET leg_a_venue = CASE WHEN leg_a_venue IS NULL OR leg_a_venue = '' THEN 'hyperliquid' ELSE leg_a_venue END,
+                    leg_a_symbol = CASE WHEN leg_a_symbol IS NULL OR leg_a_symbol = '' THEN leg_a_venue_symbol ELSE leg_a_symbol END,
+                    leg_b_venue = CASE WHEN leg_b_venue IS NULL OR leg_b_venue = '' THEN 'mt5' ELSE leg_b_venue END,
+                    leg_b_symbol = CASE WHEN leg_b_symbol IS NULL OR leg_b_symbol = '' THEN mt5_symbol ELSE leg_b_symbol END
+                """
+            )
+        )
     if "orders" in inspector.get_table_names():
         existing_orders = {column["name"] for column in inspector.get_columns("orders")}
         order_columns = {
@@ -144,10 +159,10 @@ def ensure_schema_columns() -> None:
             "auto_execute_min_net_profit": "FLOAT DEFAULT 0.0",
             "paper_decision_delay_ms_min": "INTEGER DEFAULT 50",
             "paper_decision_delay_ms_max": "INTEGER DEFAULT 200",
-            "paper_hyperliquid_latency_ms_min": "INTEGER DEFAULT 80",
-            "paper_hyperliquid_latency_ms_max": "INTEGER DEFAULT 200",
-            "paper_mt5_latency_ms_min": "INTEGER DEFAULT 120",
-            "paper_mt5_latency_ms_max": "INTEGER DEFAULT 350",
+            "paper_leg_a_latency_ms_min": "INTEGER DEFAULT 80",
+            "paper_leg_a_latency_ms_max": "INTEGER DEFAULT 200",
+            "paper_leg_b_latency_ms_min": "INTEGER DEFAULT 120",
+            "paper_leg_b_latency_ms_max": "INTEGER DEFAULT 350",
             "cb_cooldown_seconds": "FLOAT DEFAULT 3.0",
             "cb_initial_threshold": "FLOAT DEFAULT 0.75",
             "cb_baseline_multiplier": "FLOAT DEFAULT 2.0",
@@ -162,8 +177,8 @@ def ensure_schema_columns() -> None:
         existing_spreads = {column["name"] for column in inspector.get_columns("spread_snapshots")}
         spread_columns = {
             "quantity": "FLOAT DEFAULT 1.0",
-            "mt5_quantity": "FLOAT DEFAULT 1.0",
-            "hyperliquid_quantity": "FLOAT DEFAULT 1.0",
+            "leg_b_quantity": "FLOAT DEFAULT 1.0",
+            "leg_a_quantity": "FLOAT DEFAULT 1.0",
             "notional_currency": "VARCHAR(16) DEFAULT 'USD'",
             "fx_rate_to_usd": "FLOAT DEFAULT 1.0",
             "entry_spread": "FLOAT DEFAULT 0.0",
@@ -194,14 +209,14 @@ def ensure_schema_columns() -> None:
     if "arbitrage_opportunities" in inspector.get_table_names():
         existing_opportunities = {column["name"] for column in inspector.get_columns("arbitrage_opportunities")}
         opportunity_columns = {
-            "mt5_quantity": "FLOAT DEFAULT 1.0",
-            "hyperliquid_quantity": "FLOAT DEFAULT 1.0",
+            "leg_b_quantity": "FLOAT DEFAULT 1.0",
+            "leg_a_quantity": "FLOAT DEFAULT 1.0",
             "notional_currency": "VARCHAR(16) DEFAULT 'USD'",
             "fx_rate_to_usd": "FLOAT DEFAULT 1.0",
-            "trigger_hyperliquid_bid": "FLOAT DEFAULT 0.0",
-            "trigger_hyperliquid_ask": "FLOAT DEFAULT 0.0",
-            "trigger_mt5_bid": "FLOAT DEFAULT 0.0",
-            "trigger_mt5_ask": "FLOAT DEFAULT 0.0",
+            "trigger_leg_a_bid": "FLOAT DEFAULT 0.0",
+            "trigger_leg_a_ask": "FLOAT DEFAULT 0.0",
+            "trigger_leg_b_bid": "FLOAT DEFAULT 0.0",
+            "trigger_leg_b_ask": "FLOAT DEFAULT 0.0",
             "unit_cost": "FLOAT DEFAULT 0.0",
             "unit_net_profit": "FLOAT DEFAULT 0.0",
             "entry_threshold": "FLOAT DEFAULT 0.0",
@@ -226,8 +241,8 @@ def ensure_schema_columns() -> None:
     if "spread_current" in inspector.get_table_names():
         existing_current = {column["name"] for column in inspector.get_columns("spread_current")}
         current_columns = {
-            "mt5_quantity": "FLOAT DEFAULT 1.0",
-            "hyperliquid_quantity": "FLOAT DEFAULT 1.0",
+            "leg_b_quantity": "FLOAT DEFAULT 1.0",
+            "leg_a_quantity": "FLOAT DEFAULT 1.0",
             "notional_currency": "VARCHAR(16) DEFAULT 'USD'",
             "fx_rate_to_usd": "FLOAT DEFAULT 1.0",
             "entry_spread": "FLOAT DEFAULT 0.0",
@@ -279,16 +294,16 @@ def ensure_schema_columns() -> None:
     if "hedge_groups" in inspector.get_table_names():
         existing_groups = {column["name"] for column in inspector.get_columns("hedge_groups")}
         group_columns = {
-            "mt5_quantity": "FLOAT DEFAULT 1.0",
-            "hyperliquid_quantity": "FLOAT DEFAULT 1.0",
+            "leg_b_quantity": "FLOAT DEFAULT 1.0",
+            "leg_a_quantity": "FLOAT DEFAULT 1.0",
             "fees": "FLOAT DEFAULT 0.0",
             "funding": "FLOAT DEFAULT 0.0",
             "swap": "FLOAT DEFAULT 0.0",
             "trigger_spread": "FLOAT DEFAULT 0.0",
-            "trigger_hyperliquid_bid": "FLOAT DEFAULT 0.0",
-            "trigger_hyperliquid_ask": "FLOAT DEFAULT 0.0",
-            "trigger_mt5_bid": "FLOAT DEFAULT 0.0",
-            "trigger_mt5_ask": "FLOAT DEFAULT 0.0",
+            "trigger_leg_a_bid": "FLOAT DEFAULT 0.0",
+            "trigger_leg_a_ask": "FLOAT DEFAULT 0.0",
+            "trigger_leg_b_bid": "FLOAT DEFAULT 0.0",
+            "trigger_leg_b_ask": "FLOAT DEFAULT 0.0",
             "entry_spread": "FLOAT DEFAULT 0.0",
             "entry_threshold": "FLOAT DEFAULT 0.0",
             "exit_target": "FLOAT DEFAULT 0.0",

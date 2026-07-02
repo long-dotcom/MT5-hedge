@@ -8,7 +8,7 @@ Alembic 模板已经保留在 `backend/alembic/`。首版启动使用 SQLAlchemy
 
 系统演进路线、PostgreSQL 迁移和实盘接入计划见 `docs/evolution-roadmap.md`。
 
-`execution_mode=paper` 表示纸面账本执行：默认 Hyperliquid 腿使用本地 `QuoteCache` 最新 bid/ask 撮合，MT5 腿使用当前 MT5 demo 账户下单。若开启 `HYPERLIQUID_PAPER_LIVE_ORDER_ENABLED=true`，Hyperliquid 腿会改为向真实账户提交最小可成交量探针单，只把真实成交均价写入 paper 账本，paper 数量仍按策略目标数量记录。开启前需要 `MT5_DEMO_ORDER_ENABLED=true`，并确保 MT5 `account_info().trade_mode` 是 demo。`MT5_LOGIN`、`MT5_PASSWORD`、`MT5_SERVER` 仍是唯一的 MT5 登录配置；如果配置了 `MT5_LOGIN` 或 `MT5_SERVER`，paper demo 下单前会要求当前账户 login/server 与它们一致，防止终端切到其他账户后误发单。
+`execution_mode=paper` 表示纸面账本执行：默认 Hyperliquid 腿使用本地 `QuoteCache` 最新 bid/ask 撮合，MT5 腿使用当前 MT5 demo 账户下单。设置页“执行开关 / Paper 真实探针”开启后，所有非 MT5 腿会进入 paper-live 探针框架：真实最小单只用于取得成交价和外部订单号，paper 账本数量仍按策略目标数量记录。Hyperliquid 和 Binance Futures 已实现真实探针下单；Binance 走 Nautilus 签名 HTTP client，并按交易所 `exchangeInfo` 的最小数量、步进和最小名义金额计算探针数量。其他 Nautilus venue 会明确拒绝并提示 adapter 未实现。开启前需要 `MT5_DEMO_ORDER_ENABLED=true`，并确保 MT5 `account_info().trade_mode` 是 demo。`MT5_LOGIN`、`MT5_PASSWORD`、`MT5_SERVER` 仍是唯一的 MT5 登录配置；如果配置了 `MT5_LOGIN` 或 `MT5_SERVER`，paper demo 下单前会要求当前账户 login/server 与它们一致，防止终端切到其他账户后误发单。
 
 ## 后端启动
 
@@ -108,6 +108,8 @@ HYPERLIQUID_FEE_ROUND_TRIPS=2
 HYPERLIQUID_ACCOUNT_ADDRESS=
 HYPERLIQUID_SECRET_KEY=
 HYPERLIQUID_PAPER_LIVE_ORDER_ENABLED=false
+PAPER_LIVE_PROBE_ENABLED=false
+PAPER_LIVE_PROBE_VENUES=*
 PAPER_LIVE_PARALLEL_EXECUTION=true
 HYPERLIQUID_PAPER_LIVE_SLIPPAGE=0.01
 MT5_DEFAULT_COMMISSION_RATE=0
@@ -123,7 +125,7 @@ MT5_PASSWORD=
 MT5_SERVER=
 ```
 
-生产或实盘前必须修改 `JWT_SECRET` 和管理员密码。后端启动时会检查运行环境：当 `ENVIRONMENT` 不是 `local/dev/development/test/testing`，或 `LIVE_TRADING_ENABLED`、`MT5_LIVE_ORDER_ENABLED`、`HYPERLIQUID_PAPER_LIVE_ORDER_ENABLED`、`DEFAULT_EXECUTION_MODE=live` 任一实盘相关开关启用时，如果仍使用默认 `JWT_SECRET=change-me-before-live` 或默认 `ADMIN_PASSWORD=admin123`，服务会拒绝启动。已经用默认密码初始化过的数据库也需要重置管理员密码；如果现有管理员 hash 仍匹配 `admin123`，生产或实盘相关模式同样会拒绝启动。
+生产或实盘前必须修改 `JWT_SECRET` 和管理员密码。后端启动时会检查运行环境：当 `ENVIRONMENT` 不是 `local/dev/development/test/testing`，或 `LIVE_TRADING_ENABLED`、`MT5_LIVE_ORDER_ENABLED`、`HYPERLIQUID_PAPER_LIVE_ORDER_ENABLED`、`PAPER_LIVE_PROBE_ENABLED`、`DEFAULT_EXECUTION_MODE=live` 任一实盘相关开关启用时，如果仍使用默认 `JWT_SECRET=change-me-before-live` 或默认 `ADMIN_PASSWORD=admin123`，服务会拒绝启动。已经用默认密码初始化过的数据库也需要重置管理员密码；如果现有管理员 hash 仍匹配 `admin123`，生产或实盘相关模式同样会拒绝启动。
 
 前端登录页不会预填默认账号密码；页面级 SSE 也不会再通过 URL query 传递 token，而是使用 `Authorization: Bearer <token>` 请求头，避免 token 被代理日志或浏览器历史记录下来。
 
@@ -136,7 +138,7 @@ HYPERLIQUID_WS_URL=wss://api.hyperliquid-testnet.xyz/ws
 
 `HYPERLIQUID_ACCOUNT_ADDRESS` 填有余额的主账户地址；余额、手续费、仓位和订单快照等只读查询会使用该地址。execution reconciler 会读取账户级 `openOrders` / `userFills` 快照，用于恢复 pending 订单和唯一匹配的缺失外部订单号。因此使用 API wallet/agent 场景时，必须配置实际账户地址，而不是只配置 agent wallet 地址。`HYPERLIQUID_SECRET_KEY` 只用于 `HYPERLIQUID_PAPER_LIVE_ORDER_ENABLED=true` 时的 paper-live 探针下单，应填写已授权的 API wallet/agent 私钥，不要填写未隔离的大额主钱包私钥。
 
-Paper-live 探针模式只改变 Hyperliquid 成交价来源，不把策略切成 `live`：对冲组仍保存为 `execution_mode=paper`，MT5 仍走 demo 下单，PnL 和持仓数量按 paper 账本目标数量计算。Hyperliquid 真实账户会留下最小探针仓位，开仓探针使用同方向最小量，平仓探针使用 reduce-only 最小量，目的是用交易所真实回报替代本地模拟成交价。探针数量按该资产 `szDecimals` 的最小步进和 `HYPERLIQUID_DEFAULT_MIN_NOTIONAL` 折算后的最小名义金额取较大值。`PAPER_LIVE_PARALLEL_EXECUTION=true` 时，严格行情复核通过后会同时提交 HL 探针和 MT5 demo 单；若只有一边成交，系统会立即提交反向冲销单。
+Paper-live 探针模式只改变成交价来源，不把策略切成 `live`：对冲组仍保存为 `execution_mode=paper`，MT5 仍走 demo 下单，PnL 和持仓数量按 paper 账本目标数量计算。Hyperliquid 真实账户会留下最小探针仓位，开仓探针使用同方向最小量，平仓探针使用 reduce-only 最小量，目的是用交易所真实回报替代本地模拟成交价。Binance Futures 探针通过 Nautilus 的 Binance HTTP client 提交 `MARKET` + `newOrderRespType=RESULT` 订单，真实成交数量按交易所规格最小化，写入 `fills` 的数量仍是策略目标数量。设置页保存的 DB 开关优先于 env；env 中的 `PAPER_LIVE_PROBE_*` 只作为无数据库或冷启动兜底，旧 `HYPERLIQUID_PAPER_LIVE_ORDER_ENABLED` 仅兼容 Hyperliquid 单 venue 兜底，不是设置页开关之外的第二道必要开关。每个 venue 仍必须注册自己的真实下单能力、最小量规则和回执解析；未实现时不会发真实单。`PAPER_LIVE_PARALLEL_EXECUTION=true` 时，严格行情复核通过后会同时提交探针腿和 MT5 demo 单；若只有一边成交，系统会立即提交反向冲销单。
 
 HIP-3 DEX 仓位不会出现在默认 `clearinghouseState` 响应里。系统会从启用的品种映射中提取 `xyz:*` 这类 DEX 前缀，并额外用 `dex=xyz` 查询账户仓位，所以仓位页可以展示 `xyz:JP225` 这类主网 DEX 仓位。
 

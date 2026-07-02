@@ -1,0 +1,59 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 420" font-family="'Segoe UI', system-ui, sans-serif">
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#64748b"/>
+    </marker>
+  </defs>
+
+  <!-- Background -->
+  <rect width="800" height="420" rx="8" fill="#f8fafc"/>
+
+  <!-- Strategy Layer -->
+  <rect x="40" y="30" width="720" height="100" rx="6" fill="#dbeafe" stroke="#93c5fd" stroke-width="1.5"/>
+  <text x="400" y="55" text-anchor="middle" font-size="15" font-weight="600" fill="#1e40af">Strategy Layer</text>
+  <rect x="70" y="68" width="140" height="44" rx="4" fill="#bfdbfe" stroke="#60a5fa"/>
+  <text x="140" y="94" text-anchor="middle" font-size="12" fill="#1e3a5f">价差计算</text>
+  <rect x="230" y="68" width="140" height="44" rx="4" fill="#bfdbfe" stroke="#60a5fa"/>
+  <text x="300" y="94" text-anchor="middle" font-size="12" fill="#1e3a5f">成本模型 (8项)</text>
+  <rect x="390" y="68" width="140" height="44" rx="4" fill="#bfdbfe" stroke="#60a5fa"/>
+  <text x="460" y="94" text-anchor="middle" font-size="12" fill="#1e3a5f">统计信号</text>
+  <rect x="550" y="68" width="180" height="44" rx="4" fill="#bfdbfe" stroke="#60a5fa"/>
+  <text x="640" y="94" text-anchor="middle" font-size="12" fill="#1e3a5f">入场线 / 退出线</text>
+
+  <!-- Arrow Strategy → Market -->
+  <line x1="400" y1="130" x2="400" y2="160" stroke="#64748b" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+  <!-- Market Layer -->
+  <rect x="40" y="160" width="720" height="100" rx="6" fill="#dcfce7" stroke="#86efac" stroke-width="1.5"/>
+  <text x="400" y="185" text-anchor="middle" font-size="15" font-weight="600" fill="#166534">Market Layer</text>
+  <rect x="70" y="198" width="140" height="44" rx="4" fill="#bbf7d0" stroke="#4ade80"/>
+  <text x="140" y="224" text-anchor="middle" font-size="12" fill="#14532d">行情采集</text>
+  <rect x="230" y="198" width="140" height="44" rx="4" fill="#bbf7d0" stroke="#4ade80"/>
+  <text x="300" y="224" text-anchor="middle" font-size="12" fill="#14532d">报价同步</text>
+  <rect x="390" y="198" width="140" height="44" rx="4" fill="#bbf7d0" stroke="#4ade80"/>
+  <text x="460" y="224" text-anchor="middle" font-size="12" fill="#14532d">会话管理</text>
+  <rect x="550" y="198" width="180" height="44" rx="4" fill="#bbf7d0" stroke="#4ade80"/>
+  <text x="640" y="224" text-anchor="middle" font-size="12" fill="#14532d">可交易性检查</text>
+
+  <!-- Arrow Market → Execution -->
+  <line x1="400" y1="260" x2="400" y2="290" stroke="#64748b" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+  <!-- Execution Layer -->
+  <rect x="40" y="290" width="720" height="100" rx="6" fill="#fef3c7" stroke="#fcd34d" stroke-width="1.5"/>
+  <text x="400" y="315" text-anchor="middle" font-size="15" font-weight="600" fill="#92400e">Execution Layer</text>
+  <rect x="70" y="328" width="110" height="44" rx="4" fill="#fde68a" stroke="#fbbf24"/>
+  <text x="125" y="354" text-anchor="middle" font-size="12" fill="#78350f">风控预检</text>
+  <rect x="200" y="328" width="110" height="44" rx="4" fill="#fde68a" stroke="#fbbf24"/>
+  <text x="255" y="354" text-anchor="middle" font-size="12" fill="#78350f">订单网关</text>
+  <rect x="330" y="328" width="110" height="44" rx="4" fill="#fde68a" stroke="#fbbf24"/>
+  <text x="385" y="354" text-anchor="middle" font-size="12" fill="#78350f">对冲池</text>
+  <rect x="460" y="328" width="110" height="44" rx="4" fill="#fde68a" stroke="#fbbf24"/>
+  <text x="515" y="354" text-anchor="middle" font-size="12" fill="#78350f">断路器</text>
+  <rect x="590" y="328" width="140" height="44" rx="4" fill="#fde68a" stroke="#fbbf24"/>
+  <text x="660" y="354" text-anchor="middle" font-size="12" fill="#78350f">自动平仓</text>
+
+  <!-- Side labels -->
+  <text x="780" y="80" text-anchor="end" font-size="11" fill="#64748b" font-style="italic">100ms 扫描</text>
+  <text x="780" y="210" text-anchor="end" font-size="11" fill="#64748b" font-style="italic">行情同步</text>
+  <text x="780" y="340" text-anchor="end" font-size="11" fill="#64748b" font-style="italic">执行 + 持久化</text>
+</svg>

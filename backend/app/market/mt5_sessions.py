@@ -24,6 +24,7 @@ class MT5SessionState:
     seconds_to_close: int | None = None
     trade_mode: str = "unknown"
     session_source: str = "fallback"
+    mt5_leg: str = "b"
 
     @property
     def can_open_any(self) -> bool:
@@ -37,11 +38,30 @@ class MT5SessionState:
 _session_cache: dict[int, tuple[float, MT5SessionState]] = {}
 
 
+def _mt5_leg(mapping: SymbolMapping) -> str:
+    if str(getattr(mapping, "leg_a_venue", "") or "").strip().lower() == "mt5":
+        return "a"
+    return "b"
+
+
+def _direction_is_mt5_long(direction: str, mt5_leg: str = "b") -> bool:
+    if direction == "long_mt5_short_hyperliquid":
+        return True
+    if direction == "long_hyperliquid_short_mt5":
+        return False
+    if direction == "long_leg_a_short_leg_b":
+        return mt5_leg == "a"
+    if direction == "long_leg_b_short_leg_a":
+        return mt5_leg == "b"
+    return False
+
+
 def mt5_session_state(mapping: SymbolMapping, now: datetime | None = None) -> MT5SessionState:
     current = now or datetime.now()
+    mt5_leg = _mt5_leg(mapping)
     local_state = local_schedule_state(mapping, now)
     if local_state and local_state.status != "normal_trade":
-        return _from_local_schedule(local_state)
+        return _from_local_schedule(local_state, mt5_leg)
     settings = get_settings()
     if settings.quote_source_mode != "live":
         return MT5SessionState(
@@ -55,6 +75,7 @@ def mt5_session_state(mapping: SymbolMapping, now: datetime | None = None) -> MT
             can_close_short=True,
             trade_mode="paper",
             session_source="paper",
+            mt5_leg=mt5_leg,
         )
     cache_key = mapping.id or hash(mapping.mt5_symbol)
     cached = _session_cache.get(cache_key)
@@ -99,6 +120,7 @@ def mt5_session_state(mapping: SymbolMapping, now: datetime | None = None) -> MT
                 seconds_to_close=seconds_to_close,
                 trade_mode=trade_mode,
                 session_source="mt5_session",
+                mt5_leg=mt5_leg,
             ))
 
         if not in_trade:
@@ -115,6 +137,7 @@ def mt5_session_state(mapping: SymbolMapping, now: datetime | None = None) -> MT
                 seconds_to_close=seconds_to_close,
                 trade_mode=trade_mode,
                 session_source="mt5_session",
+                mt5_leg=mt5_leg,
             ))
 
         can_open_long, can_open_short, can_close_long, can_close_short = mode_permissions
@@ -152,19 +175,21 @@ def mt5_session_state(mapping: SymbolMapping, now: datetime | None = None) -> MT
             seconds_to_close=seconds_to_close,
             trade_mode=trade_mode,
             session_source="mt5_session",
+            mt5_leg=mt5_leg,
         ))
     except Exception as exc:
         return _remember_session(cache_key, now_monotonic, _fallback_closed(mapping, f"MT5 交易时段读取失败: {exc}"))
 
 
 def mt5_action_allowed(state: MT5SessionState, direction: str, action: str) -> tuple[bool, str]:
+    mt5_long = _direction_is_mt5_long(direction, state.mt5_leg)
     if action == "open":
-        allowed = state.can_open_long if direction == "long_mt5_short_hyperliquid" else state.can_open_short
+        allowed = state.can_open_long if mt5_long else state.can_open_short
         if allowed:
             return True, ""
         return False, f"MT5 当前不允许该方向新开仓: {state.status}，{state.reason}"
     if action == "close":
-        allowed = state.can_close_long if direction == "long_mt5_short_hyperliquid" else state.can_close_short
+        allowed = state.can_close_long if mt5_long else state.can_close_short
         if allowed:
             return True, ""
         return False, f"MT5 当前不允许该方向平仓: {state.status}，{state.reason}"
@@ -185,10 +210,11 @@ def as_session_dict(state: MT5SessionState) -> dict[str, Any]:
         "seconds_to_close": state.seconds_to_close,
         "trade_mode": state.trade_mode,
         "session_source": state.session_source,
+        "mt5_leg": state.mt5_leg,
     }
 
 
-def _from_local_schedule(state: LocalScheduleState) -> MT5SessionState:
+def _from_local_schedule(state: LocalScheduleState, mt5_leg: str = "b") -> MT5SessionState:
     return MT5SessionState(
         symbol=state.symbol,
         status=state.status,
@@ -202,6 +228,7 @@ def _from_local_schedule(state: LocalScheduleState) -> MT5SessionState:
         seconds_to_close=state.seconds_to_close,
         trade_mode=state.status,
         session_source=state.source,
+        mt5_leg=mt5_leg,
     )
 
 
@@ -229,6 +256,7 @@ def _read_sessions(mt5: Any, symbol: str, current: datetime, kind: str) -> list[
 
 def _fallback_from_tick(mt5: Any, mapping: SymbolMapping, info: Any, current: datetime) -> MT5SessionState:
     settings = get_settings()
+    mt5_leg = _mt5_leg(mapping)
     tick = mt5.symbol_info_tick(mapping.mt5_symbol)
     trade_mode = _trade_mode_name(mt5, int(getattr(info, "trade_mode", -1)))
     can_open_long, can_open_short, can_close_long, can_close_short = _permissions_from_trade_mode(mt5, trade_mode, int(getattr(info, "trade_mode", -1)))
@@ -244,6 +272,7 @@ def _fallback_from_tick(mt5: Any, mapping: SymbolMapping, info: Any, current: da
             can_close_short=False,
             trade_mode=trade_mode,
             session_source="mt5_tick_trade_mode_fallback",
+            mt5_leg=mt5_leg,
         )
     tick_seconds = getattr(tick, "time_msc", 0)
     tick_time = datetime.fromtimestamp(tick_seconds / 1000) if tick_seconds else datetime.fromtimestamp(getattr(tick, "time", 0))
@@ -260,6 +289,7 @@ def _fallback_from_tick(mt5: Any, mapping: SymbolMapping, info: Any, current: da
             can_close_short=False,
             trade_mode=trade_mode,
             session_source="mt5_tick_trade_mode_fallback",
+            mt5_leg=mt5_leg,
         )
     status = "normal_trade"
     reason = "MT5 Python 包不支持 session API，使用 tick 新鲜度和 trade_mode 兜底"
@@ -280,6 +310,7 @@ def _fallback_from_tick(mt5: Any, mapping: SymbolMapping, info: Any, current: da
         can_close_short=can_close_short,
         trade_mode=trade_mode,
         session_source="mt5_tick_trade_mode_fallback",
+        mt5_leg=mt5_leg,
     )
 
 
@@ -354,6 +385,7 @@ def _fallback_closed(mapping: SymbolMapping, reason: str) -> MT5SessionState:
         can_close_short=False,
         trade_mode="unknown",
         session_source="fallback",
+        mt5_leg=_mt5_leg(mapping),
     )
 
 

@@ -6,7 +6,10 @@ from urllib import request
 from sqlalchemy.orm import Session
 
 from app.config.settings import Settings, get_settings, hyperliquid_execution_info_url
-from app.db.models import HedgeGroup, Position, SymbolMapping, SystemSetting
+from app.adapters.venue import NATIVE_VENUES
+from app.db.models import ExchangeCredential, HedgeGroup, Position, SymbolMapping, SystemSetting
+from app.execution.probe import NAUTILUS_PROBE_SUPPORTED_VENUES
+from app.execution.runtime_settings import paper_live_probe_enabled_for_venue, runtime_paper_live_probe_enabled
 
 
 @dataclass(frozen=True)
@@ -84,29 +87,68 @@ def _hyperliquid_paper_checks(db: Session, settings: Settings) -> list[Readiness
             f"Hyperliquid paper 使用本地 QuoteCache 撮合，已启用 {len(mappings)} 个品种",
         )
     ]
-    if not getattr(settings, "hyperliquid_paper_live_order_enabled", False):
-        return checks
-    checks[0] = ReadinessCheck(
-        "hyperliquid_paper_live_probe",
-        "ok",
-        f"Hyperliquid paper-live 探针已开启，paper 账本数量不变，HL 使用最小真实订单取成交价；已启用 {len(mappings)} 个品种",
-    )
-    user = _hyperliquid_user_address(settings)
-    checks.append(
-        ReadinessCheck(
-            "hyperliquid_paper_live_credentials",
-            "ok" if user and getattr(settings, "hyperliquid_secret_key", "") else "block",
-            "Hyperliquid paper-live 账户地址和 API 私钥已配置" if user and getattr(settings, "hyperliquid_secret_key", "") else "HYPERLIQUID_ACCOUNT_ADDRESS 或 HYPERLIQUID_SECRET_KEY 未配置",
+    paper_live_hyperliquid = paper_live_probe_enabled_for_venue(db, settings, "hyperliquid")
+    if paper_live_hyperliquid:
+        checks[0] = ReadinessCheck(
+            "hyperliquid_paper_live_probe",
+            "ok",
+            f"Hyperliquid paper-live 探针已开启，paper 账本数量不变，HL 使用最小真实订单取成交价；已启用 {len(mappings)} 个品种",
         )
-    )
-    try:
-        import_module("hyperliquid.exchange")
-        import_module("eth_account")
-        checks.append(ReadinessCheck("hyperliquid_sdk_import", "ok", "hyperliquid-python-sdk 可导入"))
-    except Exception as exc:
-        checks.append(ReadinessCheck("hyperliquid_sdk_import", "block", f"hyperliquid-python-sdk 不可导入: {exc}"))
+        user = _hyperliquid_user_address(settings)
+        checks.append(
+            ReadinessCheck(
+                "hyperliquid_paper_live_credentials",
+                "ok" if user and getattr(settings, "hyperliquid_secret_key", "") else "block",
+                "Hyperliquid paper-live 账户地址和 API 私钥已配置" if user and getattr(settings, "hyperliquid_secret_key", "") else "HYPERLIQUID_ACCOUNT_ADDRESS 或 HYPERLIQUID_SECRET_KEY 未配置",
+            )
+        )
+        try:
+            import_module("hyperliquid.exchange")
+            import_module("eth_account")
+            checks.append(ReadinessCheck("hyperliquid_sdk_import", "ok", "hyperliquid-python-sdk 可导入"))
+        except Exception as exc:
+            checks.append(ReadinessCheck("hyperliquid_sdk_import", "block", f"hyperliquid-python-sdk 不可导入: {exc}"))
+    checks.extend(_generic_paper_live_probe_checks(db, mappings, settings))
     return checks
 
+
+def _generic_paper_live_probe_checks(db: Session, mappings: list[SymbolMapping], settings: Settings) -> list[ReadinessCheck]:
+    if not runtime_paper_live_probe_enabled(db, settings):
+        return []
+    mapped_venues = {
+        venue
+        for mapping in mappings
+        for venue in (str(mapping.leg_a_venue or "").strip().lower(), str(mapping.leg_b_venue or "").strip().lower())
+        if venue and venue != "mt5"
+    }
+    enabled_mapped = sorted(mapped_venues)
+    checks = [
+        ReadinessCheck(
+            "paper_live_probe_venues",
+            "ok" if enabled_mapped else "warn",
+            f"通用 paper-live 探针 venue 已启用: {', '.join(enabled_mapped)}" if enabled_mapped else "PAPER_LIVE_PROBE_ENABLED 已开启，但当前启用品种映射未命中 PAPER_LIVE_PROBE_VENUES",
+        )
+    ]
+    unsupported = sorted(mapped_venues - {"hyperliquid"} - NAUTILUS_PROBE_SUPPORTED_VENUES)
+    if unsupported:
+        checks.append(
+            ReadinessCheck(
+                "paper_live_probe_adapter_support",
+                "warn",
+                f"以下 venue 已进入通用探针框架，但真实探针下单 adapter 尚未实现: {', '.join(unsupported)}",
+            )
+        )
+    for venue in sorted(mapped_venues & NAUTILUS_PROBE_SUPPORTED_VENUES):
+        credential = db.query(ExchangeCredential).filter(ExchangeCredential.venue == venue, ExchangeCredential.enabled.is_(True)).first()
+        ready = bool(credential and not credential.read_only and credential.encrypted_credentials)
+        checks.append(
+            ReadinessCheck(
+                f"{venue}_paper_live_probe_credentials",
+                "ok" if ready else "block",
+                f"{venue} paper-live 探针凭证已启用且允许交易" if ready else f"{venue} paper-live 探针需要启用交易所配置、填写凭证并关闭只读模式",
+            )
+        )
+    return checks
 
 def _mt5_checks(settings: Settings) -> list[ReadinessCheck]:
     checks = [
@@ -169,7 +211,7 @@ def _symbol_mapping_checks(db: Session) -> list[ReadinessCheck]:
 
 
 def _position_safety_checks(db: Session) -> list[ReadinessCheck]:
-    positions = db.query(Position).filter(Position.platform.in_(["hyperliquid", "mt5"])).all()
+    positions = db.query(Position).filter(Position.platform.in_(list(NATIVE_VENUES))).all()
     active_positions = [row for row in positions if abs(row.quantity) > 0]
     if not active_positions:
         return [ReadinessCheck("live_position_management", "ok", "当前未发现已同步 live 仓位")]
@@ -200,18 +242,20 @@ def _live_groups_for_position(db: Session, position: Position) -> list[HedgeGrou
 
 
 def _position_matches_group(db: Session, position: Position, group: HedgeGroup) -> bool:
-    if position.platform not in {"hyperliquid", "mt5"}:
+    mapping = db.query(SymbolMapping).filter(SymbolMapping.symbol == group.symbol).first()
+    leg_a_venue = mapping.leg_a_venue if mapping else "hyperliquid"
+    leg_b_venue = mapping.leg_b_venue if mapping else "mt5"
+    if position.platform not in {leg_a_venue, leg_b_venue}:
         return False
     symbols = {
-        "hyperliquid": {group.symbol},
-        "mt5": {group.symbol},
+        leg_a_venue: {group.symbol},
+        leg_b_venue: {group.symbol},
     }
-    mapping = db.query(SymbolMapping).filter(SymbolMapping.symbol == group.symbol).first()
     if mapping:
-        if mapping.hyperliquid_symbol:
-            symbols["hyperliquid"].add(mapping.hyperliquid_symbol)
+        if mapping.leg_a_venue_symbol:
+            symbols[leg_a_venue].add(mapping.leg_a_venue_symbol)
         if mapping.mt5_symbol:
-            symbols["mt5"].add(mapping.mt5_symbol)
+            symbols[leg_b_venue].add(mapping.mt5_symbol)
     if position.symbol not in symbols.get(position.platform, set()):
         return False
     if _position_side(position.side) != _expected_position_side(group.direction, position.platform):
@@ -226,16 +270,18 @@ def _position_matches_group(db: Session, position: Position, group: HedgeGroup) 
 
 
 def _expected_position_side(direction: str, platform: str) -> str:
-    if direction == "long_hyperliquid_short_mt5":
-        return "long" if platform == "hyperliquid" else "short"
+    if direction == "long_leg_a_short_leg_b":
+        if platform == "hyperliquid":
+            return "long"
+        return "short"
     return "short" if platform == "hyperliquid" else "long"
 
 
 def _expected_position_quantity(group: HedgeGroup, platform: str) -> float:
     if platform == "hyperliquid":
-        value = group.hyperliquid_quantity
+        value = group.leg_a_quantity
     else:
-        value = group.mt5_quantity
+        value = group.leg_b_quantity
     return float(group.quantity if value is None else value)
 
 
